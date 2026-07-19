@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import pytest
 
+from atlaslens_api.phase3f.runpod import RunPodAPIError
 from atlaslens_api.phase3f.safety import (
     MAX_RUNTIME_SECONDS,
     BudgetPolicy,
@@ -22,6 +23,7 @@ class _RunPodStub:
         self.create_calls = 0
         self.terminate_calls: list[str] = []
         self.raise_after_create = False
+        self.capacity_race_without_pod = False
         self.leave_after_terminate = False
 
     def list_pods(self) -> tuple[PodRecord, ...]:
@@ -29,6 +31,8 @@ class _RunPodStub:
 
     def create_pod(self, request: PodRequest) -> PodRecord:
         self.create_calls += 1
+        if self.capacity_race_without_pod:
+            raise RunPodAPIError("GPU_CAPACITY_ALLOCATION_REJECTED")
         pod = PodRecord("phase3f-pod", request.run_marker)
         self.pods.append(pod)
         if self.raise_after_create:
@@ -102,6 +106,26 @@ def test_ambiguous_create_is_discovered_by_marker_and_terminated() -> None:
     assert client.terminate_calls == ["phase3f-pod"]
     assert session.last_audit is not None
     assert session.last_audit.termination_verified is True
+
+
+def test_capacity_race_has_zero_retry_and_restores_empty_inventory() -> None:
+    client = _RunPodStub()
+    client.pods = []
+    client.capacity_race_without_pod = True
+    session = SinglePodSession(client)
+
+    with pytest.raises(Phase3FSafetyError, match="GPU_CAPACITY_RACE_NO_POD"):
+        session.execute(_request(), lambda _lease: None)
+
+    assert client.create_calls == 1
+    assert client.terminate_calls == []
+    assert client.pods == []
+    assert session.last_audit is not None
+    assert session.last_audit.create_attempts == 1
+    assert session.last_audit.termination_attempts == 0
+    assert session.last_audit.termination_verified is True
+    assert session.last_audit.before_count == session.last_audit.after_count == 0
+    assert session.last_audit.before_inventory_sha256 == session.last_audit.after_inventory_sha256
 
 
 def test_unremoved_pod_is_reported_even_when_work_succeeds() -> None:

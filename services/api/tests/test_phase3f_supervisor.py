@@ -9,9 +9,11 @@ from pathlib import Path
 import pytest
 
 from atlaslens_api.phase3f.runpod import RunPodInventory
+from atlaslens_api.phase3f.safety import PodRecord
 from atlaslens_api.phase3f.supervisor import (
     Phase3FSupervisorError,
     require_empty_inventory,
+    require_inventory_restored,
     verify_output_archive,
 )
 
@@ -97,3 +99,17 @@ def test_preprovision_inventory_must_be_completely_empty() -> None:
         match="ACTIVE_ENDPOINT_INVENTORY_NOT_ZERO",
     ):
         require_empty_inventory(RunPodInventory((), ("endpoint-1",), (), ()))
+
+
+def test_capacity_race_cleanup_requires_all_four_inventories_restored() -> None:
+    empty = RunPodInventory((), (), (), ())
+    require_inventory_restored(empty, empty)
+
+    for not_empty in (
+        RunPodInventory((PodRecord("pod-1", "phase3f-run"),), (), (), ()),
+        RunPodInventory((), ("endpoint-1",), (), ()),
+        RunPodInventory((), (), ("volume-1",), ()),
+        RunPodInventory((), (), (), ("template-1",)),
+    ):
+        with pytest.raises(Phase3FSupervisorError, match="CLOUD_CLEANUP_UNVERIFIED"):
+            require_inventory_restored(empty, not_empty)

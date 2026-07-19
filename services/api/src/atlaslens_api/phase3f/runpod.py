@@ -41,6 +41,18 @@ MAPILLARY_ENV_REFERENCE: Final = (
 )
 _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _URL = re.compile(r"https?://[^\s]+", re.I)
+_CAPACITY_ERROR_STATUSES: Final = frozenset({400, 409, 422, 503})
+_CAPACITY_ERROR_PHRASES: Final = (
+    "insufficient capacity",
+    "no capacity",
+    "out of capacity",
+    "no available gpu",
+    "no gpu available",
+    "no available machine",
+    "no machines available",
+    "no longer any instances available",
+    "unable to find a suitable machine",
+)
 _GPU_LIST_QUERY: Final = """query AtlasLensPhase3FGpuTypes {
   gpuTypes {
     id
@@ -97,7 +109,7 @@ class RunPodConfig:
     container_disk_gb: int = MAX_CONTAINER_DISK_GB
     min_gpu_memory_gb: int = MIN_GPU_MEMORY_GB
     ssh_public_key: str | None = None
-    allowed_cloud_types: tuple[str, ...] = ("SECURE",)
+    allowed_cloud_types: tuple[str, ...] = ("SECURE", "COMMUNITY")
 
     def __post_init__(self) -> None:
         _require(bool(_IMAGE.fullmatch(self.image_name)), "image_must_be_digest_pinned")
@@ -139,7 +151,17 @@ class GPUOffer:
     cloud_type: str
     secure_cloud: bool
     community_cloud: bool
-    available_gpu_counts: tuple[int, ...]
+    available_gpu_counts: tuple[int, ...] | None
+
+    @property
+    def capacity_confirmed(self) -> bool:
+        return self.available_gpu_counts is not None and 1 in self.available_gpu_counts
+
+    @property
+    def capacity_evidence(self) -> str:
+        if self.capacity_confirmed:
+            return "available_gpu_counts"
+        return "advertised_stock_status"
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,9 +222,32 @@ class GPUAvailabilityReport:
                     "communityCloud": selected.community_cloud,
                     "stockStatus": selected.stock_status,
                     "uninterruptablePrice": str(selected.hourly_price),
-                    "availableGpuCounts": list(selected.available_gpu_counts),
+                    "availableGpuCounts": (
+                        None
+                        if selected.available_gpu_counts is None
+                        else list(selected.available_gpu_counts)
+                    ),
+                    "capacity_confirmed": selected.capacity_confirmed,
+                    "capacity_evidence": selected.capacity_evidence,
                 }
             ),
+            "selected_gpu_id": None if selected is None else selected.gpu_type_id,
+            "selected_gpu_display_name": (
+                None if selected is None else selected.display_name
+            ),
+            "selected_hourly_price": (
+                None if selected is None else str(selected.hourly_price)
+            ),
+            "selected_stock_status": (
+                None if selected is None else selected.stock_status
+            ),
+            "capacity_confirmed": (
+                None if selected is None else selected.capacity_confirmed
+            ),
+            "capacity_evidence": (
+                None if selected is None else selected.capacity_evidence
+            ),
+            "create_attempt_limit": 1,
             "gpu_candidates": [item.to_public_dict() for item in self.candidates],
             "graphql_request_count": self.graphql_request_count,
             "http_statuses": list(self.http_statuses),
@@ -464,8 +509,8 @@ class RunPodV1Client:
         selected = min(
             offers,
             key=lambda offer: (
-                offer.hourly_price,
                 self._preference_rank(offer.gpu_type_id),
+                offer.hourly_price,
                 offer.gpu_type_id,
                 0 if offer.cloud_type == "SECURE" else 1,
             ),
@@ -726,8 +771,8 @@ class RunPodV1Client:
         return min(
             variant_offers,
             key=lambda item: (
-                item[0].hourly_price,
                 0 if item[0].cloud_type == "SECURE" else 1,
+                item[0].hourly_price,
             ),
         )
 
@@ -803,9 +848,34 @@ class RunPodV1Client:
                 price=price,
             )
         counts_value = value.get("availableGpuCounts")
+        if counts_value is None:
+            offer = GPUOffer(
+                gpu_type_id=gpu_type_id,
+                display_name=display_name,
+                memory_gb=memory_gb,
+                hourly_price=price,
+                stock_status=status,
+                cloud_type=cloud_type,
+                secure_cloud=secure_cloud,
+                community_cloud=community_cloud,
+                available_gpu_counts=None,
+            )
+            diagnostic = GPUCandidateDiagnostic(
+                gpu_type_id=gpu_type_id,
+                display_name=display_name,
+                memory_gb=memory_gb,
+                secure_cloud=secure_cloud,
+                community_cloud=community_cloud,
+                stock_status=status,
+                uninterruptable_price=price,
+                available_gpu_counts=None,
+                accepted=True,
+                classification="capacity_unconfirmed_but_advertised",
+            )
+            return offer, diagnostic
         if not isinstance(counts_value, Sequence) or isinstance(counts_value, str | bytes):
             return reject(
-                "gpu_count_one_unavailable",
+                "available_gpu_counts_invalid",
                 stock_status=status,
                 price=price,
             )
@@ -876,6 +946,7 @@ class RunPodV1Client:
             "POST",
             "pods",
             expected_status=201,
+            classify_capacity_race=True,
             json_body={
                 "name": request.run_marker,
                 "imageName": self._config.image_name,
@@ -996,6 +1067,7 @@ class RunPodV1Client:
         expected_status: int,
         params: Mapping[str, str] | None = None,
         json_body: Mapping[str, object] | None = None,
+        classify_capacity_race: bool = False,
     ) -> object:
         self._api_request_count += 1
         headers = {
@@ -1022,7 +1094,10 @@ class RunPodV1Client:
             raise
         except httpx.HTTPError:
             raise RunPodAPIError("transport_failed") from None
-        _require(status == expected_status, f"unexpected_status_{status}")
+        if status != expected_status:
+            if classify_capacity_race and self._is_capacity_race(status, body):
+                raise RunPodAPIError("GPU_CAPACITY_ALLOCATION_REJECTED")
+            raise RunPodAPIError(f"unexpected_status_{status}")
         if expected_status == 204:
             _require(not body, "delete_response_not_empty")
             return None
@@ -1031,6 +1106,12 @@ class RunPodV1Client:
             return json.loads(body)
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise RunPodAPIError("response_json_invalid") from None
+
+    def _is_capacity_race(self, status: int, body: bytearray) -> bool:
+        if status not in _CAPACITY_ERROR_STATUSES:
+            return False
+        text = bytes(body).decode("utf-8", errors="ignore").casefold()
+        return any(phrase in text for phrase in _CAPACITY_ERROR_PHRASES)
 
 
 __all__ = [

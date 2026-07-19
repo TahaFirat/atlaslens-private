@@ -1,5 +1,26 @@
 # Decision log
 
+## 2026-07-19 - Phase 3F treats advertised RunPod stock as unconfirmed capacity
+
+- Context: RunPod's authenticated GPU detail response can advertise High, Medium
+  or Low stock and a finite on-demand price while returning
+  `availableGpuCounts=null`. Treating the nullable field as malformed blocked the
+  bounded pilot even though the provider still advertised stock.
+- Decision: A list-valued count remains authoritative and must contain one. A null
+  count is eligible only as explicitly unconfirmed capacity when stock, price,
+  memory and cloud gates pass. Prefer A5000, then L4, then RTX 3090, then cheaper
+  eligible alternatives within the fallback tier. Prefer an eligible Secure
+  variant over Community. Revalidate the exact GPU ID immediately before create,
+  permit one non-interruptible one-GPU REST attempt, never retry another GPU or
+  Pod, and classify a sanitized allocation race as
+  `GPU_CAPACITY_RACE_NO_POD` only after all inventories are restored.
+- Alternatives: Reject all nullable counts; treat null as confirmed capacity;
+  retry another GPU after an allocation race; choose globally by lowest price.
+- Consequences: Live readiness can be true with `capacity_confirmed=false`, while
+  paid execution remains fail-closed at the second detail query and single-create
+  boundary. No Serverless endpoint or network volume is introduced.
+- Target phase: Product Phase 3F bounded RunPod pilot only.
+
 ## 2026-07-19 - Product Phase 3E makes limited retrieval coverage explicit and map-first
 
 - Context: The private index contains 29 Ankara references and 11 locked holdouts.

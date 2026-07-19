@@ -21,7 +21,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\st
 
 This mode verifies all four inventories, discovers current provider GPU IDs,
 queries only discovered candidates with at least 16 GiB, and reports sanitized
-stock, price and rejection classifications. It cannot create or terminate a
+stock, price, capacity evidence and rejection classifications. A list-valued
+`availableGpuCounts` must contain `1`. A null count list is accepted only as
+`capacity_unconfirmed_but_advertised` when stock is High, Medium or Low and the
+remaining memory, cloud and price gates pass. It cannot create or terminate a
 resource. Do not run the paid command unless it returns
 `ready_for_execute=true`, `cloud_mutations=0`, and inventories `0/0/0/0`.
 
@@ -53,20 +56,28 @@ resource is present.
 
 Immediately before creation the supervisor requires Pod, endpoint, network
 volume and template inventories to all be empty. It makes one create attempt,
-never retries with a second Pod, accepts only a Secure Cloud offer at or below
-the configured hourly ceiling, and maps Mapillary access through the named
-RunPod secret reference. Source, canonical-LF vendor files and the exact model
-are checksum-verified before transfer. The cloud job is watched in the
-foreground, output is downloaded and checksum-verified, and the one-Pod session
-terminates in `finally`. The start wrapper invokes receipt-bound termination
-again from its own `finally` and requires all four inventories to return to
-zero.
+never retries with a second Pod, and revalidates the exact selected GPU ID with
+one read-only detail query. Selection uses A5000, L4, RTX 3090, then other
+eligible GPUs; price breaks ties only within the same preference level. Secure
+Cloud is preferred whenever its variant is eligible, with Community Cloud used
+only when no eligible Secure variant exists. Offers must remain at or below the
+configured hourly ceiling. An advertised-but-unconfirmed offer may make exactly
+one REST create attempt. A sanitized allocation/no-capacity response becomes
+`GPU_CAPACITY_RACE_NO_POD`; no alternate GPU or Pod is tried, no successful-run
+receipt or spend is recorded, and all four inventories must be restored to zero.
+Mapillary access is mapped through the named RunPod secret reference. Source,
+canonical-LF vendor files and the exact model are checksum-verified before
+transfer. The cloud job is watched in the foreground, output is downloaded and
+checksum-verified, and the one-Pod session terminates in `finally`. The start
+wrapper invokes receipt-bound termination again from its own `finally` and
+requires all four inventories to return to zero.
 
 Stop on these operator blockers: `ACTIVE_POD_INVENTORY_NOT_ZERO`,
 `ACTIVE_ENDPOINT_INVENTORY_NOT_ZERO`, `NETWORK_VOLUME_INVENTORY_NOT_ZERO`,
 `TEMPLATE_INVENTORY_NOT_ZERO`, `UNEXPECTED_POD_INVENTORY`,
 `OPERATOR_PROCESS_ALREADY_RUNNING`, `STALE_OPERATOR_RECEIPT_REQUIRES_TERMINATE`,
 `NO_ELIGIBLE_GPU_OFFER`, `GPU_AVAILABILITY_GRAPHQL_ERRORS`,
+`GPU_CAPACITY_RACE_NO_POD`,
 `projected_cost_exceeds_target`,
 `soft_stop_budget_reached`, `termination_budget_reached`,
 `absolute_budget_reached`, `runtime_limit_reached`,

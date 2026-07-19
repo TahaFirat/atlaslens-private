@@ -256,7 +256,7 @@ def test_live_readiness_is_authenticated_read_only_and_does_not_write_state(
         cloud_type="SECURE",
         secure_cloud=True,
         community_cloud=False,
-        available_gpu_counts=(1,),
+        available_gpu_counts=None,
     )
     report = GPUAvailabilityReport(
         selected_offer=offer,
@@ -297,6 +297,13 @@ def test_live_readiness_is_authenticated_read_only_and_does_not_write_state(
     assert not runtime.exists()
     output = json.loads(capsys.readouterr().out)
     assert output["ready_for_execute"] is True
+    assert output["selected_gpu_id"] == "NVIDIA L4"
+    assert output["selected_gpu_display_name"] == "L4"
+    assert output["selected_hourly_price"] == "0.39"
+    assert output["selected_stock_status"] == "Low"
+    assert output["capacity_confirmed"] is False
+    assert output["capacity_evidence"] == "advertised_stock_status"
+    assert output["create_attempt_limit"] == 1
     assert output["runpod_api_calls"] == 6
     assert output["cloud_mutations"] == 0
 

@@ -366,6 +366,15 @@ class SinglePodSession:
                 raise cleanup_error from operation_error
             raise cleanup_error
         if operation_error is not None:
+            if getattr(operation_error, "code", None) == "GPU_CAPACITY_ALLOCATION_REJECTED":
+                audit = self.last_audit
+                if audit is None:  # pragma: no cover - cleanup assigns it or raises first
+                    raise Phase3FSafetyError("capacity_race_cleanup_unverified")
+                if audit.termination_attempts == 0 and audit.termination_verified:
+                    raise Phase3FSafetyError("GPU_CAPACITY_RACE_NO_POD") from operation_error
+                raise Phase3FSafetyError(
+                    "GPU_CAPACITY_RACE_AMBIGUOUS_POD_CLEANED"
+                ) from operation_error
             raise operation_error
         _require(operation_completed and self.last_audit is not None, "operation_not_completed")
         audit = self.last_audit

@@ -18,7 +18,11 @@ from atlaslens_api.phase3f.safety import MAX_RUNTIME_SECONDS, PodRecord, PodRequ
 
 TOKEN = "runpod-test-token-never-log"
 IMAGE = "registry.example/atlaslens@sha256:" + "a" * 64
-PREFERENCES = ("NVIDIA RTX A5000", "NVIDIA RTX A4000")
+PREFERENCES = (
+    "NVIDIA RTX A5000",
+    "NVIDIA L4",
+    "NVIDIA GeForce RTX 3090",
+)
 SSH_PUBLIC_KEY = "ssh-ed25519 " + "A" * 68 + " atlaslens-phase3f"
 _DEFAULT = object()
 
@@ -55,6 +59,7 @@ def _detail_row(
     stock_status: object = "Low",
     secure_cloud: object = True,
     community_cloud: object = False,
+    community_price: object = None,
 ) -> dict[str, object]:
     return {
         "id": gpu_type_id,
@@ -71,7 +76,15 @@ def _detail_row(
                 "availableGpuCounts": [1] if counts is _DEFAULT else counts,
             }
         ),
-        "communityPrice": None,
+        "communityPrice": (
+            None
+            if community_price is None
+            else {
+                "stockStatus": stock_status,
+                "uninterruptablePrice": community_price,
+                "availableGpuCounts": [1] if counts is _DEFAULT else counts,
+            }
+        ),
     }
 
 
@@ -202,9 +215,11 @@ def test_gpu_offer_uses_official_list_then_detail_schema_and_lowest_price() -> N
         offer = client.select_gpu_offer(max_hourly_price=Decimal("0.50"))
         report = client.last_availability_report
     assert calls == 2
-    assert offer.gpu_type_id == "NVIDIA RTX A4000"
-    assert offer.memory_gb == 16
-    assert offer.hourly_price == Decimal("0.29")
+    assert offer.gpu_type_id == "NVIDIA RTX A5000"
+    assert offer.memory_gb == 24
+    assert offer.hourly_price == Decimal("0.45")
+    assert offer.capacity_confirmed is True
+    assert offer.capacity_evidence == "available_gpu_counts"
     assert report is not None
     assert report.graphql_request_count == 2
     assert report.response_schema_classification == "official_gpuTypes_list_and_detail_lists"
@@ -214,7 +229,7 @@ def test_malformed_or_unavailable_candidate_does_not_poison_valid_candidate() ->
     def handler(request: httpx.Request) -> httpx.Response:
         return _graphql_response(
             request,
-            a5000_counts=None,
+            a5000_counts="not-a-list",
             a4000_price="0.31",
             a4000_counts=[1],
             a4000_status="mEdIuM",
@@ -227,7 +242,40 @@ def test_malformed_or_unavailable_candidate_does_not_poison_valid_candidate() ->
     assert offer.gpu_type_id == "NVIDIA RTX A4000"
     assert report is not None
     rejected = [item for item in report.candidates if not item.accepted]
-    assert any(item.classification == "gpu_count_one_unavailable" for item in rejected)
+    assert any(item.classification == "available_gpu_counts_invalid" for item in rejected)
+
+
+@pytest.mark.parametrize("status", ["Low", "Medium", "High"])
+def test_null_counts_with_advertised_stock_are_eligible_but_unconfirmed(
+    status: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _graphql_response(
+            request,
+            a5000_price="0.45",
+            a5000_counts=None,
+            a5000_status=status,
+            a4000_price="0.60",
+        )
+
+    with _client(handler) as client:
+        report = client.check_gpu_availability(max_hourly_price=Decimal("0.50"))
+
+    offer = report.selected_offer
+    assert offer is not None
+    assert offer.gpu_type_id == "NVIDIA RTX A5000"
+    assert offer.available_gpu_counts is None
+    assert offer.capacity_confirmed is False
+    assert offer.capacity_evidence == "advertised_stock_status"
+    assert any(
+        item.accepted
+        and item.classification == "capacity_unconfirmed_but_advertised"
+        for item in report.candidates
+    )
+    public = report.to_public_dict()
+    assert public["capacity_confirmed"] is False
+    assert public["capacity_evidence"] == "advertised_stock_status"
+    assert public["create_attempt_limit"] == 1
 
 
 @pytest.mark.parametrize("status", ["High", "medium", "LOW"])
@@ -252,7 +300,7 @@ def test_documented_stock_status_values_are_case_insensitive(status: str) -> Non
         ("0.30", [1], None, "stock_unavailable"),
         ("0.30", [1], "None", "stock_unavailable"),
         ("0.30", [], "Low", "gpu_count_one_unavailable"),
-        ("0.30", None, "Low", "gpu_count_one_unavailable"),
+        ("0.30", "not-a-list", "Low", "available_gpu_counts_invalid"),
         ("not-numeric", [1], "Low", "gpu_price_invalid"),
         ("0.51", [1], "Low", "gpu_price_above_limit"),
     ],
@@ -352,6 +400,139 @@ def test_equal_price_uses_declared_preference_order() -> None:
     assert offer.gpu_type_id == "NVIDIA RTX A5000"
 
 
+def test_preferred_gpu_beats_cheaper_other_gpu() -> None:
+    gpu_rows = [
+        {"id": "NVIDIA RTX A4000", "displayName": "RTX A4000", "memoryInGb": 16},
+        {"id": "NVIDIA L4", "displayName": "L4", "memoryInGb": 24},
+    ]
+    details = {
+        "NVIDIA RTX A4000": _detail_row(
+            "NVIDIA RTX A4000",
+            display_name="RTX A4000",
+            memory_gb=16,
+            price="0.24",
+            counts=None,
+        ),
+        "NVIDIA L4": _detail_row(
+            "NVIDIA L4",
+            display_name="L4",
+            memory_gb=24,
+            price="0.39",
+            counts=None,
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body["operationName"] == "AtlasLensPhase3FGpuTypes":
+            return httpx.Response(200, json={"data": {"gpuTypes": gpu_rows}})
+        query = body["query"]
+        ordered_ids = sorted(details, key=query.index)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    f"g{index}": [details[gpu_id]]
+                    for index, gpu_id in enumerate(ordered_ids)
+                }
+            },
+        )
+
+    with _client(handler) as client:
+        offer = client.select_gpu_offer(max_hourly_price=Decimal("0.50"))
+
+    assert offer.gpu_type_id == "NVIDIA L4"
+    assert offer.hourly_price == Decimal("0.39")
+
+
+def test_a5000_preference_beats_l4_and_cheaper_other() -> None:
+    gpu_rows = [
+        {"id": "NVIDIA RTX A4000", "displayName": "RTX A4000", "memoryInGb": 16},
+        {"id": "NVIDIA L4", "displayName": "L4", "memoryInGb": 24},
+        {"id": "NVIDIA RTX A5000", "displayName": "RTX A5000", "memoryInGb": 24},
+    ]
+    details = {
+        row["id"]: _detail_row(
+            str(row["id"]),
+            display_name=str(row["displayName"]),
+            memory_gb=int(row["memoryInGb"]),
+            price={
+                "NVIDIA RTX A4000": "0.24",
+                "NVIDIA L4": "0.39",
+                "NVIDIA RTX A5000": "0.49",
+            }[str(row["id"])],
+            counts=None,
+        )
+        for row in gpu_rows
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body["operationName"] == "AtlasLensPhase3FGpuTypes":
+            return httpx.Response(200, json={"data": {"gpuTypes": gpu_rows}})
+        query = body["query"]
+        ordered_ids = sorted(details, key=query.index)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    f"g{index}": [details[gpu_id]]
+                    for index, gpu_id in enumerate(ordered_ids)
+                }
+            },
+        )
+
+    with _client(handler) as client:
+        offer = client.select_gpu_offer(max_hourly_price=Decimal("0.50"))
+
+    assert offer.gpu_type_id == "NVIDIA RTX A5000"
+    assert offer.hourly_price == Decimal("0.49")
+
+
+def test_secure_cloud_is_preferred_for_a_secure_advertised_offer() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body["operationName"] == "AtlasLensPhase3FGpuTypes":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "gpuTypes": [
+                            {
+                                "id": "NVIDIA L4",
+                                "displayName": "L4",
+                                "memoryInGb": 24,
+                            }
+                        ]
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "g0": [
+                        _detail_row(
+                            "NVIDIA L4",
+                            display_name="L4",
+                            memory_gb=24,
+                            price="0.39",
+                            counts=None,
+                            community_cloud=True,
+                            community_price="0.20",
+                        )
+                    ]
+                }
+            },
+        )
+
+    with _client(handler) as client:
+        offer = client.select_gpu_offer(max_hourly_price=Decimal("0.50"))
+
+    assert offer.cloud_type == "SECURE"
+    assert offer.hourly_price == Decimal("0.39")
+
+
 def test_pre_create_revalidation_failure_prevents_rest_mutation() -> None:
     detail_calls = 0
     rest_create_calls = 0
@@ -374,7 +555,7 @@ def test_pre_create_revalidation_failure_prevents_rest_mutation() -> None:
         return _graphql_response(
             request,
             a5000_price="0.30",
-            a5000_counts=None,
+            a5000_status=None,
         )
 
     with _client(handler) as client:
@@ -488,6 +669,33 @@ def test_create_never_retries_a_server_failure() -> None:
     ):
         client.create_pod(_request())
     assert create_calls == 1
+    assert TOKEN not in str(error.value)
+    assert TOKEN not in repr(error.value)
+
+
+def test_capacity_race_is_sanitized_and_never_retried() -> None:
+    create_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request, a5000_counts=None)
+        create_calls += 1
+        return httpx.Response(
+            409,
+            json={"message": f"No available GPU capacity; credential={TOKEN}"},
+        )
+
+    with (
+        _client(handler) as client,
+        pytest.raises(
+            RunPodAPIError,
+            match="GPU_CAPACITY_ALLOCATION_REJECTED",
+        ) as error,
+    ):
+        client.create_pod(_request())
+    assert create_calls == 1
+    assert client.cloud_mutation_count == 1
     assert TOKEN not in str(error.value)
     assert TOKEN not in repr(error.value)
 

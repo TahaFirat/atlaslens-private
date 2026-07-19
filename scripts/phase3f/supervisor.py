@@ -720,6 +720,7 @@ def _record_failed_operator_state(
     receipt_path: Path,
     *,
     cleanup_verified: bool,
+    no_pod_capacity_race: bool = False,
 ) -> None:
     try:
         receipt = read_operator_receipt(receipt_path)
@@ -728,7 +729,11 @@ def _record_failed_operator_state(
         write_operator_receipt(
             receipt_path,
             receipt.update_lifecycle(
-                stage="failed",
+                stage=(
+                    "terminated"
+                    if no_pod_capacity_race and cleanup_verified
+                    else "failed"
+                ),
                 finished_at=datetime.now(UTC).isoformat(),
                 cleanup_verified=cleanup_verified,
             ),
@@ -772,6 +777,7 @@ def _run_execute(
     )
     owns_operator_receipt = False
     session: SinglePodSession | None = None
+    capacity_race_inventory_verified = False
     try:
         _disk_gate()
         head, tracked = _preflight_repository()
@@ -826,7 +832,7 @@ def _run_execute(
             request = PodRequest(
                 run_marker=operator_receipt.run_marker,
                 idempotency_key=f"atlaslens-phase3f-create-{run_id}",
-                hourly_cost_usd=offer.hourly_price,
+                hourly_cost_usd=policy.max_hourly_cost_usd,
                 max_runtime_seconds=policy.max_runtime_seconds,
                 gpu_type_id=offer.gpu_type_id,
                 public_ports=(22,),
@@ -837,25 +843,38 @@ def _run_execute(
                 cleanup_poll_attempts=20,
                 cleanup_poll_seconds=3.0,
             )
-            execution = session.execute(
-                request,
-                lambda lease: _operation(
-                    client,
-                    lease,
-                    bundle_root=bundle.root,
-                    key=key,
-                    known_hosts=known_hosts,
-                    download_path=download_path,
-                    run_id=run_id,
-                    started=started,
-                    operator_receipt=operator_receipt,
-                    operator_receipt_path=receipt_path,
-                    remote_job_seconds=max(
-                        60,
-                        min(REMOTE_JOB_SECONDS, policy.max_runtime_seconds - 15 * 60),
+            try:
+                execution = session.execute(
+                    request,
+                    lambda lease: _operation(
+                        client,
+                        lease,
+                        bundle_root=bundle.root,
+                        key=key,
+                        known_hosts=known_hosts,
+                        download_path=download_path,
+                        run_id=run_id,
+                        started=started,
+                        operator_receipt=operator_receipt,
+                        operator_receipt_path=receipt_path,
+                        remote_job_seconds=max(
+                            60,
+                            min(REMOTE_JOB_SECONDS, policy.max_runtime_seconds - 15 * 60),
+                        ),
                     ),
-                ),
-            )
+                )
+            except (Phase3FSafetyError, RunPodAPIError) as exc:
+                if exc.code == "GPU_CAPACITY_RACE_NO_POD":
+                    after_capacity_race = _post_inventory(client, before)
+                    require_inventory_restored(before, after_capacity_race)
+                    capacity_race_inventory_verified = True
+                    _emit(
+                        "PHASE3F_GPU_CAPACITY_RACE_NO_POD",
+                        create_attempts=1,
+                        resources=0,
+                        cleanup_verified=True,
+                    )
+                raise
             after = _post_inventory(client, before)
             require_inventory_restored(before, after)
             _emit("PHASE3F_CLOUD_CLEANUP_VERIFIED", resources=0)
@@ -943,9 +962,22 @@ def _run_execute(
                 and session.last_audit is not None
                 and session.last_audit.termination_verified
             )
+            no_pod_capacity_race = bool(
+                isinstance(exc, (Phase3FSafetyError, RunPodAPIError))
+                and exc.code == "GPU_CAPACITY_RACE_NO_POD"
+                and capacity_race_inventory_verified
+                and session is not None
+                and session.last_audit is not None
+                and session.last_audit.termination_attempts == 0
+            )
             _record_failed_operator_state(
                 receipt_path,
-                cleanup_verified=cleanup_verified,
+                cleanup_verified=(
+                    cleanup_verified and capacity_race_inventory_verified
+                    if no_pod_capacity_race
+                    else cleanup_verified
+                ),
+                no_pod_capacity_race=no_pod_capacity_race,
             )
         print(exc.code)
         return 1
