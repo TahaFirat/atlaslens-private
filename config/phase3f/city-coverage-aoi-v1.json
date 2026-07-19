@@ -1,0 +1,23 @@
+{
+  "schema_version": "atlaslens-phase3f-city-aoi-v1",
+  "purpose": "Predetermined metadata-coverage query windows; not geolocation evidence or accuracy truth.",
+  "tile_half_span_degrees": 0.05,
+  "cities": [
+    {"city": "İstanbul", "longitude": 28.9784, "latitude": 41.0082},
+    {"city": "Ankara", "longitude": 32.8597, "latitude": 39.9334},
+    {"city": "İzmir", "longitude": 27.1428, "latitude": 38.4237},
+    {"city": "Bursa", "longitude": 29.0600, "latitude": 40.1950},
+    {"city": "Antalya", "longitude": 30.7133, "latitude": 36.8969},
+    {"city": "Konya", "longitude": 32.4846, "latitude": 37.8746},
+    {"city": "Kayseri", "longitude": 35.4826, "latitude": 38.7205},
+    {"city": "Gaziantep", "longitude": 37.3781, "latitude": 37.0662},
+    {"city": "Samsun", "longitude": 36.3361, "latitude": 41.2867},
+    {"city": "Trabzon", "longitude": 39.7168, "latitude": 41.0027},
+    {"city": "Diyarbakır", "longitude": 40.2306, "latitude": 37.9144},
+    {"city": "Erzurum", "longitude": 41.2769, "latitude": 39.9043},
+    {"city": "Mersin", "longitude": 34.6415, "latitude": 36.8121},
+    {"city": "Adana", "longitude": 35.3213, "latitude": 37.0000},
+    {"city": "Eskişehir", "longitude": 30.5206, "latitude": 39.7767},
+    {"city": "Sivas", "longitude": 37.0150, "latitude": 39.7505}
+  ]
+}
