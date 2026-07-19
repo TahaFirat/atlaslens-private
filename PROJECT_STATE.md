@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-19T10:58:29+03:00
+last_verified_at: 2026-07-19T21:30:06+03:00
 current_product_phase: 3
-product_phase_name: phase_3e_honest_geolocation_map_first
-product_phase_status: complete_honest_coverage_routing_map_first_visual_gate_pass
+product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
+product_phase_status: local_operator_handoff_ready_manual_execution_cloud_not_started
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -269,6 +269,25 @@ phase_3e_disk_gate: pass_c_44_416_gib_d_11_967_gib
 phase_3e_validation_agents: pass_retrieval_truth_product_frontend_security_validation_exactly_three
 phase_3e_next_action: approve_rights_cleared_multi_region_turkiye_corpus_independent_holdout_and_calibration_phase
 next_product_phase: phase_3f_licensed_multi_region_corpus_and_independent_calibration
+phase_3f_branch: feature_phase3f_multiregion_pilot
+phase_3f_supervisor_commit: 4d6e8f222bb4fc3b3d77463649ff221a7a6ad676
+phase_3f_operator_handoff: ready_manual_execution_dry_run_default
+phase_3f_operator_wrappers: start_status_receipt_bound_terminate
+phase_3f_budget_guard_usd: target_6_soft_7_5_hard_9_absolute_10
+phase_3f_gpu_hourly_ceiling_usd: 0_50
+phase_3f_wall_ceiling_minutes: 345
+phase_3f_single_pod: fail_closed_zero_inventory_one_create_no_retry
+phase_3f_runtime_state: c_atlaslensruntime_phase3f_operator_receipt
+phase_3f_artifact_readiness: pass_model_vendor_canonical_lf_receipt
+phase_3f_megaloc_cuda_smoke: pass_preexisting_dimension_8448_finite_l2_normalized_not_rerun
+phase_3f_operator_tests: pass_36_focused_49_phase3f_total_no_provider_call
+phase_3f_static_contract: pass_ruff_strict_mypy
+phase_3f_disk_gate: pass_c_47_666_gib_d_23_901_gib
+phase_3f_runpod_inventory: user_supplied_zero_baseline_no_provider_call_in_handoff
+phase_3f_cloud_spend_usd: 0
+phase_3f_cloud_mutations_push_pr: none
+phase_3f_asda_html: untouched_untracked_not_read
+phase_3f_next_action: operator_reviews_dry_run_then_explicit_execute_in_own_powershell
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
 phase_6c_dataset_qa_ui_gate: pass
@@ -323,6 +342,41 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F local operator handoff checkpoint
+
+Status: **READY FOR MANUAL EXECUTION - CLOUD EXECUTION NOT STARTED**.
+
+The bounded supervisor from commit `4d6e8f2` now has three thin PowerShell
+operator wrappers. Start is a local-only dry-run unless `-Execute` is supplied;
+the real path accepts the fixed 10 USD absolute, 7.5 USD soft-stop, 9 USD hard-
+stop, 0.50 USD/hour GPU and 345-minute wall ceilings. It requires empty Pod,
+endpoint, network-volume and template inventories immediately before a single
+create attempt, maps the named Mapillary RunPod secret, transfers only the
+checksum-bound source/model/canonical-LF vendor bundle, watches the cloud job,
+verifies the downloaded archive and restores all inventories in `finally`.
+
+The exact Pod ID is retained only in the sanitized operator receipt under
+`C:\AtlasLensRuntime\phase3f\_operator`; status is read-only and emergency stop
+can terminate only that receipt-bound Pod. Any unrelated Pod or non-Pod resource
+causes fail-closed refusal. A stale live PID or unclean receipt blocks a new
+start. The wrappers resolve the repository from `PSScriptRoot`, tolerate spaces
+and execution from another working directory, never accept the API key as an
+argument, and do not read `.env` or `asda.html`.
+
+Thirty-six focused local/mocked tests and all 49 Phase 3F tests passed,
+including dry-run zero mutation,
+single-create/finally termination, budget thresholds, secret redaction, stale
+state/PID, PowerShell syntax and receipt-bound termination. Ruff and strict
+mypy passed. The exact model and vendor/receipt hashes revalidated; the existing
+offline CUDA readiness receipt remains PASS with finite normalized dimension
+8,448 and was not rerun. C: had 47.666 GiB and D: 23.901 GiB free.
+
+No RunPod API call, Pod, volume, endpoint, template, cloud spend, GitHub push or
+other external mutation occurred in this handoff. The current zero-resource
+inventory is the explicit operator-supplied baseline; it was intentionally not
+queried because this task prohibited RunPod calls. The exact commands and output
+paths are in [the Phase 3F operator runbook](docs/phase3f/operator-runbook.md).
 
 ## Product Phase 3D investor-ready private demo checkpoint
 
