@@ -300,6 +300,29 @@ def require_startable_receipt(
     raise Phase3FOperatorError("STALE_OPERATOR_RECEIPT_REQUIRES_TERMINATE")
 
 
+def archive_completed_operator_receipt(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    receipt = read_operator_receipt(path)
+    _require(
+        receipt.cleanup_verified and receipt.stage in {"failed", "terminated"},
+        "ACTIVE_OPERATOR_RECEIPT_NOT_ARCHIVABLE",
+    )
+    archive_path = path.parent / "archive" / f"{receipt.run_id}.json"
+    if archive_path.exists():
+        _require(
+            read_operator_receipt(archive_path) == receipt,
+            "OPERATOR_RECEIPT_ARCHIVE_CONFLICT",
+        )
+    else:
+        write_operator_receipt(archive_path, receipt)
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise Phase3FOperatorError("OPERATOR_RECEIPT_ARCHIVE_FAILED") from exc
+    return archive_path
+
+
 @dataclass(frozen=True, slots=True)
 class OperatorInventoryStatus:
     receipt_stage: str
@@ -406,6 +429,7 @@ __all__ = [
     "OperatorInventoryStatus",
     "OperatorReceipt",
     "Phase3FOperatorError",
+    "archive_completed_operator_receipt",
     "inspect_operator_inventory",
     "process_is_running",
     "read_operator_receipt",

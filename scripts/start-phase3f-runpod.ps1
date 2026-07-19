@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [switch]$Execute,
+    [switch]$LiveReadiness,
     [ValidateRange(0.01, 10.0)]
     [decimal]$MaxSpendUsd = 10,
     [ValidateRange(0.01, 10.0)]
@@ -21,6 +22,9 @@ $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($env:RUNPOD_API_KEY)) {
     throw "RUNPOD_API_KEY_NOT_VISIBLE_IN_PROCESS"
+}
+if ($Execute -and $LiveReadiness) {
+    throw "PHASE3F_OPERATOR_ACTION_INVALID"
 }
 if (-not ($SoftStopUsd -lt $HardStopUsd -and $HardStopUsd -lt $MaxSpendUsd)) {
     throw "PHASE3F_BUDGET_ORDER_INVALID"
@@ -66,6 +70,9 @@ $arguments = @(
 )
 if ($Execute) {
     $arguments += "--execute"
+}
+elseif ($LiveReadiness) {
+    $arguments += "--live-readiness"
 }
 
 $supervisorExitCode = 1

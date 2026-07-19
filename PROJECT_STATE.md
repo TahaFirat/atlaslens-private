@@ -2,7 +2,7 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-19T21:30:06+03:00
+last_verified_at: 2026-07-19T22:04:38+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
 product_phase_status: local_operator_handoff_ready_manual_execution_cloud_not_started
@@ -271,7 +271,7 @@ phase_3e_next_action: approve_rights_cleared_multi_region_turkiye_corpus_indepen
 next_product_phase: phase_3f_licensed_multi_region_corpus_and_independent_calibration
 phase_3f_branch: feature_phase3f_multiregion_pilot
 phase_3f_supervisor_commit: 4d6e8f222bb4fc3b3d77463649ff221a7a6ad676
-phase_3f_operator_handoff: ready_manual_execution_dry_run_default
+phase_3f_operator_handoff: live_readiness_required_before_manual_execute
 phase_3f_operator_wrappers: start_status_receipt_bound_terminate
 phase_3f_budget_guard_usd: target_6_soft_7_5_hard_9_absolute_10
 phase_3f_gpu_hourly_ceiling_usd: 0_50
@@ -280,14 +280,21 @@ phase_3f_single_pod: fail_closed_zero_inventory_one_create_no_retry
 phase_3f_runtime_state: c_atlaslensruntime_phase3f_operator_receipt
 phase_3f_artifact_readiness: pass_model_vendor_canonical_lf_receipt
 phase_3f_megaloc_cuda_smoke: pass_preexisting_dimension_8448_finite_l2_normalized_not_rerun
-phase_3f_operator_tests: pass_36_focused_49_phase3f_total_no_provider_call
+phase_3f_operator_tests: pass_51_focused_64_phase3f_total
 phase_3f_static_contract: pass_ruff_strict_mypy
 phase_3f_disk_gate: pass_c_47_666_gib_d_23_901_gib
-phase_3f_runpod_inventory: user_supplied_zero_baseline_no_provider_call_in_handoff
+phase_3f_gpu_schema_root_cause: available_gpu_counts_null_was_global_sequence_error
+phase_3f_gpu_schema_parser: candidate_local_rejection_and_sanitized_aggregate
+phase_3f_gpu_offer_selection: lowest_price_then_a5000_l4_rtx3090_then_others
+phase_3f_gpu_precreate_revalidation: exact_discovered_id_one_read_only_check
+phase_3f_live_gpu_diagnostic: three_authenticated_read_only_graphql_requests_http_200
+phase_3f_live_gpu_shape: gpu_types_lists_lowest_price_object_available_gpu_counts_null
+phase_3f_live_gpu_result: no_eligible_offer_under_required_count_one_gate
+phase_3f_runpod_inventory: authenticated_read_only_pass_zero_pods_endpoints_volumes_templates
 phase_3f_cloud_spend_usd: 0
-phase_3f_cloud_mutations_push_pr: none
+phase_3f_cloud_mutations_push_pr: none_read_only_requests_only
 phase_3f_asda_html: untouched_untracked_not_read
-phase_3f_next_action: operator_reviews_dry_run_then_explicit_execute_in_own_powershell
+phase_3f_next_action: run_live_readiness_and_execute_only_if_ready_true
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
 phase_6c_dataset_qa_ui_gate: pass
@@ -345,7 +352,7 @@ next_phase: phase_6c_in_progress
 
 ## Product Phase 3F local operator handoff checkpoint
 
-Status: **READY FOR MANUAL EXECUTION - CLOUD EXECUTION NOT STARTED**.
+Status: **READY FOR LIVE READINESS - PAID EXECUTION BLOCKED BY CURRENT AVAILABILITY**.
 
 The bounded supervisor from commit `4d6e8f2` now has three thin PowerShell
 operator wrappers. Start is a local-only dry-run unless `-Execute` is supplied;
@@ -364,19 +371,33 @@ start. The wrappers resolve the repository from `PSScriptRoot`, tolerate spaces
 and execution from another working directory, never accept the API key as an
 argument, and do not read `.env` or `asda.html`.
 
-Thirty-six focused local/mocked tests and all 49 Phase 3F tests passed,
-including dry-run zero mutation,
+Fifty-one focused local/mocked tests and all 64 Phase 3F tests passed, including
+dry-run zero mutation,
 single-create/finally termination, budget thresholds, secret redaction, stale
 state/PID, PowerShell syntax and receipt-bound termination. Ruff and strict
 mypy passed. The exact model and vendor/receipt hashes revalidated; the existing
 offline CUDA readiness receipt remains PASS with finite normalized dimension
 8,448 and was not rerun. C: had 47.666 GiB and D: 23.901 GiB free.
 
-No RunPod API call, Pod, volume, endpoint, template, cloud spend, GitHub push or
-other external mutation occurred in this handoff. The current zero-resource
-inventory is the explicit operator-supplied baseline; it was intentionally not
-queried because this task prohibited RunPod calls. The exact commands and output
-paths are in [the Phase 3F operator runbook](docs/phase3f/operator-runbook.md).
+The first paid attempt stopped before creation with `gpu_availability_invalid`.
+Three bounded authenticated read-only GraphQL diagnostics returned HTTP 200 and
+the documented `data.gpuTypes[]` list/detail shape. The provider spelling is
+`uninterruptablePrice`; the code already used it. The actual fault was that live
+`lowestPrice` objects exposed usable stock/price fields while
+`availableGpuCounts` was `null`, and the parser treated that one candidate field
+as a global sequence invariant. The new parser rejects only that candidate,
+aggregates sanitized reasons, discovers exact provider IDs, selects by price then
+declared preference, and revalidates the same ID immediately before creation.
+
+Current L4 and RTX 3090 Secure Cloud details reported `Low` stock and bounded
+prices, but their GPU-count arrays were still null. The explicitly required
+`availableGpuCounts`-contains-1 gate therefore produces `NO_ELIGIBLE_GPU_OFFER`;
+no paid retry is authorized until `-LiveReadiness` returns
+`ready_for_execute=true`. Four additional authenticated read-only inventory
+requests verified 0 Pods, endpoints, network volumes and templates. No resource,
+cloud spend, GitHub push or other external mutation occurred. The exact commands
+and output paths are in
+[the Phase 3F operator runbook](docs/phase3f/operator-runbook.md).
 
 ## Product Phase 3D investor-ready private demo checkpoint
 

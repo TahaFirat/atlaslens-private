@@ -15,13 +15,14 @@ import pytest
 from atlaslens_api.phase3f.operator import (
     OperatorReceipt,
     Phase3FOperatorError,
+    archive_completed_operator_receipt,
     inspect_operator_inventory,
     read_operator_receipt,
     require_startable_receipt,
     terminate_receipt_bound_pod,
     write_operator_receipt,
 )
-from atlaslens_api.phase3f.runpod import RunPodInventory
+from atlaslens_api.phase3f.runpod import GPUAvailabilityReport, GPUOffer, RunPodInventory
 from atlaslens_api.phase3f.safety import PodRecord
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -113,6 +114,24 @@ def test_stale_or_live_operator_receipt_fails_closed(tmp_path: Path) -> None:
     )
     write_operator_receipt(path, terminated)
     require_startable_receipt(path, is_process_running=lambda _pid: True)
+
+
+def test_completed_receipt_is_archived_without_fake_termination(tmp_path: Path) -> None:
+    path = tmp_path / "_operator" / "phase3f-current.json"
+    completed = _receipt(pod_id=None, stage="preflight").update_lifecycle(
+        stage="terminated",
+        finished_at="2026-07-19T19:00:00+00:00",
+        cleanup_verified=True,
+    )
+    write_operator_receipt(path, completed)
+
+    archived = archive_completed_operator_receipt(path)
+
+    assert archived == path.parent / "archive" / f"{completed.run_id}.json"
+    assert archived is not None
+    assert read_operator_receipt(archived) == completed
+    assert not path.exists()
+    assert completed.pod_id is None
 
 
 def test_status_is_read_only_and_rejects_a_second_pod() -> None:
@@ -214,6 +233,74 @@ def test_default_supervisor_action_is_local_dry_run_without_state_or_api(
     assert output["cloud_mutations"] == 0
 
 
+def test_live_readiness_is_authenticated_read_only_and_does_not_write_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_supervisor()
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-only-placeholder")
+    monkeypatch.setattr(module, "_disk_gate", lambda: None)
+    monkeypatch.setattr(
+        module,
+        "_preflight_repository",
+        lambda: ("f" * 40, ("tracked.py",)),
+    )
+    monkeypatch.setattr(module, "_verify_local_readiness", lambda: None)
+    offer = GPUOffer(
+        gpu_type_id="NVIDIA L4",
+        display_name="L4",
+        memory_gb=24,
+        hourly_price=Decimal("0.39"),
+        stock_status="Low",
+        cloud_type="SECURE",
+        secure_cloud=True,
+        community_cloud=False,
+        available_gpu_counts=(1,),
+    )
+    report = GPUAvailabilityReport(
+        selected_offer=offer,
+        candidates=(),
+        graphql_request_count=2,
+        http_statuses=(200, 200),
+        top_level_keys=(("data",), ("data",)),
+        response_schema_classification="official_gpuTypes_list_and_detail_lists",
+    )
+
+    class _ReadOnlyClient:
+        api_request_count = 6
+        cloud_mutation_count = 0
+        last_graphql_errors: tuple[object, ...] = ()
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _ReadOnlyClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def inventory(self) -> RunPodInventory:
+            return RunPodInventory((), (), (), ())
+
+        def check_gpu_availability(self, *, max_hourly_price: Decimal) -> GPUAvailabilityReport:
+            assert max_hourly_price == Decimal("0.50")
+            return report
+
+    monkeypatch.setattr(module, "RunPodV1Client", _ReadOnlyClient)
+    runtime = ROOT / ".local" / "live readiness test paths" / tmp_path.name
+
+    result = module.main(["--live-readiness", "--runtime-root", str(runtime)])
+
+    assert result == 0
+    assert not runtime.exists()
+    output = json.loads(capsys.readouterr().out)
+    assert output["ready_for_execute"] is True
+    assert output["runpod_api_calls"] == 6
+    assert output["cloud_mutations"] == 0
+
+
 def test_powershell_wrappers_are_explicit_receipt_bound_and_secret_safe() -> None:
     start = START_PATH.read_text(encoding="utf-8")
     status = STATUS_PATH.read_text(encoding="utf-8")
@@ -221,7 +308,9 @@ def test_powershell_wrappers_are_explicit_receipt_bound_and_secret_safe() -> Non
     combined = start + status + stop
 
     assert "[switch]$Execute" in start
+    assert "[switch]$LiveReadiness" in start
     assert '$arguments += "--execute"' in start
+    assert '$arguments += "--live-readiness"' in start
     assert "$MaxSpendUsd = 10" in start
     assert "$SoftStopUsd = 7.5" in start
     assert "$HardStopUsd = 9" in start

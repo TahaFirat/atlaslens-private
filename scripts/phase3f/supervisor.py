@@ -24,6 +24,7 @@ if str(SOURCE) not in sys.path:
 from atlaslens_api.phase3f.operator import (  # noqa: E402
     OperatorReceipt,
     Phase3FOperatorError,
+    archive_completed_operator_receipt,
     inspect_operator_inventory,
     read_operator_receipt,
     require_startable_receipt,
@@ -538,6 +539,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="atlaslens-phase3f-supervisor")
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--execute", action="store_true")
+    actions.add_argument("--live-readiness", action="store_true")
     actions.add_argument("--status", action="store_true")
     actions.add_argument("--terminate", action="store_true")
     parser.add_argument("--runtime-root", type=Path, default=Path(r"C:\AtlasLensRuntime\phase3f"))
@@ -641,6 +643,79 @@ def _run_dry_run(
     return 0
 
 
+def _run_live_readiness(
+    args: argparse.Namespace,
+    *,
+    token: str,
+    receipt_path: Path,
+) -> int:
+    policy = _policy(args)
+    _disk_gate()
+    _head, _tracked = _preflight_repository()
+    _verify_local_readiness()
+    require_startable_receipt(receipt_path)
+    config = RunPodConfig(
+        image_name=IMAGE,
+        gpu_type_preferences=GPU_PREFERENCES,
+        container_disk_gb=40,
+        min_gpu_memory_gb=16,
+    )
+    with RunPodV1Client(api_token=token, config=config) as client:
+        inventory = client.inventory()
+        require_empty_inventory(inventory)
+        try:
+            report = client.check_gpu_availability(
+                max_hourly_price=policy.max_hourly_cost_usd,
+            )
+        except RunPodAPIError as exc:
+            print(
+                json.dumps(
+                    {
+                        "action": "live-readiness",
+                        "ready_for_execute": False,
+                        "blocker_code": exc.code,
+                        "graphql_errors": [
+                            item.to_public_dict() for item in client.last_graphql_errors
+                        ],
+                        "runpod_api_calls": client.api_request_count,
+                        "cloud_mutations": client.cloud_mutation_count,
+                        "pods": len(inventory.pods),
+                        "endpoints": len(inventory.endpoint_ids),
+                        "network_volumes": len(inventory.network_volume_ids),
+                        "templates": len(inventory.template_ids),
+                        "secret_values_included": False,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return 1
+        ready = report.selected_offer is not None
+        print(
+            json.dumps(
+                {
+                    "action": "live-readiness",
+                    **report.to_public_dict(),
+                    "ready_for_execute": ready,
+                    "blocker_code": None if ready else "NO_ELIGIBLE_GPU_OFFER",
+                    "graphql_errors": [],
+                    "runpod_api_calls": client.api_request_count,
+                    "cloud_mutations": client.cloud_mutation_count,
+                    "pods": len(inventory.pods),
+                    "endpoints": len(inventory.endpoint_ids),
+                    "network_volumes": len(inventory.network_volume_ids),
+                    "templates": len(inventory.template_ids),
+                    "secret_values_included": False,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return 0 if ready else 1
+
+
 def _record_failed_operator_state(
     receipt_path: Path,
     *,
@@ -702,6 +777,7 @@ def _run_execute(
         head, tracked = _preflight_repository()
         _verify_local_readiness()
         require_startable_receipt(receipt_path)
+        archive_completed_operator_receipt(receipt_path)
         write_operator_receipt(receipt_path, operator_receipt)
         owns_operator_receipt = True
         _emit("PHASE3F_LOCAL_PREFLIGHT_OK", branch=REQUIRED_BRANCH, head=head)
@@ -752,6 +828,7 @@ def _run_execute(
                 idempotency_key=f"atlaslens-phase3f-create-{run_id}",
                 hourly_cost_usd=offer.hourly_price,
                 max_runtime_seconds=policy.max_runtime_seconds,
+                gpu_type_id=offer.gpu_type_id,
                 public_ports=(22,),
             )
             session = SinglePodSession(
@@ -907,6 +984,12 @@ def main(argv: list[str] | None = None) -> int:
         receipt_path = _operator_receipt_path(args)
         if args.status or args.terminate:
             return _run_control(args, token=token, receipt_path=receipt_path)
+        if args.live_readiness:
+            return _run_live_readiness(
+                args,
+                token=token,
+                receipt_path=receipt_path,
+            )
         if not args.execute:
             return _run_dry_run(args, receipt_path=receipt_path)
         return _run_execute(args, token=token, receipt_path=receipt_path)

@@ -13,6 +13,18 @@ Dry-run from any PowerShell working directory:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\start-phase3f-runpod.ps1" -MaxSpendUsd 10 -SoftStopUsd 7.5 -HardStopUsd 9 -MaxGpuHourlyUsd 0.50 -MaxWallMinutes 345
 ```
 
+Authenticated read-only readiness immediately before any paid retry:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\start-phase3f-runpod.ps1" -LiveReadiness -RuntimeRoot "C:\AtlasLensRuntime\phase3f" -MaxSpendUsd 10 -SoftStopUsd 7.5 -HardStopUsd 9 -MaxGpuHourlyUsd 0.50 -MaxWallMinutes 345
+```
+
+This mode verifies all four inventories, discovers current provider GPU IDs,
+queries only discovered candidates with at least 16 GiB, and reports sanitized
+stock, price and rejection classifications. It cannot create or terminate a
+resource. Do not run the paid command unless it returns
+`ready_for_execute=true`, `cloud_mutations=0`, and inventories `0/0/0/0`.
+
 Real start, only after reviewing the dry-run result:
 
 ```powershell
@@ -54,7 +66,8 @@ Stop on these operator blockers: `ACTIVE_POD_INVENTORY_NOT_ZERO`,
 `ACTIVE_ENDPOINT_INVENTORY_NOT_ZERO`, `NETWORK_VOLUME_INVENTORY_NOT_ZERO`,
 `TEMPLATE_INVENTORY_NOT_ZERO`, `UNEXPECTED_POD_INVENTORY`,
 `OPERATOR_PROCESS_ALREADY_RUNNING`, `STALE_OPERATOR_RECEIPT_REQUIRES_TERMINATE`,
-`no_eligible_gpu_offer`, `projected_cost_exceeds_target`,
+`NO_ELIGIBLE_GPU_OFFER`, `GPU_AVAILABILITY_GRAPHQL_ERRORS`,
+`projected_cost_exceeds_target`,
 `soft_stop_budget_reached`, `termination_budget_reached`,
 `absolute_budget_reached`, `runtime_limit_reached`,
 `PHASE3F_TERMINATION_UNVERIFIED`, or `CLOUD_CLEANUP_UNVERIFIED`.
