@@ -1,5 +1,36 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F validates the minimum REST Pod contract before create
+
+- Context: Run `d63e2c8b65f725bb5ba4f026c6ab193b` made its only POST and
+  received HTTP 400 with `provider_error_invalid_json_shape`, no Pod ID, and a
+  restored 0/0/0/0 inventory. That historical diagnostic proves the body was
+  valid JSON but not an object; it did not retain enough metadata to distinguish
+  an array from a scalar or to recover a provider field path. The exact outgoing
+  request is reconstructable from the committed adapter and included
+  `volumeInGb=0`, a null `templateId`, `locked=false`, and availability priority.
+  RunPod's official REST contract documents a 20 GiB default Pod volume, a
+  separate optional `networkVolumeId`, and custom priority for honoring exact
+  GPU ID order.
+- Decision: Reduce the Phase 3F request to the official bounded GPU fields, use a
+  20 GiB Pod volume mounted at `/workspace`, omit network-volume/template/null,
+  CPU-only and Serverless fields, and validate field set, JSON types, ranges,
+  exact selected GPU ID, one boolean-false non-interruptible GPU, disks, and the
+  named secret reference offline before POST. Treat HTTP 400 as capacity only
+  when a strict provider code/message allowlist says no capacity, while retaining
+  the existing 404/409/422 allocation status policy. Classify schema/field errors
+  as `RUNPOD_CREATE_PAYLOAD_INVALID` and unknown 400 responses as
+  `RUNPOD_CREATE_BAD_REQUEST_UNKNOWN`.
+- Alternatives: Continue sending zero Pod storage and null placeholders; treat
+  every 400 as a capacity race; persist raw provider bodies; resolve the named
+  secret locally; retry create.
+- Consequences: Dry-run exposes field names and JSON types with zero API calls,
+  zero creates, and no values. Future array validation responses retain only safe
+  field path/type/message-class metadata; scalar/text/empty responses retain only
+  length, digest, content type, and allowlist class. The historical 400's exact
+  array/scalar subtype and provider-reported field remain honestly unavailable.
+- Target phase: Product Phase 3F bounded RunPod pilot only.
+
 ## 2026-07-19 - Phase 3F binds a 201 Pod ID before validating create fields
 
 - Context: Run `c1b3f58f9eddc945db24399c7173e493` ended with

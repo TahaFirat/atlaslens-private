@@ -13,6 +13,12 @@ Dry-run from any PowerShell working directory:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\start-phase3f-runpod.ps1" -MaxSpendUsd 10 -SoftStopUsd 7.5 -HardStopUsd 9 -MaxGpuHourlyUsd 0.50 -MaxWallMinutes 345
 ```
 
+The dry-run performs no RunPod request and now renders only the create payload's
+field names and JSON types. Require `payload_contract_valid=true`,
+`create_attempts=0`, `cloud_mutations=0`, and
+`secret_values_included=false`. Environment values, including the RunPod secret
+reference and ephemeral SSH public key, are never rendered.
+
 Authenticated read-only readiness immediately before any paid retry:
 
 ```powershell
@@ -66,14 +72,30 @@ one REST create attempt. A sanitized allocation/no-capacity response becomes
 `GPU_CAPACITY_RACE_NO_POD`; no alternate GPU or Pod is tried, no successful-run
 receipt or spend is recorded, and all four inventories must be restored to zero.
 Create response handling classifies HTTP status before looking at any Pod field.
-Only HTTP 201 enters success parsing. Status 400/404/409/422 is a capacity race;
-401 is `RUNPOD_AUTH_INVALID`, 403 is `RUNPOD_PERMISSION_DENIED`, 429 is
+Only HTTP 201 enters success parsing. HTTP 400 is a capacity race only when a
+strict provider code/message allowlist explicitly reports no instances or
+capacity; the pre-existing 404/409/422 allocation statuses remain capacity
+failures. HTTP 400 schema/field validation is
+`RUNPOD_CREATE_PAYLOAD_INVALID`; an unrecognized bad request is
+`RUNPOD_CREATE_BAD_REQUEST_UNKNOWN`. JSON-array validation diagnostics retain
+only the safe field path, type/code, and a general message class. Text/scalar or
+empty errors retain only byte length, SHA-256, normalized content type, and an
+allowlist classification; raw response bodies are not persisted or printed. 401
+is `RUNPOD_AUTH_INVALID`, 403 is `RUNPOD_PERMISSION_DENIED`, 429 is
 `RUNPOD_RATE_LIMITED`, and 5xx is `RUNPOD_PROVIDER_ERROR`. On HTTP 201 the Pod ID
 is atomically bound to the operator receipt before any remaining field is
 validated. The response must not advertise `interruptible=true`; an authenticated
 `GET /pods/{id}` must then verify exact JSON boolean `false`. Missing, null or
 string values are never coerced. Every post-ID validation failure carries the
 receipt-bound Pod into the one-Pod `finally` termination path.
+The create request is validated offline before POST against the bounded official
+GPU Pod contract. It contains only name, digest-pinned image, cloud/compute type,
+the exact selected GPU ID with custom priority, one non-interruptible GPU, a
+40 GiB container disk, a 20 GiB Pod volume mounted at `/workspace`, SSH port and
+public-IP support, and necessary environment fields. A Pod volume belongs to the
+Pod and persists across its restarts; it is not a separately created network
+volume. `networkVolumeId`, template/null placeholders, CPU-only fields and
+Serverless fields are omitted.
 Mapillary access is mapped through the named RunPod secret reference. Source,
 canonical-LF vendor files and the exact model are checksum-verified before
 transfer. The cloud job is watched in the foreground, output is downloaded and
@@ -87,6 +109,7 @@ Stop on these operator blockers: `ACTIVE_POD_INVENTORY_NOT_ZERO`,
 `OPERATOR_PROCESS_ALREADY_RUNNING`, `STALE_OPERATOR_RECEIPT_REQUIRES_TERMINATE`,
 `NO_ELIGIBLE_GPU_OFFER`, `GPU_AVAILABILITY_GRAPHQL_ERRORS`,
 `GPU_CAPACITY_RACE_NO_POD`,
+`RUNPOD_CREATE_PAYLOAD_INVALID`, `RUNPOD_CREATE_BAD_REQUEST_UNKNOWN`,
 `RUNPOD_AUTH_INVALID`, `RUNPOD_PERMISSION_DENIED`, `RUNPOD_RATE_LIMITED`,
 `RUNPOD_PROVIDER_ERROR`,
 `projected_cost_exceeds_target`,

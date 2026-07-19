@@ -32,11 +32,13 @@ from atlaslens_api.phase3f.operator import (  # noqa: E402
     write_operator_receipt,
 )
 from atlaslens_api.phase3f.runpod import (  # noqa: E402
+    GPUOffer,
     PodConnection,
     RunPodAPIError,
     RunPodConfig,
     RunPodInventory,
     RunPodV1Client,
+    build_create_payload,
 )
 from atlaslens_api.phase3f.safety import (  # noqa: E402
     BudgetPolicy,
@@ -568,6 +570,35 @@ def _policy(args: argparse.Namespace) -> BudgetPolicy:
     )
 
 
+def _payload_contract_public(
+    config: RunPodConfig,
+    *,
+    gpu_type_id: str,
+    cloud_type: str,
+) -> dict[str, object]:
+    preview_request = PodRequest(
+        run_marker="atlaslens-phase3f-contract-preview",
+        idempotency_key="atlaslens-phase3f-contract-preview",
+        hourly_cost_usd=Decimal("0.50"),
+        max_runtime_seconds=30 * 60,
+        gpu_type_id=gpu_type_id,
+        public_ports=(22,),
+    )
+    preview_offer = GPUOffer(
+        gpu_type_id=gpu_type_id,
+        display_name=gpu_type_id,
+        memory_gb=16,
+        hourly_price=Decimal("0.50"),
+        stock_status="Low",
+        cloud_type=cloud_type,
+        secure_cloud=cloud_type == "SECURE",
+        community_cloud=cloud_type == "COMMUNITY",
+        available_gpu_counts=None,
+    )
+    _payload, report = build_create_payload(config, preview_request, preview_offer)
+    return report.to_public_dict()
+
+
 def _operator_receipt_path(args: argparse.Namespace) -> Path:
     candidate = args.operator_receipt
     if candidate is None:
@@ -622,6 +653,17 @@ def _run_dry_run(
     head, _tracked = _preflight_repository()
     _verify_local_readiness()
     require_startable_receipt(receipt_path)
+    config = RunPodConfig(
+        image_name=IMAGE,
+        gpu_type_preferences=GPU_PREFERENCES,
+        container_disk_gb=40,
+        min_gpu_memory_gb=16,
+    )
+    contract = _payload_contract_public(
+        config,
+        gpu_type_id=GPU_PREFERENCES[0],
+        cloud_type="SECURE",
+    )
     print(
         json.dumps(
             {
@@ -637,6 +679,8 @@ def _run_dry_run(
                 "vendor_canonical_lf_sha256": SOURCE_LF_SHA256,
                 "runpod_api_calls": 0,
                 "cloud_mutations": 0,
+                "create_attempts": 0,
+                **contract,
                 "ready_for_execute": True,
                 "secret_values_included": False,
             },
@@ -697,6 +741,13 @@ def _run_live_readiness(
             )
             return 1
         ready = report.selected_offer is not None
+        contract: dict[str, object] = {}
+        if report.selected_offer is not None:
+            contract = _payload_contract_public(
+                config,
+                gpu_type_id=report.selected_offer.gpu_type_id,
+                cloud_type=report.selected_offer.cloud_type,
+            )
         print(
             json.dumps(
                 {
@@ -707,6 +758,8 @@ def _run_live_readiness(
                     "graphql_errors": [],
                     "runpod_api_calls": client.api_request_count,
                     "cloud_mutations": client.cloud_mutation_count,
+                    "create_attempts": 0,
+                    **contract,
                     "pods": len(inventory.pods),
                     "endpoints": len(inventory.endpoint_ids),
                     "network_volumes": len(inventory.network_volume_ids),

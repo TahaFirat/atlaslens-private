@@ -7,6 +7,7 @@ before creation; no GraphQL mutation is implemented here.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -27,6 +28,7 @@ from atlaslens_api.phase3f.safety import (
 REST_BASE_URL: Final = "https://rest.runpod.io/v1/"
 GRAPHQL_URL: Final = "https://api.runpod.io/graphql"
 MAX_CONTAINER_DISK_GB: Final = 40
+POD_VOLUME_GB: Final = 20
 MIN_GPU_MEMORY_GB: Final = 16
 MAX_RESPONSE_BYTES: Final = 2 * 1024 * 1024
 _RESOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,190}$")
@@ -41,11 +43,59 @@ MAPILLARY_ENV_REFERENCE: Final = (
 )
 _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _URL = re.compile(r"https?://[^\s]+", re.I)
-_CAPACITY_ERROR_STATUSES: Final = frozenset({400, 404, 409, 422})
+_ALLOCATION_ERROR_STATUSES: Final = frozenset({404, 409, 422})
 _SENSITIVE_JSON_KEY = re.compile(
     r"(?:authorization|cookie|credential|password|secret|token|api[-_]?key)", re.I
 )
 _SAFE_JSON_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+_SAFE_CONTENT_TYPE = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
+_SAFE_ERROR_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_SAFE_FIELD_PATH = re.compile(r"^[A-Za-z][A-Za-z0-9_.\[\]-]{0,190}$")
+_SECRET_REFERENCE = re.compile(r"^\{\{ RUNPOD_SECRET_[a-z0-9_]{1,96} \}\}$")
+_CAPACITY_CODE = re.compile(
+    r"^(?:NO_CAPACITY|INSUFFICIENT_CAPACITY|NO_AVAILABLE_INSTANCES|"
+    r"GPU_UNAVAILABLE|GPU_CAPACITY_UNAVAILABLE|OUT_OF_CAPACITY|"
+    r"NO_MACHINE_AVAILABLE)$",
+    re.I,
+)
+_CAPACITY_MESSAGE = re.compile(
+    r"(?:\b(?:no|zero)\s+(?:available\s+)?(?:gpu\s+)?(?:instances?|machines?|capacity)\b|"
+    r"\binsufficient\s+(?:gpu\s+)?capacity\b|"
+    r"\bout\s+of\s+(?:gpu\s+)?capacity\b|"
+    r"\bno\s+(?:gpu\s+)?instances?\s+(?:is\s+|are\s+)?available\b)",
+    re.I,
+)
+_VALIDATION_MESSAGE = re.compile(
+    r"\b(?:validation|schema|required|missing|invalid|unknown|unexpected|field|"
+    r"must\s+be|greater\s+than|less\s+than|not\s+permitted)\b",
+    re.I,
+)
+_CREATE_PAYLOAD_FIELDS: Final = frozenset(
+    {
+        "name",
+        "imageName",
+        "cloudType",
+        "computeType",
+        "gpuTypeIds",
+        "gpuTypePriority",
+        "gpuCount",
+        "interruptible",
+        "containerDiskInGb",
+        "volumeInGb",
+        "volumeMountPath",
+        "ports",
+        "supportPublicIp",
+        "env",
+    }
+)
+_CREATE_ENV_FIELDS: Final = frozenset(
+    {
+        "MAPILLARY_ACCESS_TOKEN",
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        "PUBLIC_KEY",
+    }
+)
 _MISSING: Final = object()
 _GPU_LIST_QUERY: Final = """query AtlasLensPhase3FGpuTypes {
   gpuTypes {
@@ -100,6 +150,82 @@ def _object(value: object, code: str) -> Mapping[str, object]:
 def _sequence(value: object, code: str) -> Sequence[object]:
     _require(isinstance(value, Sequence) and not isinstance(value, str | bytes), code)
     return cast(Sequence[object], value)
+
+
+def _json_type(value: object) -> str:
+    if value is _MISSING:
+        return "missing"
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int | float):
+        return "number"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, Sequence) and not isinstance(value, bytes | bytearray):
+        return "array"
+    return "unknown"
+
+
+def _safe_content_type(value: str | None) -> str:
+    media_type = "" if value is None else value.split(";", maxsplit=1)[0].strip().lower()
+    return media_type if _SAFE_CONTENT_TYPE.fullmatch(media_type) else "unavailable"
+
+
+def _safe_error_code(value: object) -> str:
+    if (
+        isinstance(value, str)
+        and _SAFE_ERROR_CODE.fullmatch(value)
+        and not _SENSITIVE_JSON_KEY.search(value)
+    ):
+        return value
+    return "provider_validation_error"
+
+
+def _safe_field_path(value: object) -> str:
+    if isinstance(value, str):
+        if _SAFE_FIELD_PATH.fullmatch(value) and not _SENSITIVE_JSON_KEY.search(value):
+            return value
+        return "<redacted-field>"
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 9999:
+                parts.append(f"[{item}]")
+            elif (
+                isinstance(item, str)
+                and _SAFE_JSON_KEY.fullmatch(item)
+                and not _SENSITIVE_JSON_KEY.search(item)
+            ):
+                parts.append(item)
+            else:
+                return "<redacted-field>"
+        rendered = ".".join(parts).replace(".[", "[")
+        if rendered and len(rendered) <= 191:
+            return rendered
+    return "<unavailable-field>"
+
+
+def _validation_message_class(code: str, message: object) -> str:
+    normalized = code.lower()
+    text = message.lower() if isinstance(message, str) else ""
+    combined = f"{normalized} {text}"
+    if "missing" in combined or "required" in combined:
+        return "required_field_missing"
+    if "extra" in combined or "unknown" in combined or "not permitted" in combined:
+        return "unknown_field"
+    if "type" in combined or "parsing" in combined:
+        return "wrong_json_type"
+    if any(term in combined for term in ("greater", "less", "range", "limit")):
+        return "value_out_of_range"
+    if "enum" in combined or "literal" in combined or "unsupported" in combined:
+        return "unsupported_value"
+    if "invalid" in combined or "value_error" in combined:
+        return "invalid_value"
+    return "provider_validation_error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +290,124 @@ class GPUOffer:
         if self.capacity_confirmed:
             return "available_gpu_counts"
         return "advertised_stock_status"
+
+
+def validate_create_payload_contract(
+    payload: Mapping[str, object],
+    *,
+    expected_gpu_type_id: str,
+    expected_image_name: str,
+    expected_cloud_type: str,
+) -> CreatePayloadContractReport:
+    """Validate the bounded Phase 3F subset of RunPod's official Pod schema."""
+
+    code = "RUNPOD_CREATE_PAYLOAD_INVALID"
+    _require(set(payload) == _CREATE_PAYLOAD_FIELDS, code)
+    _require(
+        isinstance(payload.get("name"), str)
+        and bool(_MARKER.fullmatch(cast(str, payload["name"]))),
+        code,
+    )
+    _require(payload.get("imageName") == expected_image_name, code)
+    _require(payload.get("cloudType") == expected_cloud_type, code)
+    _require(expected_cloud_type in {"SECURE", "COMMUNITY"}, code)
+    _require(payload.get("computeType") == "GPU", code)
+    gpu_type_ids = payload.get("gpuTypeIds")
+    _require(
+        isinstance(gpu_type_ids, list)
+        and gpu_type_ids == [expected_gpu_type_id]
+        and bool(_GPU_TYPE_ID.fullmatch(expected_gpu_type_id)),
+        code,
+    )
+    _require(payload.get("gpuTypePriority") == "custom", code)
+    _require(type(payload.get("gpuCount")) is int and payload["gpuCount"] == 1, code)
+    _require(payload.get("interruptible") is False, code)
+    container_disk = payload.get("containerDiskInGb")
+    _require(
+        type(container_disk) is int
+        and 1 <= container_disk <= MAX_CONTAINER_DISK_GB,
+        code,
+    )
+    volume = payload.get("volumeInGb")
+    _require(type(volume) is int and volume == POD_VOLUME_GB, code)
+    _require(payload.get("volumeMountPath") == "/workspace", code)
+    _require(payload.get("ports") == ["22/tcp"], code)
+    _require(payload.get("supportPublicIp") is True, code)
+    _require("networkVolumeId" not in payload, code)
+    environment = _object(payload.get("env"), code)
+    _require(
+        set(environment).issubset(_CREATE_ENV_FIELDS)
+        and {
+            "MAPILLARY_ACCESS_TOKEN",
+            "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+        }.issubset(environment),
+        code,
+    )
+    _require(environment.get("MAPILLARY_ACCESS_TOKEN") == MAPILLARY_ENV_REFERENCE, code)
+    _require(
+        isinstance(environment.get("MAPILLARY_ACCESS_TOKEN"), str)
+        and bool(
+            _SECRET_REFERENCE.fullmatch(
+                cast(str, environment["MAPILLARY_ACCESS_TOKEN"])
+            )
+        ),
+        code,
+    )
+    _require(environment.get("HF_HUB_OFFLINE") == "1", code)
+    _require(environment.get("TRANSFORMERS_OFFLINE") == "1", code)
+    public_key = environment.get("PUBLIC_KEY", _MISSING)
+    _require(
+        public_key is _MISSING
+        or (
+            isinstance(public_key, str)
+            and bool(_SSH_PUBLIC_KEY.fullmatch(public_key))
+        ),
+        code,
+    )
+    _require(all(isinstance(value, str) for value in environment.values()), code)
+    fields = tuple(sorted((name, _json_type(value)) for name, value in payload.items()))
+    env_fields = tuple(
+        sorted((str(name), _json_type(value)) for name, value in environment.items())
+    )
+    return CreatePayloadContractReport(fields=fields, env_fields=env_fields)
+
+
+def build_create_payload(
+    config: RunPodConfig,
+    request: PodRequest,
+    offer: GPUOffer,
+) -> tuple[dict[str, object], CreatePayloadContractReport]:
+    environment: dict[str, object] = {
+        "MAPILLARY_ACCESS_TOKEN": MAPILLARY_ENV_REFERENCE,
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+    }
+    if config.ssh_public_key is not None:
+        environment["PUBLIC_KEY"] = config.ssh_public_key
+    payload: dict[str, object] = {
+        "name": request.run_marker,
+        "imageName": config.image_name,
+        "cloudType": offer.cloud_type,
+        "computeType": "GPU",
+        "gpuTypeIds": [offer.gpu_type_id],
+        "gpuTypePriority": "custom",
+        "gpuCount": 1,
+        "interruptible": False,
+        "containerDiskInGb": config.container_disk_gb,
+        "volumeInGb": POD_VOLUME_GB,
+        "volumeMountPath": "/workspace",
+        "ports": ["22/tcp"],
+        "supportPublicIp": True,
+        "env": environment,
+    }
+    report = validate_create_payload_contract(
+        payload,
+        expected_gpu_type_id=offer.gpu_type_id,
+        expected_image_name=config.image_name,
+        expected_cloud_type=offer.cloud_type,
+    )
+    return payload, report
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +517,20 @@ class GraphQLErrorDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class CreateValidationErrorDiagnostic:
+    field_path: str
+    type_code: str
+    message_class: str
+
+    def to_public_dict(self) -> dict[str, str]:
+        return {
+            "field_path": self.field_path,
+            "type_code": self.type_code,
+            "message_class": self.message_class,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CreateResponseDiagnostic:
     http_status: int
     top_level_keys: tuple[str, ...]
@@ -280,6 +538,12 @@ class CreateResponseDiagnostic:
     interruptible_present: bool | None
     interruptible_json_type: str
     classification: str
+    body_kind: str
+    byte_length: int
+    sha256: str | None
+    content_type: str
+    failure_code: str | None
+    validation_errors: tuple[CreateValidationErrorDiagnostic, ...] = ()
     secret_free: bool = True
 
     def to_public_dict(self) -> dict[str, object]:
@@ -290,7 +554,36 @@ class CreateResponseDiagnostic:
             "interruptible_present": self.interruptible_present,
             "interruptible_json_type": self.interruptible_json_type,
             "response_classification": self.classification,
+            "response_body_kind": self.body_kind,
+            "response_byte_length": self.byte_length,
+            "response_sha256": self.sha256,
+            "response_content_type": self.content_type,
+            "failure_code": self.failure_code,
+            "validation_errors": [
+                item.to_public_dict() for item in self.validation_errors
+            ],
             "secret_free": self.secret_free,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CreatePayloadContractReport:
+    fields: tuple[tuple[str, str], ...]
+    env_fields: tuple[tuple[str, str], ...]
+    valid: bool = True
+
+    def to_public_dict(self) -> dict[str, object]:
+        return {
+            "payload_fields": [
+                {"name": name, "json_type": json_type}
+                for name, json_type in self.fields
+            ],
+            "payload_env_fields": [
+                {"name": name, "json_type": json_type}
+                for name, json_type in self.env_fields
+            ],
+            "payload_contract_valid": self.valid,
+            "secret_values_included": False,
         }
 
 
@@ -953,25 +1246,15 @@ class RunPodV1Client:
         _require(request.gpu_count == 1, "gpu_count_must_be_one")
         _require(not request.interruptible, "interruptible_not_allowed")
         _require(request.network_volume_id is None, "network_volume_not_allowed")
-        _require(request.public_ports in {(), (22,)}, "ports_not_allowed")
-        _require(
-            (request.public_ports == (22,)) == (self._config.ssh_public_key is not None),
-            "ssh_configuration_mismatch",
-        )
+        _require(request.public_ports == (22,), "ssh_port_required")
+        _require(self._config.ssh_public_key is not None, "ssh_configuration_mismatch")
         _require(request.gpu_type_id is not None, "gpu_type_id_required")
         offer = self.revalidate_gpu_offer(
             cast(str, request.gpu_type_id),
             max_hourly_price=request.hourly_cost_usd,
         )
         self._last_offer = offer
-        ports = ["22/tcp"] if request.public_ports == (22,) else []
-        environment = {
-            "MAPILLARY_ACCESS_TOKEN": MAPILLARY_ENV_REFERENCE,
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-        }
-        if self._config.ssh_public_key is not None:
-            environment["PUBLIC_KEY"] = self._config.ssh_public_key
+        create_payload, _contract = build_create_payload(self._config, request, offer)
         self._cloud_mutation_count += 1
         payload = self._request_json(
             "POST",
@@ -979,23 +1262,7 @@ class RunPodV1Client:
             expected_status=201,
             response_observer=self._observe_create_response,
             status_classifier=self._classify_create_status,
-            json_body={
-                "name": request.run_marker,
-                "imageName": self._config.image_name,
-                "cloudType": offer.cloud_type,
-                "computeType": "GPU",
-                "gpuTypeIds": [offer.gpu_type_id],
-                "gpuTypePriority": "availability",
-                "gpuCount": 1,
-                "containerDiskInGb": self._config.container_disk_gb,
-                "templateId": None,
-                "volumeInGb": 0,
-                "ports": ports,
-                "supportPublicIp": bool(ports),
-                "interruptible": False,
-                "locked": False,
-                "env": environment,
-            },
+            json_body=create_payload,
         )
         row = _object(payload, "create_response_invalid")
         pod_id = _resource_id(row.get("id"), "create_response_invalid")
@@ -1010,7 +1277,11 @@ class RunPodV1Client:
             self._validate_interruptible(row, pod_id)
             _require(row.get("endpointId") is None, "create_response_endpoint_bound")
             _require(row.get("networkVolume") is None, "create_response_network_volume")
-            _require(row.get("volumeInGb") == 0, "create_response_volume")
+            _require(row.get("volumeInGb") == POD_VOLUME_GB, "create_response_volume")
+            _require(
+                row.get("volumeMountPath") == "/workspace",
+                "create_response_volume_mount",
+            )
             disk = row.get("containerDiskInGb")
             _require(
                 isinstance(disk, int) and 1 <= disk <= MAX_CONTAINER_DISK_GB,
@@ -1130,7 +1401,7 @@ class RunPodV1Client:
         expected_status: int,
         params: Mapping[str, str] | None = None,
         json_body: Mapping[str, object] | None = None,
-        response_observer: Callable[[int, bytearray], None] | None = None,
+        response_observer: Callable[[int, bytearray, str | None], None] | None = None,
         status_classifier: Callable[[int], str] | None = None,
     ) -> object:
         self._api_request_count += 1
@@ -1154,12 +1425,13 @@ class RunPodV1Client:
                     if len(body) > MAX_RESPONSE_BYTES:
                         raise RunPodAPIError("response_too_large")
                 status = response.status_code
+                content_type = response.headers.get("content-type")
         except RunPodAPIError:
             raise
         except httpx.HTTPError:
             raise RunPodAPIError("transport_failed") from None
         if response_observer is not None:
-            response_observer(status, body)
+            response_observer(status, body, content_type)
         if status != expected_status:
             code = (
                 f"unexpected_status_{status}"
@@ -1177,7 +1449,21 @@ class RunPodV1Client:
             raise RunPodAPIError("response_json_invalid") from None
 
     def _classify_create_status(self, status: int) -> str:
-        if status in _CAPACITY_ERROR_STATUSES:
+        if status == 400:
+            diagnostic = self._last_create_response_diagnostic
+            if (
+                diagnostic is not None
+                and diagnostic.http_status == status
+                and diagnostic.failure_code
+                in {
+                    "GPU_CAPACITY_ALLOCATION_REJECTED",
+                    "RUNPOD_CREATE_PAYLOAD_INVALID",
+                    "RUNPOD_CREATE_BAD_REQUEST_UNKNOWN",
+                }
+            ):
+                return diagnostic.failure_code
+            return "RUNPOD_CREATE_BAD_REQUEST_UNKNOWN"
+        if status in _ALLOCATION_ERROR_STATUSES:
             return "GPU_CAPACITY_ALLOCATION_REJECTED"
         if status == 401:
             return "RUNPOD_AUTH_INVALID"
@@ -1189,10 +1475,41 @@ class RunPodV1Client:
             return "RUNPOD_PROVIDER_ERROR"
         return "RUNPOD_CREATE_RESPONSE_REJECTED"
 
-    def _observe_create_response(self, status: int, body: bytearray) -> None:
+    def _observe_create_response(
+        self,
+        status: int,
+        body: bytearray,
+        content_type_header: str | None,
+    ) -> None:
+        byte_length = len(body)
+        content_type = _safe_content_type(content_type_header)
+        digest = hashlib.sha256(body).hexdigest()
+        if not body:
+            self._last_create_response_diagnostic = CreateResponseDiagnostic(
+                http_status=status,
+                top_level_keys=(),
+                id_present=None,
+                interruptible_present=None,
+                interruptible_json_type="unavailable",
+                classification=(
+                    "http_201_empty" if status == 201 else "provider_error_empty"
+                ),
+                body_kind="empty",
+                byte_length=0,
+                sha256=digest,
+                content_type=content_type,
+                failure_code=self._bad_request_code(status, ""),
+            )
+            return
         try:
             payload = json.loads(body)
         except (UnicodeDecodeError, json.JSONDecodeError):
+            try:
+                error_text: object = bytes(body).decode("utf-8", errors="strict")
+                body_kind = "non_json_text"
+            except UnicodeDecodeError:
+                error_text = ""
+                body_kind = "non_json_binary"
             self._last_create_response_diagnostic = CreateResponseDiagnostic(
                 http_status=status,
                 top_level_keys=(),
@@ -1202,65 +1519,158 @@ class RunPodV1Client:
                 classification=(
                     "http_201_non_json" if status == 201 else "provider_error_non_json"
                 ),
+                body_kind=body_kind,
+                byte_length=byte_length,
+                sha256=digest,
+                content_type=content_type,
+                failure_code=self._bad_request_code(status, error_text),
             )
             return
-        if not isinstance(payload, Mapping):
+        if isinstance(payload, Mapping):
+            row = cast(Mapping[str, object], payload)
+            keys = tuple(
+                sorted(
+                    key
+                    if _SAFE_JSON_KEY.fullmatch(key)
+                    and not _SENSITIVE_JSON_KEY.search(key)
+                    else "<redacted-key>"
+                    for key in row
+                )
+            )
+            interruptible = row.get("interruptible", _MISSING)
             self._last_create_response_diagnostic = CreateResponseDiagnostic(
                 http_status=status,
-                top_level_keys=(),
-                id_present=None,
-                interruptible_present=None,
-                interruptible_json_type="unavailable",
+                top_level_keys=keys,
+                id_present="id" in row,
+                interruptible_present="interruptible" in row,
+                interruptible_json_type=_json_type(interruptible),
                 classification=(
-                    "http_201_invalid_json_shape"
+                    "http_201_create_success_object"
                     if status == 201
-                    else "provider_error_invalid_json_shape"
+                    else "provider_error_json_object"
                 ),
+                body_kind="json_object",
+                byte_length=byte_length,
+                sha256=None,
+                content_type=content_type,
+                failure_code=self._bad_request_code(status, row),
             )
             return
-        row = cast(Mapping[str, object], payload)
-        keys = tuple(
-            sorted(
-                key
-                if _SAFE_JSON_KEY.fullmatch(key) and not _SENSITIVE_JSON_KEY.search(key)
-                else "<redacted-key>"
-                for key in row
-            )
+        validation_errors = self._validation_errors(payload)
+        body_json_type = _json_type(payload)
+        body_kind = (
+            "json_array" if body_json_type == "array" else f"json_scalar_{body_json_type}"
         )
-        interruptible = row.get("interruptible", _MISSING)
         self._last_create_response_diagnostic = CreateResponseDiagnostic(
             http_status=status,
-            top_level_keys=keys,
-            id_present="id" in row,
-            interruptible_present="interruptible" in row,
-            interruptible_json_type=self._json_type(interruptible),
+            top_level_keys=(),
+            id_present=None,
+            interruptible_present=None,
+            interruptible_json_type="unavailable",
             classification=(
-                "http_201_create_success_object"
+                f"http_201_{body_kind}"
                 if status == 201
-                else "provider_error_object"
+                else f"provider_error_{body_kind}"
             ),
+            body_kind=body_kind,
+            byte_length=byte_length,
+            sha256=digest if body_json_type != "array" else None,
+            content_type=content_type,
+            failure_code=self._bad_request_code(
+                status,
+                payload,
+                validation_errors=validation_errors,
+            ),
+            validation_errors=validation_errors,
         )
 
-    def _json_type(self, value: object) -> str:
-        if value is _MISSING:
-            return "missing"
-        if value is None:
-            return "null"
-        if isinstance(value, bool):
-            return "boolean"
+    def _bad_request_code(
+        self,
+        status: int,
+        payload: object,
+        *,
+        validation_errors: tuple[CreateValidationErrorDiagnostic, ...] = (),
+    ) -> str | None:
+        if status != 400:
+            return None
+        texts = self._error_texts(payload)
+        if any(_CAPACITY_CODE.fullmatch(text) for text in texts) or any(
+            _CAPACITY_MESSAGE.search(text) for text in texts
+        ):
+            return "GPU_CAPACITY_ALLOCATION_REJECTED"
+        if validation_errors or any(_VALIDATION_MESSAGE.search(text) for text in texts):
+            return "RUNPOD_CREATE_PAYLOAD_INVALID"
+        return "RUNPOD_CREATE_BAD_REQUEST_UNKNOWN"
+
+    def _error_texts(self, value: object) -> tuple[str, ...]:
+        collected: list[str] = []
+
+        def visit(item: object, *, key: str | None = None) -> None:
+            if len(collected) >= 32:
+                return
+            if isinstance(item, Mapping):
+                for raw_key, child in item.items():
+                    candidate = str(raw_key)
+                    if _SENSITIVE_JSON_KEY.search(candidate):
+                        continue
+                    if candidate.lower() in {
+                        "code",
+                        "type",
+                        "message",
+                        "msg",
+                        "detail",
+                        "error",
+                        "reason",
+                    }:
+                        visit(child, key=candidate)
+                return
+            if isinstance(item, Sequence) and not isinstance(
+                item, str | bytes | bytearray
+            ):
+                for child in item[:32]:
+                    visit(child, key=key)
+                return
+            if isinstance(item, str) and key is not None and len(item) <= 512:
+                collected.append(item)
+
         if isinstance(value, str):
-            return "string"
-        if isinstance(value, int | float):
-            return "number"
-        if isinstance(value, Mapping):
-            return "object"
-        if isinstance(value, Sequence):
-            return "array"
-        return "unknown"
+            if len(value) <= 512:
+                collected.append(value)
+        else:
+            visit(value)
+        return tuple(collected)
+
+    def _validation_errors(
+        self,
+        payload: object,
+    ) -> tuple[CreateValidationErrorDiagnostic, ...]:
+        if not isinstance(payload, list):
+            return ()
+        errors: list[CreateValidationErrorDiagnostic] = []
+        for item in payload[:32]:
+            if not isinstance(item, Mapping):
+                continue
+            row = cast(Mapping[str, object], item)
+            location = row.get("loc", row.get("field", row.get("path", _MISSING)))
+            raw_code = row.get("type", row.get("code", _MISSING))
+            message = row.get("msg", row.get("message", _MISSING))
+            if location is _MISSING and raw_code is _MISSING:
+                continue
+            code = _safe_error_code(raw_code)
+            errors.append(
+                CreateValidationErrorDiagnostic(
+                    field_path=_safe_field_path(location),
+                    type_code=code,
+                    message_class=_validation_message_class(code, message),
+                )
+            )
+        return tuple(errors)
 
 
 __all__ = [
+    "CreatePayloadContractReport",
     "CreateResponseDiagnostic",
+    "CreateValidationErrorDiagnostic",
     "GPUAvailabilityReport",
     "GPUCandidateDiagnostic",
     "GPUOffer",
@@ -1269,6 +1679,7 @@ __all__ = [
     "MAPILLARY_ENV_REFERENCE",
     "MAX_CONTAINER_DISK_GB",
     "MIN_GPU_MEMORY_GB",
+    "POD_VOLUME_GB",
     "PodConnection",
     "REST_BASE_URL",
     "RunPodAPIError",
@@ -1276,4 +1687,6 @@ __all__ = [
     "RunPodConfig",
     "RunPodInventory",
     "RunPodV1Client",
+    "build_create_payload",
+    "validate_create_payload_contract",
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from decimal import Decimal
@@ -9,11 +10,16 @@ import pytest
 
 from atlaslens_api.phase3f.runpod import (
     GRAPHQL_URL,
+    MAPILLARY_ENV_REFERENCE,
+    POD_VOLUME_GB,
     REST_BASE_URL,
+    GPUOffer,
     RunPodAPIError,
     RunPodConfig,
     RunPodCreateError,
     RunPodV1Client,
+    build_create_payload,
+    validate_create_payload_contract,
 )
 from atlaslens_api.phase3f.safety import (
     MAX_RUNTIME_SECONDS,
@@ -41,12 +47,13 @@ def _config(**overrides: object) -> RunPodConfig:
         "gpu_type_preferences": PREFERENCES,
         "container_disk_gb": 40,
         "min_gpu_memory_gb": 16,
+        "ssh_public_key": SSH_PUBLIC_KEY,
     }
     values.update(overrides)
     return RunPodConfig(**values)  # type: ignore[arg-type]
 
 
-def _request(*, public_ports: tuple[int, ...] = ()) -> PodRequest:
+def _request(*, public_ports: tuple[int, ...] = (22,)) -> PodRequest:
     return PodRequest(
         run_marker="phase3f-run-001",
         idempotency_key="phase3f-create-001",
@@ -54,6 +61,20 @@ def _request(*, public_ports: tuple[int, ...] = ()) -> PodRequest:
         max_runtime_seconds=MAX_RUNTIME_SECONDS,
         gpu_type_id="NVIDIA RTX A5000",
         public_ports=public_ports,
+    )
+
+
+def _offer() -> GPUOffer:
+    return GPUOffer(
+        gpu_type_id="NVIDIA RTX A5000",
+        display_name="RTX A5000",
+        memory_gb=24,
+        hourly_price=Decimal("0.27"),
+        stock_status="Low",
+        cloud_type="SECURE",
+        secure_cloud=True,
+        community_cloud=False,
+        available_gpu_counts=None,
     )
 
 
@@ -122,8 +143,9 @@ def _created_payload(*, interruptible: object = False) -> dict[str, object]:
         "containerDiskInGb": 40,
         "endpointId": None,
         "networkVolume": None,
-        "volumeInGb": 0,
-        "ports": [],
+        "volumeInGb": POD_VOLUME_GB,
+        "volumeMountPath": "/workspace",
+        "ports": ["22/tcp"],
         "gpu": {"count": 1},
         "costPerHr": "0.45",
     }
@@ -611,7 +633,7 @@ def test_graphql_query_uses_provider_spelling() -> None:
     assert "uninterruptiblePrice" not in rendered
 
 
-def test_create_is_one_secure_rest_call_with_no_volume_or_extra_ports() -> None:
+def test_create_uses_minimal_official_gpu_payload_with_pod_volume() -> None:
     create_requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -633,19 +655,16 @@ def test_create_is_one_secure_rest_call_with_no_volume_or_extra_ports() -> None:
             "cloudType": "SECURE",
             "computeType": "GPU",
             "gpuTypeIds": ["NVIDIA RTX A5000"],
-            "gpuTypePriority": "availability",
+            "gpuTypePriority": "custom",
             "gpuCount": 1,
+            "interruptible": False,
             "containerDiskInGb": 40,
-            "templateId": None,
-            "volumeInGb": 0,
+            "volumeInGb": 20,
+            "volumeMountPath": "/workspace",
             "ports": ["22/tcp"],
             "supportPublicIp": True,
-            "interruptible": False,
-            "locked": False,
             "env": {
-                "MAPILLARY_ACCESS_TOKEN": (
-                    "{{ RUNPOD_SECRET_atlaslens_mapillary_access_token }}"
-                ),
+                "MAPILLARY_ACCESS_TOKEN": MAPILLARY_ENV_REFERENCE,
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
                 "PUBLIC_KEY": SSH_PUBLIC_KEY,
@@ -655,10 +674,12 @@ def test_create_is_one_secure_rest_call_with_no_volume_or_extra_ports() -> None:
         assert body["interruptible"] is False
         assert body["gpuCount"] == 1
         assert body["gpuTypeIds"] == ["NVIDIA RTX A5000"]
-        assert body["volumeInGb"] == 0
-        assert body["templateId"] is None
+        assert body["volumeInGb"] == 20
+        assert "templateId" not in body
         assert "endpointId" not in body
         assert "networkVolumeId" not in body
+        assert "vcpuCount" not in body
+        assert "globalNetworking" not in body
         return httpx.Response(
             201,
             json={
@@ -668,7 +689,8 @@ def test_create_is_one_secure_rest_call_with_no_volume_or_extra_ports() -> None:
                 "interruptible": False,
                 "endpointId": None,
                 "networkVolume": None,
-                "volumeInGb": 0,
+                "volumeInGb": 20,
+                "volumeMountPath": "/workspace",
                 "ports": ["22/tcp"],
                 "gpu": {"count": 1},
                 "costPerHr": "0.45",
@@ -703,9 +725,66 @@ def test_create_is_one_secure_rest_call_with_no_volume_or_extra_ports() -> None:
         "networkVolume",
         "ports",
         "volumeInGb",
+        "volumeMountPath",
     )
     assert diagnostic.interruptible_present is True
     assert diagnostic.interruptible_json_type == "boolean"
+
+
+def test_offline_create_contract_accepts_twenty_gib_pod_volume() -> None:
+    payload, report = build_create_payload(_config(), _request(), _offer())
+
+    assert payload["volumeInGb"] == 20
+    assert "networkVolumeId" not in payload
+    assert report.valid is True
+    public = report.to_public_dict()
+    assert public["payload_contract_valid"] is True
+    assert public["secret_values_included"] is False
+    assert MAPILLARY_ENV_REFERENCE not in repr(public)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.__setitem__("volumeInGb", 0),
+        lambda payload: payload.__setitem__("volumeInGb", -1),
+        lambda payload: payload.__setitem__("containerDiskInGb", 0),
+        lambda payload: payload.__setitem__("containerDiskInGb", 41),
+        lambda payload: payload.__setitem__("gpuCount", "1"),
+        lambda payload: payload.__setitem__("interruptible", "false"),
+        lambda payload: payload.__setitem__("gpuTypeIds", ["NVIDIA L4"]),
+        lambda payload: payload.__setitem__("networkVolumeId", "volume-id"),
+        lambda payload: payload.__setitem__("unknownField", True),
+    ],
+)
+def test_offline_create_contract_rejects_invalid_or_unknown_fields(
+    mutate: Callable[[dict[str, object]], None],
+) -> None:
+    payload, _report = build_create_payload(_config(), _request(), _offer())
+    mutate(payload)
+
+    with pytest.raises(RunPodAPIError, match="RUNPOD_CREATE_PAYLOAD_INVALID"):
+        validate_create_payload_contract(
+            payload,
+            expected_gpu_type_id="NVIDIA RTX A5000",
+            expected_image_name=IMAGE,
+            expected_cloud_type="SECURE",
+        )
+
+
+def test_offline_create_contract_rejects_non_reference_secret_value() -> None:
+    payload, _report = build_create_payload(_config(), _request(), _offer())
+    environment = payload["env"]
+    assert isinstance(environment, dict)
+    environment["MAPILLARY_ACCESS_TOKEN"] = TOKEN
+
+    with pytest.raises(RunPodAPIError, match="RUNPOD_CREATE_PAYLOAD_INVALID"):
+        validate_create_payload_contract(
+            payload,
+            expected_gpu_type_id="NVIDIA RTX A5000",
+            expected_image_name=IMAGE,
+            expected_cloud_type="SECURE",
+        )
 
 
 @pytest.mark.parametrize(
@@ -882,7 +961,7 @@ def test_capacity_status_is_classified_after_http_before_pod_fields(status: int)
             json={
                 "interruptible": True,
                 "api_token": TOKEN,
-                "error": "allocation unavailable",
+                "error": "No available GPU instances",
             },
         )
 
@@ -901,10 +980,172 @@ def test_capacity_status_is_classified_after_http_before_pod_fields(status: int)
     assert diagnostic is not None
     assert diagnostic.http_status == status
     assert diagnostic.id_present is False
-    assert diagnostic.classification == "provider_error_object"
+    assert diagnostic.classification == "provider_error_json_object"
+    assert diagnostic.failure_code == (
+        "GPU_CAPACITY_ALLOCATION_REJECTED" if status == 400 else None
+    )
     assert "api_token" not in diagnostic.top_level_keys
     assert "<redacted-key>" in diagnostic.top_level_keys
     assert TOKEN not in repr(diagnostic.to_public_dict())
+
+
+def test_json_array_validation_error_is_sanitized_as_invalid_payload() -> None:
+    create_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        create_calls += 1
+        return httpx.Response(
+            400,
+            json=[
+                {
+                    "loc": ["body", "volumeInGb"],
+                    "type": "greater_than",
+                    "msg": "Input should be greater than zero",
+                    "input": TOKEN,
+                },
+                {
+                    "loc": ["body", "templateId"],
+                    "type": "extra_forbidden",
+                    "msg": "Extra inputs are not permitted",
+                },
+                {
+                    "loc": ["body", "api_token"],
+                    "type": TOKEN,
+                    "msg": TOKEN,
+                },
+            ],
+        )
+
+    with (
+        _client(handler) as client,
+        pytest.raises(RunPodAPIError, match="RUNPOD_CREATE_PAYLOAD_INVALID") as error,
+    ):
+        client.create_pod(_request())
+    diagnostic = client.last_create_response_diagnostic
+
+    assert create_calls == 1
+    assert diagnostic is not None
+    assert diagnostic.body_kind == "json_array"
+    assert diagnostic.classification == "provider_error_json_array"
+    assert diagnostic.failure_code == "RUNPOD_CREATE_PAYLOAD_INVALID"
+    assert [item.to_public_dict() for item in diagnostic.validation_errors] == [
+        {
+            "field_path": "body.volumeInGb",
+            "type_code": "greater_than",
+            "message_class": "value_out_of_range",
+        },
+        {
+            "field_path": "body.templateId",
+            "type_code": "extra_forbidden",
+            "message_class": "unknown_field",
+        },
+        {
+            "field_path": "<redacted-field>",
+            "type_code": "provider_validation_error",
+            "message_class": "provider_validation_error",
+        },
+    ]
+    assert TOKEN not in str(error.value)
+    assert TOKEN not in repr(diagnostic.to_public_dict())
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_kind", "expected_content_type"),
+    [
+        (httpx.Response(400, text="request rejected"), "non_json_text", "text/plain"),
+        (
+            httpx.Response(400, json="request rejected"),
+            "json_scalar_string",
+            "application/json",
+        ),
+        (httpx.Response(400), "empty", "unavailable"),
+    ],
+)
+def test_plain_text_scalar_and_empty_bad_request_metadata_is_hash_only(
+    response: httpx.Response,
+    expected_kind: str,
+    expected_content_type: str,
+) -> None:
+    create_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        create_calls += 1
+        return response
+
+    with (
+        _client(handler) as client,
+        pytest.raises(RunPodAPIError, match="RUNPOD_CREATE_BAD_REQUEST_UNKNOWN"),
+    ):
+        client.create_pod(_request())
+    diagnostic = client.last_create_response_diagnostic
+
+    assert create_calls == 1
+    assert diagnostic is not None
+    assert diagnostic.body_kind == expected_kind
+    assert diagnostic.content_type == expected_content_type
+    assert diagnostic.byte_length == len(response.content)
+    assert diagnostic.sha256 == hashlib.sha256(response.content).hexdigest()
+    assert diagnostic.failure_code == "RUNPOD_CREATE_BAD_REQUEST_UNKNOWN"
+    assert "request rejected" not in repr(diagnostic.to_public_dict())
+
+
+def test_unknown_400_is_not_capacity_and_never_retried() -> None:
+    create_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        create_calls += 1
+        return httpx.Response(400, json={"message": "Request rejected"})
+
+    with (
+        _client(handler) as client,
+        pytest.raises(RunPodAPIError, match="RUNPOD_CREATE_BAD_REQUEST_UNKNOWN"),
+    ):
+        client.create_pod(_request())
+
+    assert create_calls == 1
+    assert client.cloud_mutation_count == 1
+    assert client.last_create_response_diagnostic is not None
+    assert (
+        client.last_create_response_diagnostic.failure_code
+        == "RUNPOD_CREATE_BAD_REQUEST_UNKNOWN"
+    )
+
+
+def test_plain_text_capacity_allowlist_is_capacity_without_body_disclosure() -> None:
+    create_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        create_calls += 1
+        return httpx.Response(
+            400,
+            text="No GPU instances are available",
+            headers={"content-type": "text/plain; charset=utf-8"},
+        )
+
+    with (
+        _client(handler) as client,
+        pytest.raises(RunPodAPIError, match="GPU_CAPACITY_ALLOCATION_REJECTED"),
+    ):
+        client.create_pod(_request())
+    diagnostic = client.last_create_response_diagnostic
+
+    assert create_calls == 1
+    assert diagnostic is not None
+    assert diagnostic.failure_code == "GPU_CAPACITY_ALLOCATION_REJECTED"
+    assert diagnostic.content_type == "text/plain"
+    assert "No GPU" not in repr(diagnostic.to_public_dict())
 
 
 @pytest.mark.parametrize(
@@ -945,7 +1186,7 @@ def test_non_success_create_status_has_stable_sanitized_classification(
     assert diagnostic.http_status == status
     assert diagnostic.id_present is False
     assert diagnostic.interruptible_json_type == "string"
-    assert diagnostic.classification == "provider_error_object"
+    assert diagnostic.classification == "provider_error_json_object"
     assert TOKEN not in str(error.value)
     assert TOKEN not in repr(diagnostic.to_public_dict())
 

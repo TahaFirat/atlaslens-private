@@ -253,6 +253,16 @@ def test_default_supervisor_action_is_local_dry_run_without_state_or_api(
     assert output["action"] == "dry-run"
     assert output["runpod_api_calls"] == 0
     assert output["cloud_mutations"] == 0
+    assert output["create_attempts"] == 0
+    assert output["payload_contract_valid"] is True
+    assert output["secret_values_included"] is False
+    fields = {item["name"]: item["json_type"] for item in output["payload_fields"]}
+    assert fields["interruptible"] == "boolean"
+    assert fields["gpuCount"] == "number"
+    assert fields["volumeInGb"] == "number"
+    assert "networkVolumeId" not in fields
+    assert "templateId" not in fields
+    assert "RUNPOD_SECRET" not in repr(output)
 
 
 def test_live_readiness_is_authenticated_read_only_and_does_not_write_state(
@@ -328,6 +338,9 @@ def test_live_readiness_is_authenticated_read_only_and_does_not_write_state(
     assert output["create_attempt_limit"] == 1
     assert output["runpod_api_calls"] == 6
     assert output["cloud_mutations"] == 0
+    assert output["create_attempts"] == 0
+    assert output["payload_contract_valid"] is True
+    assert "RUNPOD_SECRET" not in repr(output)
 
 
 def test_powershell_wrappers_are_explicit_receipt_bound_and_secret_safe() -> None:
