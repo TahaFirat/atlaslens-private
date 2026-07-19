@@ -1,5 +1,37 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F accepts bounded on-demand attestation when RunPod omits interruptible
+
+- Context: Run `f3a1a535bc90d1954a19377a01e66a55` was reported with HTTP 201,
+  an atomically bound Pod ID and a missing create-response `interruptible` field,
+  then failed closed during authenticated verification. The Pod was terminated
+  and all four resource inventories returned to zero. The historical v1 operator
+  receipt proves the bound-ID/termination outcome but did not retain request,
+  GPU, price, response
+  field-presence, GET-status or binding-time evidence; those exact historical
+  values cannot be reconstructed from that receipt.
+- Decision: Keep exact JSON boolean `false` from either create or authenticated
+  GET as the first evidence tier. When both representations instead expose a
+  missing, null or string value, accept the Pod only when the exact outgoing
+  request was boolean `false`, create was HTTP 201, the ID was already atomically
+  receipt-bound, returned GPU and `RUNNING` status match, `costPerHr` is positive,
+  within the configured hourly ceiling and within 0.005 USD/hour of the
+  revalidated GraphQL `uninterruptablePrice`, no response proves boolean `true`,
+  and inventory contains only that receipt-bound Pod with no endpoint, network
+  volume or template. Record this evidence as
+  `request_and_on_demand_price_attested`, never as
+  `interruptible_field_verified`.
+- Alternatives: Treat an omitted optional response field as proof of an
+  interruptible Pod; coerce null/string values; accept request intent alone;
+  skip exact price/GPU/status/inventory checks; keep terminating valid on-demand
+  Pods solely because the provider omits a field.
+- Consequences: Any mismatch still carries the already-bound Pod into the
+  one-Pod `finally` termination path. Receipt v2 atomically records binding time,
+  evidence tier, request type, selected/returned price evidence, exact GPU,
+  status/cloud and sanitized create/GET field-presence metadata while retaining
+  read compatibility with v1 receipts.
+- Target phase: Product Phase 3F bounded RunPod pilot only.
+
 ## 2026-07-20 - Phase 3F validates the minimum REST Pod contract before create
 
 - Context: Run `d63e2c8b65f725bb5ba4f026c6ab193b` made its only POST and

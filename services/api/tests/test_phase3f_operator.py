@@ -22,7 +22,12 @@ from atlaslens_api.phase3f.operator import (
     terminate_receipt_bound_pod,
     write_operator_receipt,
 )
-from atlaslens_api.phase3f.runpod import GPUAvailabilityReport, GPUOffer, RunPodInventory
+from atlaslens_api.phase3f.runpod import (
+    GPUAvailabilityReport,
+    GPUOffer,
+    PodRentalAttestationDiagnostic,
+    RunPodInventory,
+)
 from atlaslens_api.phase3f.safety import PodRecord
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -112,9 +117,94 @@ def test_create_id_is_atomically_bound_before_response_field_validation(
 
     bound = read_operator_receipt(path)
     assert bound.pod_id == "created-pod"
+    assert bound.pod_bound_at is not None
     assert bound.stage == "running"
     assert bound.cleanup_verified is False
     assert not tuple(path.parent.glob("*.partial"))
+
+
+def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) -> None:
+    module = _load_supervisor()
+    path = tmp_path / "operator" / "phase3f-current.json"
+    receipt = _receipt(pod_id=None, stage="preflight")
+    write_operator_receipt(path, receipt)
+    module._bind_operator_pod(
+        path,
+        expected_run_id=receipt.run_id,
+        pod=PodRecord("created-pod", receipt.run_marker),
+    )
+    attestation = PodRentalAttestationDiagnostic(
+        evidence="request_and_on_demand_price_attested",
+        request_interruptible=False,
+        create_http_status=201,
+        selected_gpu_id="NVIDIA RTX A5000",
+        selected_uninterruptable_price=Decimal("0.16"),
+        create_cost_per_hr=Decimal("0.160"),
+        price_delta_usd=Decimal("0.000"),
+        desired_status="RUNNING",
+        cloud_type="SECURE",
+        create_interruptible_present=False,
+        create_interruptible_json_type="missing",
+        get_verification_http_status=200,
+        get_interruptible_present=False,
+        get_interruptible_json_type="missing",
+        pod_inventory_count=1,
+        explicit_false_source=None,
+    )
+
+    module._record_operator_rental_attestation(
+        path,
+        expected_run_id=receipt.run_id,
+        attestation=attestation,
+    )
+
+    recorded = read_operator_receipt(path)
+    assert recorded.pod_id == "created-pod"
+    assert recorded.pod_bound_at is not None
+    assert recorded.rental_evidence == "request_and_on_demand_price_attested"
+    assert recorded.request_interruptible is False
+    assert recorded.selected_gpu_id == "NVIDIA RTX A5000"
+    assert recorded.selected_uninterruptable_price == Decimal("0.16")
+    assert recorded.create_cost_per_hr == Decimal("0.160")
+    assert recorded.get_interruptible_json_type == "missing"
+    assert recorded.pod_inventory_count == 1
+    assert recorded.to_dict()["secret_values_included"] is False
+    assert "interruptible_field_verified" not in recorded.to_dict()
+    assert not tuple(path.parent.glob("*.partial"))
+
+
+def test_legacy_operator_receipt_remains_readable(tmp_path: Path) -> None:
+    path = tmp_path / "phase3f-current.json"
+    current = _receipt()
+    payload = current.to_dict()
+    payload["schema"] = "atlaslens-phase3f-operator-receipt-v1"
+    for field in (
+        "pod_bound_at",
+        "rental_evidence",
+        "request_interruptible",
+        "selected_gpu_id",
+        "selected_uninterruptable_price",
+        "create_http_status",
+        "create_cost_per_hr",
+        "price_delta_usd",
+        "desired_status",
+        "cloud_type",
+        "create_interruptible_present",
+        "create_interruptible_json_type",
+        "get_verification_http_status",
+        "get_interruptible_present",
+        "get_interruptible_json_type",
+        "pod_inventory_count",
+        "explicit_false_source",
+    ):
+        del payload[field]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    restored = read_operator_receipt(path)
+
+    assert restored.pod_id == current.pod_id
+    assert restored.pod_bound_at is None
+    assert restored.rental_evidence is None
 
 
 def test_stale_or_live_operator_receipt_fails_closed(tmp_path: Path) -> None:

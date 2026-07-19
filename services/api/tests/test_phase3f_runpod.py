@@ -136,7 +136,13 @@ def _gpu_list_response() -> dict[str, object]:
     }
 
 
-def _created_payload(*, interruptible: object = False) -> dict[str, object]:
+def _created_payload(
+    *,
+    interruptible: object = False,
+    cost_per_hr: object = "0.45",
+    gpu_type_id: str = "NVIDIA RTX A5000",
+    desired_status: str = "RUNNING",
+) -> dict[str, object]:
     payload: dict[str, object] = {
         "id": "created-pod",
         "name": "phase3f-run-001",
@@ -146,8 +152,9 @@ def _created_payload(*, interruptible: object = False) -> dict[str, object]:
         "volumeInGb": POD_VOLUME_GB,
         "volumeMountPath": "/workspace",
         "ports": ["22/tcp"],
-        "gpu": {"count": 1},
-        "costPerHr": "0.45",
+        "gpu": {"id": gpu_type_id, "count": 1},
+        "costPerHr": cost_per_hr,
+        "desiredStatus": desired_status,
     }
     if interruptible is not _MISSING_FIELD:
         payload["interruptible"] = interruptible
@@ -692,8 +699,9 @@ def test_create_uses_minimal_official_gpu_payload_with_pod_volume() -> None:
                 "volumeInGb": 20,
                 "volumeMountPath": "/workspace",
                 "ports": ["22/tcp"],
-                "gpu": {"count": 1},
+                "gpu": {"id": "NVIDIA RTX A5000", "count": 1},
                 "costPerHr": "0.45",
+                "desiredStatus": "RUNNING",
             },
         )
 
@@ -709,6 +717,7 @@ def test_create_uses_minimal_official_gpu_payload_with_pod_volume() -> None:
     ) as client:
         pod = client.create_pod(_request(public_ports=(22,)))
         diagnostic = client.last_create_response_diagnostic
+        attestation = client.last_rental_attestation
     assert pod == PodRecord("created-pod", "phase3f-run-001")
     assert len(create_requests) == 1
     assert create_requests[0].method == "POST"
@@ -717,6 +726,7 @@ def test_create_uses_minimal_official_gpu_payload_with_pod_volume() -> None:
     assert diagnostic.top_level_keys == (
         "containerDiskInGb",
         "costPerHr",
+        "desiredStatus",
         "endpointId",
         "gpu",
         "id",
@@ -729,6 +739,10 @@ def test_create_uses_minimal_official_gpu_payload_with_pod_volume() -> None:
     )
     assert diagnostic.interruptible_present is True
     assert diagnostic.interruptible_json_type == "boolean"
+    assert attestation is not None
+    assert attestation.evidence == "explicit_interruptible_false"
+    assert attestation.explicit_false_source == "create_response"
+    assert attestation.get_verification_http_status is None
 
 
 def test_offline_create_contract_accepts_twenty_gib_pod_volume() -> None:
@@ -828,6 +842,7 @@ def test_indeterminate_create_interruptible_uses_authenticated_get_verification(
     ) as client:
         pod = client.create_pod(_request())
         diagnostic = client.last_create_response_diagnostic
+        attestation = client.last_rental_attestation
 
     assert pod == PodRecord("created-pod", "phase3f-run-001")
     assert bound == [pod]
@@ -837,6 +852,216 @@ def test_indeterminate_create_interruptible_uses_authenticated_get_verification(
     assert diagnostic.id_present is True
     assert diagnostic.interruptible_json_type == expected_type
     assert diagnostic.classification == "http_201_create_success_object"
+    assert attestation is not None
+    assert attestation.evidence == "explicit_interruptible_false"
+    assert attestation.explicit_false_source == "authenticated_get"
+    assert attestation.get_verification_http_status == 200
+
+
+@pytest.mark.parametrize(
+    ("cost_per_hr", "expected_cost", "expected_delta"),
+    [
+        ("0.45", Decimal("0.45"), Decimal("0.00")),
+        (0.45, Decimal("0.45"), Decimal("0.00")),
+        ("0.455", Decimal("0.455"), Decimal("0.005")),
+    ],
+)
+@pytest.mark.parametrize(
+    ("interruptible_value", "expected_type"),
+    [
+        (_MISSING_FIELD, "missing"),
+        (None, "null"),
+        ("false", "string"),
+    ],
+)
+def test_indeterminate_fields_attest_on_demand_price_within_tolerance_and_cleanup(
+    cost_per_hr: object,
+    expected_cost: Decimal,
+    expected_delta: Decimal,
+    interruptible_value: object,
+    expected_type: str,
+) -> None:
+    pod_present = False
+    delete_calls = 0
+    recorded: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present, delete_calls
+        _assert_secret_safe(request)
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        path = request.url.path
+        if request.method == "POST":
+            pod_present = True
+            return httpx.Response(
+                201,
+                json=_created_payload(
+                    interruptible=interruptible_value,
+                    cost_per_hr=cost_per_hr,
+                ),
+            )
+        if request.method == "DELETE":
+            assert path.endswith("/pods/created-pod")
+            delete_calls += 1
+            pod_present = False
+            return httpx.Response(204)
+        if path.endswith("/pods/created-pod"):
+            payload: dict[str, object] = {"id": "created-pod"}
+            if interruptible_value is not _MISSING_FIELD:
+                payload["interruptible"] = interruptible_value
+            return httpx.Response(200, json=payload)
+        if path.endswith("/pods"):
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        if path.endswith(("/endpoints", "/networkvolumes", "/templates")):
+            return httpx.Response(200, json=[])
+        raise AssertionError(path)
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        record_rental_attestation=recorded.append,
+    ) as client:
+        session = SinglePodSession(client)
+        execution = session.execute(_request(), lambda _lease: "completed")
+        attestation = client.last_rental_attestation
+
+    assert execution.value == "completed"
+    assert delete_calls == 1
+    assert pod_present is False
+    assert attestation is not None
+    assert recorded == [attestation]
+    assert attestation.evidence == "request_and_on_demand_price_attested"
+    assert attestation.request_interruptible is False
+    assert attestation.selected_gpu_id == "NVIDIA RTX A5000"
+    assert attestation.selected_uninterruptable_price == Decimal("0.45")
+    assert attestation.create_cost_per_hr == expected_cost
+    assert attestation.price_delta_usd == expected_delta
+    assert attestation.desired_status == "RUNNING"
+    assert attestation.cloud_type == "SECURE"
+    assert attestation.create_interruptible_present is (
+        interruptible_value is not _MISSING_FIELD
+    )
+    assert attestation.create_interruptible_json_type == expected_type
+    assert attestation.get_verification_http_status == 200
+    assert attestation.get_interruptible_present is (
+        interruptible_value is not _MISSING_FIELD
+    )
+    assert attestation.get_interruptible_json_type == expected_type
+    assert attestation.pod_inventory_count == 1
+    assert "interruptible_field_verified" not in attestation.to_public_dict()
+    assert TOKEN not in repr(attestation.to_public_dict())
+
+
+@pytest.mark.parametrize(
+    ("payload_overrides", "expected_code"),
+    [
+        ({"cost_per_hr": "0.46"}, "create_response_on_demand_price_mismatch"),
+        ({"gpu_type_id": "NVIDIA L4"}, "create_response_gpu_mismatch"),
+        ({"desired_status": "EXITED"}, "create_response_desired_status_invalid"),
+    ],
+)
+def test_on_demand_attestation_mismatch_terminates_receipt_bound_pod(
+    payload_overrides: dict[str, object],
+    expected_code: str,
+) -> None:
+    pod_present = False
+    delete_calls = 0
+    bound: list[PodRecord] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present, delete_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            pod_present = True
+            return httpx.Response(
+                201,
+                json=_created_payload(
+                    interruptible=_MISSING_FIELD,
+                    **payload_overrides,
+                ),
+            )
+        if request.method == "DELETE":
+            delete_calls += 1
+            pod_present = False
+            return httpx.Response(204)
+        if request.url.path.endswith("/pods"):
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        raise AssertionError(request.url.path)
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        bind_created_pod=bound.append,
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(RunPodCreateError, match=expected_code):
+            session.execute(_request(), lambda _lease: None)
+
+    assert bound == [PodRecord("created-pod", "phase3f-run-001")]
+    assert delete_calls == 1
+    assert pod_present is False
+    assert session.last_audit is not None
+    assert session.last_audit.termination_verified is True
+
+
+def test_on_demand_attestation_rejects_multiple_pod_inventory_without_touching_other() -> None:
+    pod_present = False
+    delete_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        path = request.url.path
+        if request.method == "POST":
+            pod_present = True
+            return httpx.Response(
+                201,
+                json=_created_payload(interruptible=_MISSING_FIELD),
+            )
+        if request.method == "DELETE":
+            delete_calls.append(path)
+            if path.endswith("/created-pod"):
+                pod_present = False
+            return httpx.Response(204)
+        if path.endswith("/pods/created-pod"):
+            return httpx.Response(200, json={"id": "created-pod"})
+        if path.endswith("/pods"):
+            rows = [{"id": "other-pod", "name": "other-run"}]
+            if pod_present:
+                rows.insert(0, {"id": "created-pod", "name": "phase3f-run-001"})
+            return httpx.Response(200, json=rows)
+        if path.endswith(("/endpoints", "/networkvolumes", "/templates")):
+            return httpx.Response(200, json=[])
+        raise AssertionError(path)
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(
+            RunPodCreateError,
+            match="pod_attestation_inventory_mismatch",
+        ):
+            session.execute(_request(), lambda _lease: None)
+
+    assert delete_calls == ["/v1/pods/created-pod"]
+    assert pod_present is False
 
 
 def test_boolean_true_is_bound_then_terminated_with_post_id_cleanup() -> None:
@@ -932,7 +1157,7 @@ def test_get_verification_not_false_terminates_bound_pod() -> None:
         session = SinglePodSession(client)
         with pytest.raises(
             RunPodCreateError,
-            match="pod_interruptible_verification_failed",
+            match="pod_interruptible_true",
         ):
             session.execute(_request(), lambda _lease: None)
 

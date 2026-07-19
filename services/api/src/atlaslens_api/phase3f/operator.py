@@ -14,13 +14,23 @@ from pathlib import Path
 from typing import Protocol, cast
 from uuid import uuid4
 
-from atlaslens_api.phase3f.runpod import RunPodInventory
+from atlaslens_api.phase3f.runpod import (
+    ON_DEMAND_PRICE_TOLERANCE_USD,
+    PodRentalAttestationDiagnostic,
+    RunPodInventory,
+)
 
-OPERATOR_RECEIPT_SCHEMA = "atlaslens-phase3f-operator-receipt-v1"
+OPERATOR_RECEIPT_SCHEMA = "atlaslens-phase3f-operator-receipt-v2"
+_LEGACY_OPERATOR_RECEIPT_SCHEMA = "atlaslens-phase3f-operator-receipt-v1"
 _MAX_RECEIPT_BYTES = 64 * 1024
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 _RESOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,190}$")
+_GPU_TYPE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._():+-]{0,190}$")
 _STAGES = frozenset({"preflight", "running", "failed", "terminated"})
+_RENTAL_EVIDENCE = frozenset(
+    {"explicit_interruptible_false", "request_and_on_demand_price_attested"}
+)
+_INTERRUPTIBLE_JSON_TYPES = frozenset({"missing", "null", "string", "boolean"})
 
 
 class Phase3FOperatorError(RuntimeError):
@@ -66,6 +76,23 @@ class OperatorReceipt:
     max_gpu_hourly_usd: Decimal
     max_wall_minutes: int
     cleanup_verified: bool
+    pod_bound_at: str | None = None
+    rental_evidence: str | None = None
+    request_interruptible: bool | None = None
+    selected_gpu_id: str | None = None
+    selected_uninterruptable_price: Decimal | None = None
+    create_http_status: int | None = None
+    create_cost_per_hr: Decimal | None = None
+    price_delta_usd: Decimal | None = None
+    desired_status: str | None = None
+    cloud_type: str | None = None
+    create_interruptible_present: bool | None = None
+    create_interruptible_json_type: str | None = None
+    get_verification_http_status: int | None = None
+    get_interruptible_present: bool | None = None
+    get_interruptible_json_type: str | None = None
+    pod_inventory_count: int | None = None
+    explicit_false_source: str | None = None
 
     def __post_init__(self) -> None:
         _require(bool(_RUN_ID.fullmatch(self.run_id)), "OPERATOR_RECEIPT_RUN_ID_INVALID")
@@ -98,6 +125,13 @@ class OperatorReceipt:
                 and "\n" not in self.finished_at,
                 "OPERATOR_RECEIPT_TIME_INVALID",
             )
+        if self.pod_bound_at is not None:
+            _require(
+                bool(self.pod_bound_at)
+                and "\r" not in self.pod_bound_at
+                and "\n" not in self.pod_bound_at,
+                "OPERATOR_RECEIPT_TIME_INVALID",
+            )
         maximum = _decimal(self.max_spend_usd, "OPERATOR_RECEIPT_BUDGET_INVALID")
         soft = _decimal(self.soft_stop_usd, "OPERATOR_RECEIPT_BUDGET_INVALID")
         hard = _decimal(self.hard_stop_usd, "OPERATOR_RECEIPT_BUDGET_INVALID")
@@ -128,6 +162,104 @@ class OperatorReceipt:
             not self.cleanup_verified or self.stage in {"failed", "terminated"},
             "OPERATOR_RECEIPT_STAGE_INVALID",
         )
+        if self.rental_evidence is not None:
+            _require(
+                self.pod_id is not None and self.pod_bound_at is not None,
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
+            _require(self.rental_evidence in _RENTAL_EVIDENCE, "OPERATOR_RECEIPT_EVIDENCE_INVALID")
+            _require(self.request_interruptible is False, "OPERATOR_RECEIPT_EVIDENCE_INVALID")
+            _require(
+                isinstance(self.selected_gpu_id, str)
+                and bool(_GPU_TYPE_ID.fullmatch(self.selected_gpu_id)),
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
+            selected_price = _decimal(
+                self.selected_uninterruptable_price,
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
+            create_price = _decimal(
+                self.create_cost_per_hr,
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
+            price_delta = _decimal(
+                self.price_delta_usd,
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
+            _require(
+                Decimal("0") < selected_price <= hourly
+                and Decimal("0") < create_price <= hourly
+                and Decimal("0") <= price_delta <= ON_DEMAND_PRICE_TOLERANCE_USD
+                and price_delta == abs(selected_price - create_price),
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
+            _require(self.create_http_status == 201, "OPERATOR_RECEIPT_EVIDENCE_INVALID")
+            _require(self.desired_status == "RUNNING", "OPERATOR_RECEIPT_EVIDENCE_INVALID")
+            _require(
+                self.cloud_type in {"SECURE", "COMMUNITY"},
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
+            _require(
+                isinstance(self.create_interruptible_present, bool)
+                and self.create_interruptible_json_type in _INTERRUPTIBLE_JSON_TYPES,
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
+            if self.rental_evidence == "request_and_on_demand_price_attested":
+                _require(
+                    self.create_interruptible_json_type in {"missing", "null", "string"}
+                    and self.get_verification_http_status == 200
+                    and isinstance(self.get_interruptible_present, bool)
+                    and self.get_interruptible_json_type in {"missing", "null", "string"}
+                    and self.pod_inventory_count == 1
+                    and self.explicit_false_source is None,
+                    "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+                )
+            else:
+                _require(
+                    self.explicit_false_source in {"create_response", "authenticated_get"},
+                    "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+                )
+                if self.explicit_false_source == "create_response":
+                    _require(
+                        self.create_interruptible_present is True
+                        and self.create_interruptible_json_type == "boolean"
+                        and self.get_verification_http_status is None,
+                        "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+                    )
+                else:
+                    _require(
+                        self.get_verification_http_status == 200
+                        and self.get_interruptible_present is True
+                        and self.get_interruptible_json_type == "boolean",
+                        "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+                    )
+            object.__setattr__(self, "selected_uninterruptable_price", selected_price)
+            object.__setattr__(self, "create_cost_per_hr", create_price)
+            object.__setattr__(self, "price_delta_usd", price_delta)
+        else:
+            _require(
+                all(
+                    value is None
+                    for value in (
+                        self.request_interruptible,
+                        self.selected_gpu_id,
+                        self.selected_uninterruptable_price,
+                        self.create_http_status,
+                        self.create_cost_per_hr,
+                        self.price_delta_usd,
+                        self.desired_status,
+                        self.cloud_type,
+                        self.create_interruptible_present,
+                        self.create_interruptible_json_type,
+                        self.get_verification_http_status,
+                        self.get_interruptible_present,
+                        self.get_interruptible_json_type,
+                        self.pod_inventory_count,
+                        self.explicit_false_source,
+                    )
+                ),
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
         object.__setattr__(self, "max_spend_usd", maximum)
         object.__setattr__(self, "soft_stop_usd", soft)
         object.__setattr__(self, "hard_stop_usd", hard)
@@ -148,12 +280,37 @@ class OperatorReceipt:
             "stage": self.stage,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "pod_bound_at": self.pod_bound_at,
             "max_spend_usd": str(self.max_spend_usd),
             "soft_stop_usd": str(self.soft_stop_usd),
             "hard_stop_usd": str(self.hard_stop_usd),
             "max_gpu_hourly_usd": str(self.max_gpu_hourly_usd),
             "max_wall_minutes": self.max_wall_minutes,
             "cleanup_verified": self.cleanup_verified,
+            "rental_evidence": self.rental_evidence,
+            "request_interruptible": self.request_interruptible,
+            "selected_gpu_id": self.selected_gpu_id,
+            "selected_uninterruptable_price": (
+                None
+                if self.selected_uninterruptable_price is None
+                else str(self.selected_uninterruptable_price)
+            ),
+            "create_http_status": self.create_http_status,
+            "create_cost_per_hr": (
+                None if self.create_cost_per_hr is None else str(self.create_cost_per_hr)
+            ),
+            "price_delta_usd": (
+                None if self.price_delta_usd is None else str(self.price_delta_usd)
+            ),
+            "desired_status": self.desired_status,
+            "cloud_type": self.cloud_type,
+            "create_interruptible_present": self.create_interruptible_present,
+            "create_interruptible_json_type": self.create_interruptible_json_type,
+            "get_verification_http_status": self.get_verification_http_status,
+            "get_interruptible_present": self.get_interruptible_present,
+            "get_interruptible_json_type": self.get_interruptible_json_type,
+            "pod_inventory_count": self.pod_inventory_count,
+            "explicit_false_source": self.explicit_false_source,
             "secret_values_included": False,
         }
 
@@ -161,7 +318,7 @@ class OperatorReceipt:
     def from_dict(cls, value: object) -> OperatorReceipt:
         _require(isinstance(value, Mapping), "OPERATOR_RECEIPT_INVALID")
         row = cast(Mapping[str, object], value)
-        expected = {
+        legacy_expected = {
             "schema",
             "run_id",
             "run_marker",
@@ -179,8 +336,35 @@ class OperatorReceipt:
             "cleanup_verified",
             "secret_values_included",
         }
-        _require(set(row) == expected, "OPERATOR_RECEIPT_INVALID")
-        _require(row.get("schema") == OPERATOR_RECEIPT_SCHEMA, "OPERATOR_RECEIPT_INVALID")
+        evidence_fields = {
+            "pod_bound_at",
+            "rental_evidence",
+            "request_interruptible",
+            "selected_gpu_id",
+            "selected_uninterruptable_price",
+            "create_http_status",
+            "create_cost_per_hr",
+            "price_delta_usd",
+            "desired_status",
+            "cloud_type",
+            "create_interruptible_present",
+            "create_interruptible_json_type",
+            "get_verification_http_status",
+            "get_interruptible_present",
+            "get_interruptible_json_type",
+            "pod_inventory_count",
+            "explicit_false_source",
+        }
+        schema = row.get("schema")
+        is_legacy = schema == _LEGACY_OPERATOR_RECEIPT_SCHEMA
+        _require(
+            (is_legacy and set(row) == legacy_expected)
+            or (
+                schema == OPERATOR_RECEIPT_SCHEMA
+                and set(row) == legacy_expected | evidence_fields
+            ),
+            "OPERATOR_RECEIPT_INVALID",
+        )
         pod_value = row.get("pod_id")
         _require(pod_value is None or isinstance(pod_value, str), "OPERATOR_RECEIPT_POD_ID_INVALID")
         pod_id = cast(str | None, pod_value)
@@ -205,6 +389,48 @@ class OperatorReceipt:
             finished_value is None or isinstance(finished_value, str),
             "OPERATOR_RECEIPT_TIME_INVALID",
         )
+        pod_bound_at = None if is_legacy else row.get("pod_bound_at")
+        rental_evidence = None if is_legacy else row.get("rental_evidence")
+        request_interruptible = None if is_legacy else row.get("request_interruptible")
+        selected_gpu_id = None if is_legacy else row.get("selected_gpu_id")
+        selected_price = None if is_legacy else row.get("selected_uninterruptable_price")
+        create_status = None if is_legacy else row.get("create_http_status")
+        create_price = None if is_legacy else row.get("create_cost_per_hr")
+        price_delta = None if is_legacy else row.get("price_delta_usd")
+        desired_status = None if is_legacy else row.get("desired_status")
+        cloud_type = None if is_legacy else row.get("cloud_type")
+        create_present = None if is_legacy else row.get("create_interruptible_present")
+        create_type = None if is_legacy else row.get("create_interruptible_json_type")
+        get_status = None if is_legacy else row.get("get_verification_http_status")
+        get_present = None if is_legacy else row.get("get_interruptible_present")
+        get_type = None if is_legacy else row.get("get_interruptible_json_type")
+        inventory_count = None if is_legacy else row.get("pod_inventory_count")
+        false_source = None if is_legacy else row.get("explicit_false_source")
+        for optional_string in (
+            pod_bound_at,
+            rental_evidence,
+            selected_gpu_id,
+            desired_status,
+            cloud_type,
+            create_type,
+            get_type,
+            false_source,
+        ):
+            _require(
+                optional_string is None or isinstance(optional_string, str),
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
+        for optional_boolean in (request_interruptible, create_present, get_present):
+            _require(
+                optional_boolean is None or isinstance(optional_boolean, bool),
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
+        for optional_integer in (create_status, get_status, inventory_count):
+            _require(
+                optional_integer is None
+                or (isinstance(optional_integer, int) and not isinstance(optional_integer, bool)),
+                "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
         return cls(
             run_id=_string(row.get("run_id"), "OPERATOR_RECEIPT_RUN_ID_INVALID"),
             run_marker=_string(row.get("run_marker"), "OPERATOR_RECEIPT_MARKER_INVALID"),
@@ -222,6 +448,35 @@ class OperatorReceipt:
             ),
             max_wall_minutes=cast(int, wall),
             cleanup_verified=cast(bool, cleanup),
+            pod_bound_at=cast(str | None, pod_bound_at),
+            rental_evidence=cast(str | None, rental_evidence),
+            request_interruptible=cast(bool | None, request_interruptible),
+            selected_gpu_id=cast(str | None, selected_gpu_id),
+            selected_uninterruptable_price=(
+                None
+                if selected_price is None
+                else _decimal(selected_price, "OPERATOR_RECEIPT_EVIDENCE_INVALID")
+            ),
+            create_http_status=cast(int | None, create_status),
+            create_cost_per_hr=(
+                None
+                if create_price is None
+                else _decimal(create_price, "OPERATOR_RECEIPT_EVIDENCE_INVALID")
+            ),
+            price_delta_usd=(
+                None
+                if price_delta is None
+                else _decimal(price_delta, "OPERATOR_RECEIPT_EVIDENCE_INVALID")
+            ),
+            desired_status=cast(str | None, desired_status),
+            cloud_type=cast(str | None, cloud_type),
+            create_interruptible_present=cast(bool | None, create_present),
+            create_interruptible_json_type=cast(str | None, create_type),
+            get_verification_http_status=cast(int | None, get_status),
+            get_interruptible_present=cast(bool | None, get_present),
+            get_interruptible_json_type=cast(str | None, get_type),
+            pod_inventory_count=cast(int | None, inventory_count),
+            explicit_false_source=cast(str | None, false_source),
         )
 
     def update_lifecycle(
@@ -229,6 +484,7 @@ class OperatorReceipt:
         *,
         stage: str,
         pod_id: str | None = None,
+        pod_bound_at: str | None = None,
         finished_at: str | None = None,
         cleanup_verified: bool = False,
     ) -> OperatorReceipt:
@@ -236,8 +492,41 @@ class OperatorReceipt:
             self,
             stage=stage,
             pod_id=self.pod_id if pod_id is None else pod_id,
+            pod_bound_at=(
+                self.pod_bound_at if pod_bound_at is None else pod_bound_at
+            ),
             finished_at=finished_at,
             cleanup_verified=cleanup_verified,
+        )
+
+    def record_rental_attestation(
+        self,
+        attestation: PodRentalAttestationDiagnostic,
+    ) -> OperatorReceipt:
+        _require(
+            self.stage == "running"
+            and self.pod_id is not None
+            and self.pod_bound_at is not None,
+            "OPERATOR_RECEIPT_STAGE_INVALID",
+        )
+        return replace(
+            self,
+            rental_evidence=attestation.evidence,
+            request_interruptible=attestation.request_interruptible,
+            selected_gpu_id=attestation.selected_gpu_id,
+            selected_uninterruptable_price=attestation.selected_uninterruptable_price,
+            create_http_status=attestation.create_http_status,
+            create_cost_per_hr=attestation.create_cost_per_hr,
+            price_delta_usd=attestation.price_delta_usd,
+            desired_status=attestation.desired_status,
+            cloud_type=attestation.cloud_type,
+            create_interruptible_present=attestation.create_interruptible_present,
+            create_interruptible_json_type=attestation.create_interruptible_json_type,
+            get_verification_http_status=attestation.get_verification_http_status,
+            get_interruptible_present=attestation.get_interruptible_present,
+            get_interruptible_json_type=attestation.get_interruptible_json_type,
+            pod_inventory_count=attestation.pod_inventory_count,
+            explicit_false_source=attestation.explicit_false_source,
         )
 
 

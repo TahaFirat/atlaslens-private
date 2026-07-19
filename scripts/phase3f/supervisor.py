@@ -33,6 +33,7 @@ from atlaslens_api.phase3f.operator import (  # noqa: E402
 )
 from atlaslens_api.phase3f.runpod import (  # noqa: E402
     GPUOffer,
+    PodRentalAttestationDiagnostic,
     PodConnection,
     RunPodAPIError,
     RunPodConfig,
@@ -814,8 +815,29 @@ def _bind_operator_pod(
     if receipt.pod_id is None or receipt.stage != "running":
         write_operator_receipt(
             receipt_path,
-            receipt.update_lifecycle(stage="running", pod_id=pod.pod_id),
+            receipt.update_lifecycle(
+                stage="running",
+                pod_id=pod.pod_id,
+                pod_bound_at=datetime.now(UTC).isoformat(),
+            ),
         )
+
+
+def _record_operator_rental_attestation(
+    receipt_path: Path,
+    *,
+    expected_run_id: str,
+    attestation: PodRentalAttestationDiagnostic,
+) -> None:
+    receipt = read_operator_receipt(receipt_path)
+    _require(receipt.run_id == expected_run_id, "OPERATOR_RECEIPT_RUN_ID_MISMATCH")
+    _require(receipt.stage == "running", "OPERATOR_RECEIPT_STAGE_INVALID")
+    _require(receipt.pod_id is not None, "OPERATOR_RECEIPT_POD_ID_MISSING")
+    write_operator_receipt(
+        receipt_path,
+        receipt.record_rental_attestation(attestation),
+    )
+    _emit("PHASE3F_POD_RENTAL_EVIDENCE", **attestation.to_public_dict())
 
 
 def _run_execute(
@@ -902,6 +924,13 @@ def _run_execute(
                 receipt_path,
                 expected_run_id=run_id,
                 pod=pod,
+            ),
+            record_rental_attestation=lambda attestation: (
+                _record_operator_rental_attestation(
+                    receipt_path,
+                    expected_run_id=run_id,
+                    attestation=attestation,
+                )
             ),
         ) as client:
             before = client.inventory()

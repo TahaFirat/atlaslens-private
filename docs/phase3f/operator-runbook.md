@@ -84,10 +84,21 @@ allowlist classification; raw response bodies are not persisted or printed. 401
 is `RUNPOD_AUTH_INVALID`, 403 is `RUNPOD_PERMISSION_DENIED`, 429 is
 `RUNPOD_RATE_LIMITED`, and 5xx is `RUNPOD_PROVIDER_ERROR`. On HTTP 201 the Pod ID
 is atomically bound to the operator receipt before any remaining field is
-validated. The response must not advertise `interruptible=true`; an authenticated
-`GET /pods/{id}` must then verify exact JSON boolean `false`. Missing, null or
-string values are never coerced. Every post-ID validation failure carries the
-receipt-bound Pod into the one-Pod `finally` termination path.
+validated. The response must not advertise `interruptible=true`. Exact JSON
+boolean `false` in the create response is sufficient; otherwise an authenticated
+`GET /pods/{id}` checks the field. Missing, null or string values are never
+coerced. If both representations remain indeterminate, the Pod can proceed only
+when request `interruptible` is exact boolean `false`, create is HTTP 201, the ID
+is already receipt-bound, returned GPU and `RUNNING` status match, `costPerHr` is
+positive and within both the hourly ceiling and 0.005 USD/hour of the revalidated
+GraphQL `uninterruptablePrice`, neither representation proves boolean `true`, and
+inventory shows only the receipt-bound Pod with no endpoint, network volume or
+template. This evidence is recorded as
+`request_and_on_demand_price_attested`; it is never described as
+`interruptible_field_verified`. Receipt v2 also records the atomic binding time
+and sanitized field-presence/type evidence while remaining able to read legacy
+v1 receipts. Every post-ID validation failure carries the receipt-bound Pod into
+the one-Pod `finally` termination path.
 The create request is validated offline before POST against the bounded official
 GPU Pod contract. It contains only name, digest-pinned image, cloud/compute type,
 the exact selected GPU ID with custom priority, one non-interruptible GPU, a

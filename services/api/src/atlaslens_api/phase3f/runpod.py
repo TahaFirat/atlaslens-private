@@ -29,6 +29,7 @@ REST_BASE_URL: Final = "https://rest.runpod.io/v1/"
 GRAPHQL_URL: Final = "https://api.runpod.io/graphql"
 MAX_CONTAINER_DISK_GB: Final = 40
 POD_VOLUME_GB: Final = 20
+ON_DEMAND_PRICE_TOLERANCE_USD: Final = Decimal("0.005")
 MIN_GPU_MEMORY_GB: Final = 16
 MAX_RESPONSE_BYTES: Final = 2 * 1024 * 1024
 _RESOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,190}$")
@@ -588,6 +589,50 @@ class CreatePayloadContractReport:
 
 
 @dataclass(frozen=True, slots=True)
+class PodRentalAttestationDiagnostic:
+    evidence: str
+    request_interruptible: bool
+    create_http_status: int
+    selected_gpu_id: str
+    selected_uninterruptable_price: Decimal
+    create_cost_per_hr: Decimal
+    price_delta_usd: Decimal
+    desired_status: str
+    cloud_type: str
+    create_interruptible_present: bool
+    create_interruptible_json_type: str
+    get_verification_http_status: int | None
+    get_interruptible_present: bool | None
+    get_interruptible_json_type: str | None
+    pod_inventory_count: int | None
+    explicit_false_source: str | None
+    secret_free: bool = True
+
+    def to_public_dict(self) -> dict[str, object]:
+        return {
+            "rental_evidence": self.evidence,
+            "request_interruptible": self.request_interruptible,
+            "create_http_status": self.create_http_status,
+            "selected_gpu_id": self.selected_gpu_id,
+            "selected_uninterruptable_price": str(
+                self.selected_uninterruptable_price
+            ),
+            "create_cost_per_hr": str(self.create_cost_per_hr),
+            "price_delta_usd": str(self.price_delta_usd),
+            "desired_status": self.desired_status,
+            "cloud_type": self.cloud_type,
+            "create_interruptible_present": self.create_interruptible_present,
+            "create_interruptible_json_type": self.create_interruptible_json_type,
+            "get_verification_http_status": self.get_verification_http_status,
+            "get_interruptible_present": self.get_interruptible_present,
+            "get_interruptible_json_type": self.get_interruptible_json_type,
+            "pod_inventory_count": self.pod_inventory_count,
+            "explicit_false_source": self.explicit_false_source,
+            "secret_free": self.secret_free,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RunPodInventory:
     pods: tuple[PodRecord, ...]
     endpoint_ids: tuple[str, ...]
@@ -615,6 +660,9 @@ class RunPodV1Client:
         timeout_seconds: float = 15.0,
         transport: httpx.BaseTransport | None = None,
         bind_created_pod: Callable[[PodRecord], None] | None = None,
+        record_rental_attestation: (
+            Callable[[PodRentalAttestationDiagnostic], None] | None
+        ) = None,
     ) -> None:
         _require(
             bool(api_token)
@@ -631,7 +679,9 @@ class RunPodV1Client:
         self._last_graphql_errors: tuple[GraphQLErrorDiagnostic, ...] = ()
         self._last_created_hourly_price: Decimal | None = None
         self._last_create_response_diagnostic: CreateResponseDiagnostic | None = None
+        self._last_rental_attestation: PodRentalAttestationDiagnostic | None = None
         self._bind_created_pod = bind_created_pod
+        self._record_rental_attestation = record_rental_attestation
         self._api_request_count = 0
         self._cloud_mutation_count = 0
         self._client = httpx.Client(
@@ -673,6 +723,10 @@ class RunPodV1Client:
     @property
     def last_create_response_diagnostic(self) -> CreateResponseDiagnostic | None:
         return self._last_create_response_diagnostic
+
+    @property
+    def last_rental_attestation(self) -> PodRentalAttestationDiagnostic | None:
+        return self._last_rental_attestation
 
     @property
     def api_request_count(self) -> int:
@@ -1274,7 +1328,6 @@ class RunPodV1Client:
             if self._bind_created_pod is not None:
                 self._bind_created_pod(created)
             _require(row.get("name") == request.run_marker, "create_response_marker_mismatch")
-            self._validate_interruptible(row, pod_id)
             _require(row.get("endpointId") is None, "create_response_endpoint_bound")
             _require(row.get("networkVolume") is None, "create_response_network_volume")
             _require(row.get("volumeInGb") == POD_VOLUME_GB, "create_response_volume")
@@ -1290,12 +1343,35 @@ class RunPodV1Client:
             returned_ports = _sequence(row.get("ports"), "create_response_ports_invalid")
             _require(set(returned_ports).issubset({"22/tcp"}), "create_response_ports_invalid")
             gpu = _object(row.get("gpu"), "create_response_gpu_invalid")
-            _require(gpu.get("count") == 1, "create_response_gpu_invalid")
-            actual_price = _decimal(row.get("costPerHr"), "create_response_price_invalid")
             _require(
-                Decimal("0") < actual_price <= offer.hourly_price <= request.hourly_cost_usd,
+                gpu.get("count") == 1 and gpu.get("id") == offer.gpu_type_id,
+                "create_response_gpu_mismatch",
+            )
+            _require(
+                row.get("desiredStatus") == "RUNNING",
+                "create_response_desired_status_invalid",
+            )
+            actual_price = _decimal(row.get("costPerHr"), "create_response_price_invalid")
+            price_delta = abs(actual_price - offer.hourly_price)
+            _require(
+                Decimal("0") < actual_price <= request.hourly_cost_usd,
                 "create_response_price_exceeded",
             )
+            _require(
+                price_delta <= ON_DEMAND_PRICE_TOLERANCE_USD,
+                "create_response_on_demand_price_mismatch",
+            )
+            attestation = self._validate_rental_evidence(
+                row,
+                created=created,
+                request_interruptible=create_payload.get("interruptible", _MISSING),
+                offer=offer,
+                actual_price=actual_price,
+                price_delta=price_delta,
+            )
+            self._last_rental_attestation = attestation
+            if self._record_rental_attestation is not None:
+                self._record_rental_attestation(attestation)
             self._last_created_hourly_price = actual_price
         except RunPodCreateError:
             raise
@@ -1305,25 +1381,128 @@ class RunPodV1Client:
             raise RunPodCreateError("create_response_validation_failed", created) from None
         return created
 
-    def _validate_interruptible(self, row: Mapping[str, object], pod_id: str) -> None:
-        value = row.get("interruptible", _MISSING)
-        if value is True:
+    def _validate_rental_evidence(
+        self,
+        row: Mapping[str, object],
+        *,
+        created: PodRecord,
+        request_interruptible: object,
+        offer: GPUOffer,
+        actual_price: Decimal,
+        price_delta: Decimal,
+    ) -> PodRentalAttestationDiagnostic:
+        _require(request_interruptible is False, "create_request_interruptible_invalid")
+        create_value = row.get("interruptible", _MISSING)
+        create_present = "interruptible" in row
+        create_type = _json_type(create_value)
+        if create_value is True:
             raise RunPodAPIError("create_response_interruptible_true")
-        try:
-            payload = self._request_json(
-                "GET",
-                f"pods/{pod_id}",
-                expected_status=200,
-                params={"includeMachine": "false", "includeNetworkVolume": "false"},
+        if create_value is False:
+            return self._rental_attestation(
+                evidence="explicit_interruptible_false",
+                request_interruptible=False,
+                offer=offer,
+                actual_price=actual_price,
+                price_delta=price_delta,
+                create_present=create_present,
+                create_type=create_type,
+                get_status=None,
+                get_present=None,
+                get_type=None,
+                pod_inventory_count=None,
+                explicit_false_source="create_response",
             )
-            verified = _object(payload, "pod_interruptible_verification_failed")
-            _require(verified.get("id") == pod_id, "pod_interruptible_verification_failed")
-            _require(
-                verified.get("interruptible", _MISSING) is False,
-                "pod_interruptible_verification_failed",
+        payload = self._request_json(
+            "GET",
+            f"pods/{created.pod_id}",
+            expected_status=200,
+            params={"includeMachine": "true", "includeNetworkVolume": "true"},
+        )
+        verified = _object(payload, "pod_interruptible_verification_failed")
+        _require(
+            verified.get("id") == created.pod_id,
+            "pod_interruptible_verification_failed",
+        )
+        get_value = verified.get("interruptible", _MISSING)
+        get_present = "interruptible" in verified
+        get_type = _json_type(get_value)
+        if get_value is True:
+            raise RunPodAPIError("pod_interruptible_true")
+        if get_value is False:
+            return self._rental_attestation(
+                evidence="explicit_interruptible_false",
+                request_interruptible=False,
+                offer=offer,
+                actual_price=actual_price,
+                price_delta=price_delta,
+                create_present=create_present,
+                create_type=create_type,
+                get_status=200,
+                get_present=get_present,
+                get_type=get_type,
+                pod_inventory_count=None,
+                explicit_false_source="authenticated_get",
             )
-        except RunPodAPIError:
-            raise RunPodAPIError("pod_interruptible_verification_failed") from None
+        inventory = self.inventory()
+        _require(
+            inventory.pods == (created,),
+            "pod_attestation_inventory_mismatch",
+        )
+        _require(
+            not inventory.endpoint_ids
+            and not inventory.network_volume_ids
+            and not inventory.template_ids,
+            "pod_attestation_related_resource_present",
+        )
+        return self._rental_attestation(
+            evidence="request_and_on_demand_price_attested",
+            request_interruptible=False,
+            offer=offer,
+            actual_price=actual_price,
+            price_delta=price_delta,
+            create_present=create_present,
+            create_type=create_type,
+            get_status=200,
+            get_present=get_present,
+            get_type=get_type,
+            pod_inventory_count=1,
+            explicit_false_source=None,
+        )
+
+    def _rental_attestation(
+        self,
+        *,
+        evidence: str,
+        request_interruptible: bool,
+        offer: GPUOffer,
+        actual_price: Decimal,
+        price_delta: Decimal,
+        create_present: bool,
+        create_type: str,
+        get_status: int | None,
+        get_present: bool | None,
+        get_type: str | None,
+        pod_inventory_count: int | None,
+        explicit_false_source: str | None,
+    ) -> PodRentalAttestationDiagnostic:
+        return PodRentalAttestationDiagnostic(
+            evidence=evidence,
+            request_interruptible=request_interruptible,
+            create_http_status=201,
+            selected_gpu_id=offer.gpu_type_id,
+            selected_uninterruptable_price=offer.hourly_price,
+            create_cost_per_hr=actual_price,
+            price_delta_usd=price_delta,
+            desired_status="RUNNING",
+            cloud_type=offer.cloud_type,
+            create_interruptible_present=create_present,
+            create_interruptible_json_type=create_type,
+            get_verification_http_status=get_status,
+            get_interruptible_present=get_present,
+            get_interruptible_json_type=get_type,
+            pod_inventory_count=pod_inventory_count,
+            explicit_false_source=explicit_false_source,
+        )
 
     def terminate_pod(self, pod_id: str) -> None:
         safe_id = _resource_id(pod_id, "pod_id_invalid")
@@ -1679,8 +1858,10 @@ __all__ = [
     "MAPILLARY_ENV_REFERENCE",
     "MAX_CONTAINER_DISK_GB",
     "MIN_GPU_MEMORY_GB",
+    "ON_DEMAND_PRICE_TOLERANCE_USD",
     "POD_VOLUME_GB",
     "PodConnection",
+    "PodRentalAttestationDiagnostic",
     "REST_BASE_URL",
     "RunPodAPIError",
     "RunPodCreateError",
