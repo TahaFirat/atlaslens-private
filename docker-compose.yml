@@ -1,0 +1,108 @@
+name: atlaslens
+
+services:
+  db:
+    image: postgis/postgis:16-3.4-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-atlaslens}
+      POSTGRES_USER: ${POSTGRES_USER:-atlaslens}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in an untracked .env file}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    networks: [backend]
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/api.Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-atlaslens}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-atlaslens}
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      APP_VERSION: ${APP_VERSION:-0.1.0}
+      ALLOWED_ORIGINS: http://localhost:${WEB_PORT:-8080},http://127.0.0.1:${WEB_PORT:-8080}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-20971520}
+      MAX_DECODED_PIXELS: ${MAX_DECODED_PIXELS:-40000000}
+      MAX_IMAGE_DIMENSION: ${MAX_IMAGE_DIMENSION:-16384}
+      RETENTION_TTL_SECONDS: ${RETENTION_TTL_SECONDS:-3600}
+      KEEP_UPLOADS: "false"
+      TEMP_STORAGE_DIR: /tmp/atlaslens
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+      TESSERACT_CMD: ${TESSERACT_CMD:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_VISION_MODEL: ${OPENAI_VISION_MODEL:-gpt-5.6-sol}
+      OPENAI_VISION_TIMEOUT_SECONDS: ${OPENAI_VISION_TIMEOUT_SECONDS:-30}
+      ANALYSIS_RATE_LIMIT_PER_MINUTE: ${ANALYSIS_RATE_LIMIT_PER_MINUTE:-12}
+      CLOUD_RATE_LIMIT_PER_MINUTE: ${CLOUD_RATE_LIMIT_PER_MINUTE:-3}
+      MAX_QUEUED_JOBS: ${MAX_QUEUED_JOBS:-8}
+      MAX_SSE_CONNECTIONS_PER_CLIENT: ${MAX_SSE_CONNECTIONS_PER_CLIENT:-4}
+      SSE_HEARTBEAT_SECONDS: ${SSE_HEARTBEAT_SECONDS:-15}
+      MAX_SSE_LIFETIME_SECONDS: ${MAX_SSE_LIFETIME_SECONDS:-600}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/ready', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp/atlaslens:rw,noexec,nosuid,size=256m,mode=1777
+    init: true
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [frontend, backend]
+
+  web:
+    build:
+      context: .
+      dockerfile: infra/web.Dockerfile
+      args:
+        VITE_API_BASE_URL: ""
+        VITE_MAP_STYLE_URL: ${VITE_MAP_STYLE_URL:-}
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+      - /var/cache/nginx:rw,noexec,nosuid,size=16m
+      - /var/run:rw,noexec,nosuid,size=1m
+    init: true
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [frontend]
+
+volumes:
+  postgres_data:
+
+networks:
+  frontend:
+  backend:
+    internal: true

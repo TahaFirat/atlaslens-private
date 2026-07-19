@@ -1,0 +1,38 @@
+{
+  "version": "phase5b-v1",
+  "clustering": {
+    "radius_km": 50.0,
+    "max_input_hypotheses": 200,
+    "max_clusters": 20
+  },
+  "suppression": {
+    "max_members_per_provider": 3,
+    "max_members_per_source": 2,
+    "max_members_per_capture_family": 1,
+    "max_members_per_content_hash": 1
+  },
+  "scoring": {
+    "weights": {
+      "model_prior": 0.15,
+      "place_support": 0.25,
+      "retrieval_similarity": 0.25,
+      "retrieval_compactness": 0.10,
+      "map_support": 0.10,
+      "provider_diversity": 0.075,
+      "source_diversity": 0.075
+    },
+    "provider_diversity_normalizer": 3,
+    "source_diversity_normalizer": 4,
+    "contradiction_penalty": 0.55,
+    "contradiction_threshold": 0.60,
+    "minimum_relative_score": 0.0,
+    "max_candidates": 8
+  },
+  "uncertainty": {
+    "model_only_floor_km": 750.0,
+    "place_supported_floor_km": 25.0,
+    "retrieval_supported_floor_km": 5.0,
+    "multi_source_floor_km": 1.0,
+    "dispersion_multiplier": 1.5
+  }
+}

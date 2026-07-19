@@ -1,0 +1,297 @@
+{
+  "schema_version": "atlaslens-corpus-leakage-policy-v1",
+  "policy_version": "turkiye-pilot-leakage-2026-07-16-v1",
+  "status": "planning_only",
+  "split_roles": [
+    "train",
+    "development",
+    "validation",
+    "holdout"
+  ],
+  "default_conflict_action": "QUARANTINE_AND_FAIL_ADMISSION",
+  "thresholds": {
+    "dhash64_hamming_distance_maximum": 4,
+    "phash_hamming_distance_maximum": 8,
+    "descriptor_cosine_auto_exclude_minimum": 0.995,
+    "descriptor_cosine_manual_review_minimum": 0.98,
+    "query_to_query_holdout_buffer_m": 5000,
+    "same_view_reference_to_holdout_buffer_m": 1000,
+    "temporal_proximity_days": 30,
+    "satellite_footprint_overlap_fraction_maximum": 0,
+    "sequence_adjacent_frame_window": 20,
+    "maximum_holdout_queries_per_sequence": 1,
+    "maximum_holdout_queries_per_capture_run": 1
+  },
+  "checks": {
+    "exact_sha256": {
+      "enabled": true,
+      "action": "EXCLUDE_ALL_CROSS_ROLE_DUPLICATES",
+      "fields": [
+        "image_sha256"
+      ],
+      "rule": "A content SHA-256 may occur in only one role. Re-encoding does not bypass the remaining checks."
+    },
+    "perceptual_near_duplicate": {
+      "enabled": true,
+      "action": "QUARANTINE_AND_FAIL_ADMISSION",
+      "algorithms": [
+        "dhash64-v1",
+        "phash64-v1",
+        "phash256-v1"
+      ],
+      "dhash64_hamming_distance_maximum": 4,
+      "phash_hamming_distance_maximum": 8,
+      "rule": "Compare only like algorithms, including normalized forms produced by the audited offline leakage tool. Unknown or incompatible hash algorithms cannot be treated as a pass."
+    },
+    "crop_overlap": {
+      "enabled": true,
+      "action": "QUARANTINE_AND_FAIL_ADMISSION",
+      "normalized_crops": [
+        "center_50_percent",
+        "center_75_percent",
+        "four_quadrants",
+        "three_horizontal_bands",
+        "three_vertical_bands"
+      ],
+      "verification": "A perceptual candidate requires bounded local-feature/geometric verification before exclusion; an unavailable configured verification makes admission incomplete, never passed.",
+      "rule": "A crop or screenshot derived from another split inherits the source asset's role and cannot enter a different role."
+    },
+    "rotation_mirror_equivalence": {
+      "enabled": true,
+      "action": "QUARANTINE_AND_FAIL_ADMISSION",
+      "rotations_degrees": [
+        0,
+        90,
+        180,
+        270
+      ],
+      "horizontal_mirror": true,
+      "rule": "Hash and crop checks cover declared rotations and horizontal mirrors; transformed assets do not become independent samples."
+    },
+    "sequence_adjacency": {
+      "enabled": true,
+      "action": "GROUP_TO_ONE_ROLE_OR_EXCLUDE",
+      "group_fields": [
+        "source_name",
+        "sequence_id"
+      ],
+      "adjacent_frame_window": 20,
+      "maximum_holdout_queries_per_sequence": 1,
+      "rule": "The full known source sequence is assigned to one role. The frame window is a fallback for legacy manifests and never permits known sequence splitting. Every locked-holdout query requires a distinct non-null sequence ID."
+    },
+    "same_capture_run": {
+      "enabled": true,
+      "action": "GROUP_TO_ONE_ROLE_OR_EXCLUDE",
+      "group_fields": [
+        "contributor_or_owner",
+        "capture_run_id"
+      ],
+      "maximum_holdout_queries_per_capture_run": 1,
+      "rule": "All assets from the same capture mission, upload batch, flight, drive, or contracted delivery stay in one role even when provider sequence IDs differ. Every locked-holdout query requires a distinct non-null capture-run ID."
+    },
+    "same_contributor_or_source_asset": {
+      "enabled": true,
+      "action": "QUARANTINE_AND_FAIL_ADMISSION",
+      "identity_fields": [
+        "source_name",
+        "source_asset_id",
+        "parent_source_asset_id",
+        "source_tile_id"
+      ],
+      "holdout_source_name_overlap_with_reference_roles_allowed": false,
+      "holdout_contributor_rule": "Use contributors independent of reference construction wherever identity can be resolved. A common corporate owner does not establish contributor independence; unresolved identity or an undocumented contributor overlap is quarantined and cannot be assumed safe.",
+      "rule": "The same source image, parent panorama/frame, source tile, contributor capture session, or derivative family cannot cross roles. A holdout source name cannot appear in a reference role. Contributor identity alone is not globally disqualifying outside the holdout, but all of that contributor's same route/session is grouped."
+    },
+    "descriptor_similarity": {
+      "enabled": true,
+      "action": "AUTO_EXCLUDE_OR_MANUAL_REVIEW",
+      "provider": "pinned_real_megaloc_only",
+      "dimension": 8448,
+      "normalization": "l2",
+      "cosine_auto_exclude_minimum": 0.995,
+      "cosine_manual_review_minimum": 0.98,
+      "rule": "Use only real descriptors from the exactly pinned model and complete audited coverage. Missing, random, hash-derived, test, or partially covered vectors make this check incomplete. Thresholds are conservative planning defaults and require calibration on a clean pilot before Expansion."
+    },
+    "spatial_buffer": {
+      "enabled": true,
+      "action": "GROUP_OR_EXCLUDE",
+      "query_to_query_holdout_buffer_m": 5000,
+      "same_view_reference_to_holdout_buffer_m": 1000,
+      "dense_holdout_excluded_province_codes": [
+        "TR-06",
+        "TR-38",
+        "TR-58"
+      ],
+      "rule": "Holdout query locations are separated from development/validation query locations by at least five kilometres, and same-view street references within one kilometre of holdout truth are excluded. Geographic proximity to a predeclared blind national aerial grid is permitted only as the intended cross-view retrieval relationship; no cell may be selected or centered from holdout truth."
+    },
+    "temporal_proximity": {
+      "enabled": true,
+      "action": "GROUP_OR_EXCLUDE",
+      "days": 30,
+      "requires_any_shared_context": [
+        "source_name_and_sequence_id",
+        "contributor_or_owner_and_capture_run_id",
+        "same_spatial_cell"
+      ],
+      "rule": "Assets within plus or minus 30 days and a shared source/sequence, contributor/run, or spatial cell are not independent across roles. Null capture time is never silently assumed safe."
+    },
+    "satellite_patch_overlap": {
+      "enabled": true,
+      "action": "QUARANTINE_AND_FAIL_ADMISSION",
+      "identity_fields": [
+        "source_tile_id",
+        "parent_source_asset_id"
+      ],
+      "maximum_pixel_footprint_overlap_fraction_across_query_roles": 0,
+      "blind_grid_exception": "A nationally predeclared reference grid may geographically cover a holdout street location only when its geometry and retention policy were frozen before holdout truth access. It may not reuse pixels from an aerial/satellite query in another role.",
+      "rule": "No raster pixels, source tiles, parent scenes, or overlapping crops cross train/development/validation/holdout query roles. Patch adjacency is grouped when provider resampling or crop padding could reuse pixels."
+    },
+    "operator_smoke_image_exclusion": {
+      "enabled": true,
+      "action": "BLOCK_FROM_ALL_CORPUS_AND_BENCHMARK_ROLES",
+      "known_operator_image_count": 2,
+      "image_bytes_or_hashes_read_in_phase_3a": false,
+      "rule": "The two operator Kayseri/Ankara smoke images, known answers, coordinates, hashes, viewpoints, crops, and nearby targeted captures are unavailable to planning, acquisition, reference construction, model selection, and holdout creation. A future intake row marked as operator smoke is rejected before any asset bytes are read by corpus tooling."
+    },
+    "benchmark_truth_isolation": {
+      "enabled": true,
+      "action": "FAIL_RUN_ON_EARLY_OR_PARTIAL_TRUTH_ACCESS",
+      "inference_projection_fields": [
+        "opaque_query_id",
+        "authorized_temporary_asset_handle"
+      ],
+      "truth_fields_denied_to_inference": [
+        "latitude",
+        "longitude",
+        "province_code",
+        "source_asset_id",
+        "sequence_id",
+        "capture_timestamp",
+        "spatial_split"
+      ],
+      "rule": "The scoring process loads location truth only after all frozen-query predictions complete. Reference builders, model-selection jobs, inference workers, logs, prompts, and environment variables never receive the truth manifest or its key."
+    }
+  },
+  "conflict_rules": [
+    {
+      "conflict_id": "asset_id_unique",
+      "fields": [
+        "asset_id"
+      ],
+      "scope": "corpus_version",
+      "action": "FAIL"
+    },
+    {
+      "conflict_id": "content_identity_cross_role",
+      "fields": [
+        "image_sha256"
+      ],
+      "scope": "all_roles",
+      "action": "FAIL"
+    },
+    {
+      "conflict_id": "sequence_cross_spatial_split",
+      "fields": [
+        "source_name",
+        "sequence_id",
+        "spatial_split"
+      ],
+      "scope": "all_roles",
+      "action": "FAIL_WHEN_SEQUENCE_HAS_MULTIPLE_SPLITS"
+    },
+    {
+      "conflict_id": "capture_run_cross_role",
+      "fields": [
+        "contributor_or_owner",
+        "capture_run_id",
+        "role"
+      ],
+      "scope": "all_roles",
+      "action": "FAIL_WHEN_CAPTURE_RUN_HAS_MULTIPLE_ROLES"
+    },
+    {
+      "conflict_id": "source_parent_or_tile_cross_role",
+      "fields": [
+        "source_name",
+        "parent_source_asset_id",
+        "source_tile_id",
+        "role"
+      ],
+      "scope": "all_roles",
+      "action": "FAIL_WHEN_KNOWN_IDENTITY_HAS_MULTIPLE_ROLES"
+    },
+    {
+      "conflict_id": "holdout_source_cross_reference_role",
+      "fields": [
+        "source_name",
+        "role"
+      ],
+      "scope": "all_roles",
+      "action": "FAIL_WHEN_HOLDOUT_SOURCE_NAME_APPEARS_IN_TRAIN_DEVELOPMENT_OR_VALIDATION"
+    },
+    {
+      "conflict_id": "holdout_contributor_cross_reference_role",
+      "fields": [
+        "contributor_or_owner",
+        "capture_run_id",
+        "role"
+      ],
+      "scope": "all_roles",
+      "action": "QUARANTINE_UNRESOLVED_OR_UNDOCUMENTED_HOLDOUT_CONTRIBUTOR_OVERLAP"
+    },
+    {
+      "conflict_id": "holdout_dense_province",
+      "fields": [
+        "province_code",
+        "role"
+      ],
+      "scope": "tier_3_locked_holdout",
+      "action": "FAIL_FOR_TR-06_TR-38_TR-58"
+    }
+  ],
+  "enforcement_order": [
+    "manifest_and_source_policy_admission",
+    "operator_smoke_image_exclusion",
+    "source_asset_and_capture_grouping",
+    "exact_sha256",
+    "perceptual_near_duplicate",
+    "rotation_mirror_equivalence",
+    "crop_overlap",
+    "sequence_adjacency",
+    "same_capture_run",
+    "spatial_buffer",
+    "temporal_proximity",
+    "satellite_patch_overlap",
+    "descriptor_similarity",
+    "benchmark_truth_isolation"
+  ],
+  "audit_receipt_requirements": {
+    "required_fields": [
+      "policy_version",
+      "corpus_version",
+      "manifest_sha256",
+      "source_policy_sha256",
+      "reference_count_before",
+      "reference_count_after",
+      "holdout_count",
+      "check_statuses",
+      "exclusion_reason_counts",
+      "tool_revision",
+      "started_at",
+      "completed_at"
+    ],
+    "allowed_final_status": "PASSED",
+    "preserve_failed_receipts": true,
+    "contain_raw_coordinates": false,
+    "contain_image_paths": false,
+    "contain_descriptors": false,
+    "rule": "A failed or incomplete audit remains failed or incomplete after filtering. Admission requires a separate clean rerun and both receipts are retained."
+  },
+  "phase_3a_execution": {
+    "network_calls": false,
+    "downloads": false,
+    "reads_image_bytes": false,
+    "generates_descriptors": false,
+    "uses_operator_images": false
+  }
+}

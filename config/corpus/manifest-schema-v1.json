@@ -1,0 +1,509 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atlaslens.local/schemas/corpus/manifest-schema-v1.json",
+  "title": "AtlasLens governed corpus asset row v1",
+  "description": "Schema for one imagery asset row. It is a planning/admission contract and never authorizes acquisition by itself.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "corpus_version",
+    "asset_id",
+    "source_asset_id",
+    "source_name",
+    "source_url",
+    "contributor_or_owner",
+    "capture_timestamp",
+    "acquisition_timestamp",
+    "latitude",
+    "longitude",
+    "coordinate_accuracy_m",
+    "heading_degrees",
+    "sequence_id",
+    "capture_run_id",
+    "image_sha256",
+    "perceptual_hash",
+    "perceptual_hash_algorithm",
+    "width_px",
+    "height_px",
+    "mime_type",
+    "asset_type",
+    "province_code",
+    "urbanicity",
+    "road_class",
+    "scene_type",
+    "road_context",
+    "terrain_class",
+    "vegetation_state",
+    "season",
+    "license_identifier",
+    "license_url",
+    "attribution_text",
+    "source_policy_decision",
+    "commercial_use_decision",
+    "derivative_index_decision",
+    "personal_data_blur_state",
+    "deletion_revocation_state",
+    "provenance_receipt",
+    "spatial_split",
+    "role",
+    "tier",
+    "acquisition_ready"
+  ],
+  "properties": {
+    "corpus_version": {
+      "type": "string",
+      "pattern": "^atlaslens-turkiye-corpus-[A-Za-z0-9._-]+$",
+      "maxLength": 160
+    },
+    "asset_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"
+    },
+    "source_asset_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "source_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "source_url": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "contributor_or_owner": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 320
+    },
+    "capture_timestamp": {
+      "oneOf": [
+        {
+          "type": "string",
+          "format": "date-time"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "acquisition_timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "latitude": {
+      "type": "number",
+      "minimum": -90,
+      "maximum": 90
+    },
+    "longitude": {
+      "type": "number",
+      "minimum": -180,
+      "maximum": 180
+    },
+    "coordinate_accuracy_m": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 100000
+    },
+    "heading_degrees": {
+      "oneOf": [
+        {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMaximum": 360
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sequence_id": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "capture_run_id": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "image_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "perceptual_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16,128}$"
+    },
+    "perceptual_hash_algorithm": {
+      "type": "string",
+      "enum": [
+        "dhash64-v1",
+        "phash64-v1",
+        "phash256-v1"
+      ]
+    },
+    "width_px": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000
+    },
+    "height_px": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000
+    },
+    "mime_type": {
+      "type": "string",
+      "enum": [
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/tiff"
+      ]
+    },
+    "asset_type": {
+      "type": "string",
+      "enum": [
+        "street_level",
+        "aerial",
+        "satellite"
+      ]
+    },
+    "province_code": {
+      "type": "string",
+      "pattern": "^TR-(0[1-9]|[1-7][0-9]|8[01])$"
+    },
+    "urbanicity": {
+      "type": "string",
+      "enum": [
+        "urban_core",
+        "suburban",
+        "rural_settlement",
+        "rural_road",
+        "unknown"
+      ]
+    },
+    "road_class": {
+      "type": "string",
+      "enum": [
+        "motorway_or_expressway",
+        "national_or_state_road",
+        "provincial_or_district_road",
+        "local_urban_street",
+        "industrial_access",
+        "unclassified_or_track",
+        "not_applicable",
+        "unknown"
+      ]
+    },
+    "scene_type": {
+      "type": "string",
+      "enum": [
+        "city_center",
+        "suburban",
+        "industrial",
+        "rural_road",
+        "terrain_dominant",
+        "mixed",
+        "unknown"
+      ]
+    },
+    "road_context": {
+      "type": "string",
+      "description": "Orthogonal Tier 2 road-form stratum; unknown is reported and never inferred.",
+      "enum": [
+        "divided_highway",
+        "ordinary_road",
+        "rural_road",
+        "junction",
+        "service_area",
+        "not_applicable",
+        "unknown"
+      ]
+    },
+    "terrain_class": {
+      "type": "string",
+      "description": "Observed broad terrain stratum; unknown is retained when source evidence is insufficient.",
+      "enum": [
+        "mountainous",
+        "flat",
+        "rolling",
+        "mixed",
+        "unknown"
+      ]
+    },
+    "vegetation_state": {
+      "type": "string",
+      "description": "Observed vegetation state used only for coverage auditing, not inferred from location truth.",
+      "enum": [
+        "leaf_on",
+        "leaf_off_or_dormant",
+        "cropland_active",
+        "sparse_or_arid",
+        "snow_cover",
+        "mixed",
+        "not_applicable",
+        "unknown"
+      ]
+    },
+    "season": {
+      "type": "string",
+      "description": "Capture season from the documented capture context; unknown is allowed when it cannot be established.",
+      "enum": [
+        "winter",
+        "spring",
+        "summer",
+        "autumn",
+        "unknown"
+      ]
+    },
+    "license_identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "license_url": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "attribution_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "source_policy_decision": {
+      "$ref": "#/$defs/sourceDecision"
+    },
+    "commercial_use_decision": {
+      "$ref": "#/$defs/sourceDecision"
+    },
+    "derivative_index_decision": {
+      "$ref": "#/$defs/sourceDecision"
+    },
+    "personal_data_blur_state": {
+      "type": "string",
+      "enum": [
+        "NOT_DETECTED",
+        "BLURRED_AT_SOURCE",
+        "BLURRED_BY_ATLASLENS",
+        "REVIEW_REQUIRED",
+        "UNKNOWN"
+      ]
+    },
+    "deletion_revocation_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "last_checked_at",
+        "request_id"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "ACTIVE",
+            "QUARANTINED",
+            "DELETION_PENDING",
+            "DELETED",
+            "REVOKED"
+          ]
+        },
+        "last_checked_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "request_id": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "provenance_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_id",
+        "source_policy_version",
+        "evidence_date",
+        "acquisition_method",
+        "receipt_sha256"
+      ],
+      "properties": {
+        "receipt_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"
+        },
+        "source_policy_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "evidence_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "acquisition_method": {
+          "type": "string",
+          "enum": [
+            "first_party_capture",
+            "partner_transfer",
+            "authorized_api",
+            "authorized_bulk_download",
+            "manual_verified_import"
+          ]
+        },
+        "receipt_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "spatial_split": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"
+    },
+    "role": {
+      "type": "string",
+      "enum": [
+        "train",
+        "development",
+        "validation",
+        "holdout"
+      ]
+    },
+    "tier": {
+      "type": "string",
+      "enum": [
+        "tier_1_national_recall",
+        "tier_2_dense_corridor",
+        "tier_3_locked_holdout"
+      ]
+    },
+    "acquisition_ready": {
+      "type": "boolean"
+    },
+    "source_tile_id": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "parent_source_asset_id": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "sourceDecision": {
+      "type": "string",
+      "enum": [
+        "GO",
+        "GO_WITH_ATTRIBUTION",
+        "FIRST_PARTY_ONLY",
+        "WRITTEN_PERMISSION_REQUIRED",
+        "LEGAL_REVIEW_REQUIRED",
+        "RESEARCH_ONLY",
+        "BLOCKED",
+        "UNKNOWN"
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "acquisition_ready": {
+            "const": true
+          }
+        },
+        "required": [
+          "acquisition_ready"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source_policy_decision": {
+            "enum": [
+              "GO",
+              "GO_WITH_ATTRIBUTION",
+              "FIRST_PARTY_ONLY"
+            ]
+          },
+          "commercial_use_decision": {
+            "enum": [
+              "GO",
+              "GO_WITH_ATTRIBUTION",
+              "FIRST_PARTY_ONLY"
+            ]
+          },
+          "derivative_index_decision": {
+            "enum": [
+              "GO",
+              "GO_WITH_ATTRIBUTION",
+              "FIRST_PARTY_ONLY"
+            ]
+          },
+          "personal_data_blur_state": {
+            "enum": [
+              "NOT_DETECTED",
+              "BLURRED_AT_SOURCE",
+              "BLURRED_BY_ATLASLENS"
+            ]
+          },
+          "deletion_revocation_state": {
+            "properties": {
+              "status": {
+                "const": "ACTIVE"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "version": "phase6c-v1",
+  "total_timeout_seconds": 45.0,
+  "paddle_attempt_timeout_seconds": 28.0,
+  "rapidocr_reserved_seconds": 16.0,
+  "full_image_scales": [
+    1.0,
+    1.5
+  ],
+  "targeted_crop_scales": [
+    1.5,
+    2.0
+  ],
+  "targeted_segmentation_labels": [
+    "Signage - Advertisement",
+    "Signage - Information",
+    "Signage - Store",
+    "Traffic Sign - Direction",
+    "Lane Marking - Text",
+    "Building"
+  ],
+  "max_targeted_crops": 6,
+  "max_rotated_crops": 2,
+  "rotated_crop_degrees": [
+    -90,
+    90
+  ],
+  "crop_padding_fraction": 0.08,
+  "minimum_region_score": 0.02,
+  "minimum_region_area_fraction": 0.0005,
+  "maximum_region_area_fraction": 0.65,
+  "fuzzy_minimum_similarity": 0.86,
+  "alias_minimum_similarity": 0.9,
+  "max_place_token_evidence": 12
+}

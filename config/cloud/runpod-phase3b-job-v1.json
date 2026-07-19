@@ -1,0 +1,96 @@
+{
+  "schema_version": "atlaslens-phase3b-cloud-job-v1",
+  "phase": "3B1",
+  "execution_enabled": false,
+  "approval_required": true,
+  "approval_state": "DO_NOT_RUN_UNTIL_USER_APPROVAL",
+  "container": {
+    "base_image": "nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:ac55d124da4882b497f732d8dfd9a702d5447a5f29d08d56da6f64f0a1eb34bc",
+    "python_version": "3.12",
+    "uv_version": "0.11.7",
+    "dependency_lock": "services/api/uv.lock",
+    "dependency_lock_sha256": "e29a27194a616def630997968d720b8eadabc6ea0ade0b05aa293e2d8321c982"
+  },
+  "paths": {
+    "input_root": "/workspace/input",
+    "input_read_only": true,
+    "corpus_root": "/workspace/input/corpus",
+    "manifest": "/workspace/input/corpus/manifests/corpus.jsonl",
+    "work_root": "/workspace/work/<run-id>",
+    "output_root": "/workspace/output/<run-id>",
+    "checkpoint_root": "/workspace/checkpoints/<run-id>"
+  },
+  "pipeline": {
+    "executable": "atlaslens-corpus",
+    "config": "/opt/atlaslens/config/cloud/runpod-phase3b-job-v1.json",
+    "source_policy": "/opt/atlaslens/config/corpus/source-policy-v1.json",
+    "manifest_schema": "/opt/atlaslens/config/corpus/manifest-schema-v1.json",
+    "leakage_policy": "/opt/atlaslens/config/corpus/leakage-policy-v1.json",
+    "production_descriptor_provider_required": true,
+    "production_descriptor_provider": null,
+    "descriptor_batch_size": null,
+    "index_backend": null,
+    "index_version": null,
+    "shard_size": null,
+    "holdout_path": null,
+    "expected_holdout_hash": null,
+    "abstain_if_distance_gt": null,
+    "test_provider_forbidden": true,
+    "implicit_network_fallback": false
+  },
+  "runtime": {
+    "hard_deadline_seconds": 57600,
+    "checkpoint_interval_seconds": 900,
+    "checkpoint_max_assets": 1000,
+    "termination_grace_seconds": 120,
+    "resume_mode": "checkpoint",
+    "incompatible_config_resume": "refuse",
+    "partial_index_publish": "refuse",
+    "final_publish": "atomic_rename"
+  },
+  "budget": {
+    "scenario": "recommended_mvp",
+    "currency": "USD",
+    "pricing_snapshot_date": "2026-07-16",
+    "gpu_type": "NVIDIA RTX A5000",
+    "gpu_hourly_rate_usd": 0.27,
+    "expected_gpu_hours": 11.25,
+    "maximum_gpu_hours": 16,
+    "expected_first_month_usd": 13.614555,
+    "maximum_first_month_usd": 14.929589,
+    "soft_limit_usd": 15,
+    "hard_limit_usd": 25,
+    "maximum_concurrent_jobs": 1,
+    "automatic_spend_or_autopay": false
+  },
+  "controls": {
+    "network_calls_in_validation": false,
+    "network_calls_in_dry_run": false,
+    "runpod_api_calls": false,
+    "embedded_credentials": false,
+    "public_ports": false,
+    "cleanup_default": "dry-run",
+    "input_mount_must_be_read_only": true,
+    "separate_mutable_roots_required": true,
+    "offline_environment_required": true
+  },
+  "artifacts": {
+    "hash_algorithm": "sha256",
+    "inventory": "artifact-inventory.json",
+    "checksums": "SHA256SUMS",
+    "required_output_kinds": [
+      "pipeline_state",
+      "accepted_manifest",
+      "rejection_report",
+      "descriptor_receipt",
+      "index_metadata",
+      "benchmark_report",
+      "revocation_impact_map",
+      "validation_report",
+      "cost_receipt",
+      "supervisor_receipt"
+    ],
+    "symlinks_allowed": false,
+    "raw_images_in_output": false
+  }
+}

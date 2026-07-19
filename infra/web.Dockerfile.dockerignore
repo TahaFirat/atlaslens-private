@@ -1,0 +1,9 @@
+**
+!apps/
+!apps/web/
+!apps/web/**
+!packages/
+!packages/contracts/
+!packages/contracts/**
+!infra/
+!infra/nginx.conf

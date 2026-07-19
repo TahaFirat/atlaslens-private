@@ -1,0 +1,17 @@
+**
+!services/
+!services/api/
+!services/api/pyproject.toml
+!services/api/uv.lock
+!services/api/src/
+!services/api/src/**
+!config/
+!config/corpus/
+!config/corpus/source-policy-v1.json
+!config/corpus/manifest-schema-v1.json
+!config/corpus/leakage-policy-v1.json
+!config/cloud/
+!config/cloud/runpod-phase3b-job-v1.json
+!scripts/
+!scripts/phase3b/
+!scripts/phase3b/cloud_job.py

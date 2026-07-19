@@ -1,0 +1,1312 @@
+{
+  "schema_version": "atlaslens-turkiye-pilot-sampling-v1",
+  "plan_version": "turkiye-pilot-2026-07-16-v1",
+  "status": "planning_only",
+  "country": {
+    "iso_3166_1_alpha_2": "TR",
+    "province_count": 81,
+    "province_code_system": "ISO 3166-2:TR"
+  },
+  "source_admission": {
+    "policy_path": "config/corpus/source-policy-v1.json",
+    "allowed_decisions": [
+      "GO",
+      "GO_WITH_ATTRIBUTION",
+      "FIRST_PARTY_ONLY"
+    ],
+    "rejected_decisions": [
+      "WRITTEN_PERMISSION_REQUIRED",
+      "LEGAL_REVIEW_REQUIRED",
+      "RESEARCH_ONLY",
+      "BLOCKED",
+      "UNKNOWN"
+    ],
+    "rule": "A row is acquisition-ready only when source, commercial-use, and derivative/index decisions are all admitted by the current source policy and its provenance receipt is valid. FIRST_PARTY_ONLY never authorizes a third-party asset.",
+    "legal_clearance_claimed": false
+  },
+  "assumptions": {
+    "unit_system": "decimal_GB",
+    "compressed_image_bytes_per_governed_asset": 750000,
+    "normalized_derivative_bytes_per_governed_asset": 400000,
+    "megaloc_descriptor_values_per_reference": 8448,
+    "megaloc_descriptor_dtype": "float32",
+    "megaloc_descriptor_bytes_per_reference": 33792,
+    "metadata_bytes_per_governed_asset": 6000,
+    "faiss_parquet_index_overhead_fraction_of_descriptor_bytes": 0.2,
+    "staging_space_fraction_of_primary_footprint": 0.5,
+    "rollback_version_space_fraction_of_primary_footprint": 0.5,
+    "local_descriptor_index_and_metadata_copies": 2,
+    "local_report_allowance_gb_by_option": {
+      "minimal_proof": 0.05,
+      "recommended_mvp": 0.1,
+      "expansion": 0.25
+    },
+    "descriptor_generation_references_per_gpu_hour": 12000,
+    "descriptor_generation_retry_factor": 1.25,
+    "benchmark_configurations_per_holdout": 5,
+    "evaluation_query_configuration_runs_per_gpu_hour": 240,
+    "notes": [
+      "Image-size assumptions are planning estimates, not measured source averages.",
+      "Descriptor size is exact before ANN/index overhead: 8,448 float32 values multiplied by four bytes equals 33,792 bytes per reference.",
+      "Primary cloud footprint includes governed images, normalized derivatives, reference descriptors, metadata, and FAISS/Parquet index overhead.",
+      "Staging and rollback/version space are separate, non-overlapping halves of one additional primary-footprint reserve. A job that cannot build and roll back within those explicit caps must stop for a revised storage approval.",
+      "Holdout queries are counted as governed image assets but never receive persistent reference descriptors.",
+      "GPU throughput and evaluation throughput must be replaced by a measured pilot receipt before an Expansion authorization."
+    ]
+  },
+  "common_strata": {
+    "urbanicity": [
+      "urban_core",
+      "suburban",
+      "rural_settlement",
+      "rural_road"
+    ],
+    "road_class": [
+      "motorway_or_expressway",
+      "national_or_state_road",
+      "provincial_or_district_road",
+      "local_urban_street",
+      "industrial_access",
+      "unclassified_or_track"
+    ],
+    "scene_type": [
+      "city_center",
+      "suburban",
+      "industrial",
+      "rural_road",
+      "terrain_dominant"
+    ],
+    "road_context": [
+      "divided_highway",
+      "ordinary_road",
+      "rural_road",
+      "junction",
+      "service_area"
+    ],
+    "terrain_class": [
+      "mountainous",
+      "flat"
+    ],
+    "vegetation_state": [
+      "leaf_on",
+      "leaf_off_or_dormant",
+      "cropland_active",
+      "sparse_or_arid",
+      "snow_cover",
+      "mixed"
+    ],
+    "season": [
+      "winter",
+      "spring",
+      "summer",
+      "autumn"
+    ],
+    "heading_bins_degrees": [
+      [
+        0,
+        45
+      ],
+      [
+        45,
+        90
+      ],
+      [
+        90,
+        135
+      ],
+      [
+        135,
+        180
+      ],
+      [
+        180,
+        225
+      ],
+      [
+        225,
+        270
+      ],
+      [
+        270,
+        315
+      ],
+      [
+        315,
+        360
+      ]
+    ],
+    "season_or_time_rule": "Where rights-bearing supply permits, each province must include at least two separated capture months and two broad seasons. Missing metadata remains unknown and is never inferred; an unmet stratum is reported as a coverage limitation.",
+    "source_balance_rule": "No source may fill more than 60 percent of an option unless the corpus is first-party-only and the exception is declared before acquisition. Source-specific immutable partitions remain independently removable.",
+    "sequence_cap": "No single sequence or capture run may contribute more than 2 percent of an option or 10 percent of a province quota, whichever admits fewer assets.",
+    "duplicate_rule": "An asset may have exactly one primary tier and one role; exact or near-duplicate bytes are not counted twice when they satisfy multiple strata."
+  },
+  "tiers": {
+    "tier_1_national_recall": {
+      "purpose": "Candidate recall coverage across all 81 provinces; it does not support meter-level claims.",
+      "minimum_references_per_province_by_option": {
+        "minimal_proof": 100,
+        "recommended_mvp": 400,
+        "expansion": 1500
+      },
+      "minimum_distinct_route_units_per_province_by_option": {
+        "minimal_proof": 2,
+        "recommended_mvp": 4,
+        "expansion": 10
+      },
+      "balance_requirements": {
+        "urban_group_share_range": [
+          0.4,
+          0.6
+        ],
+        "rural_group_share_range": [
+          0.4,
+          0.6
+        ],
+        "minimum_road_classes_per_province": 3,
+        "maximum_single_road_class_share": 0.6,
+        "minimum_scene_types_nationally": 5,
+        "maximum_unknown_heading_share_for_street_assets": 0.25
+      },
+      "provinces": [
+        {
+          "province_code": "TR-01",
+          "name": "Adana",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-02",
+          "name": "Adıyaman",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-03",
+          "name": "Afyonkarahisar",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-04",
+          "name": "Ağrı",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-05",
+          "name": "Amasya",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-06",
+          "name": "Ankara",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-07",
+          "name": "Antalya",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-08",
+          "name": "Artvin",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-09",
+          "name": "Aydın",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-10",
+          "name": "Balıkesir",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-11",
+          "name": "Bilecik",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-12",
+          "name": "Bingöl",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-13",
+          "name": "Bitlis",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-14",
+          "name": "Bolu",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-15",
+          "name": "Burdur",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-16",
+          "name": "Bursa",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-17",
+          "name": "Çanakkale",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-18",
+          "name": "Çankırı",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-19",
+          "name": "Çorum",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-20",
+          "name": "Denizli",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-21",
+          "name": "Diyarbakır",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-22",
+          "name": "Edirne",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-23",
+          "name": "Elazığ",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-24",
+          "name": "Erzincan",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-25",
+          "name": "Erzurum",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-26",
+          "name": "Eskişehir",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-27",
+          "name": "Gaziantep",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-28",
+          "name": "Giresun",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-29",
+          "name": "Gümüşhane",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-30",
+          "name": "Hakkari",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-31",
+          "name": "Hatay",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-32",
+          "name": "Isparta",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-33",
+          "name": "Mersin",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-34",
+          "name": "İstanbul",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-35",
+          "name": "İzmir",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-36",
+          "name": "Kars",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-37",
+          "name": "Kastamonu",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-38",
+          "name": "Kayseri",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-39",
+          "name": "Kırklareli",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-40",
+          "name": "Kırşehir",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-41",
+          "name": "Kocaeli",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-42",
+          "name": "Konya",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-43",
+          "name": "Kütahya",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-44",
+          "name": "Malatya",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-45",
+          "name": "Manisa",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-46",
+          "name": "Kahramanmaraş",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-47",
+          "name": "Mardin",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-48",
+          "name": "Muğla",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-49",
+          "name": "Muş",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-50",
+          "name": "Nevşehir",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-51",
+          "name": "Niğde",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-52",
+          "name": "Ordu",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-53",
+          "name": "Rize",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-54",
+          "name": "Sakarya",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-55",
+          "name": "Samsun",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-56",
+          "name": "Siirt",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-57",
+          "name": "Sinop",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-58",
+          "name": "Sivas",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-59",
+          "name": "Tekirdağ",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-60",
+          "name": "Tokat",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-61",
+          "name": "Trabzon",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-62",
+          "name": "Tunceli",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-63",
+          "name": "Şanlıurfa",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-64",
+          "name": "Uşak",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-65",
+          "name": "Van",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-66",
+          "name": "Yozgat",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-67",
+          "name": "Zonguldak",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-68",
+          "name": "Aksaray",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-69",
+          "name": "Bayburt",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-70",
+          "name": "Karaman",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-71",
+          "name": "Kırıkkale",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-72",
+          "name": "Batman",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-73",
+          "name": "Şırnak",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-74",
+          "name": "Bartın",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-75",
+          "name": "Ardahan",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-76",
+          "name": "Iğdır",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-77",
+          "name": "Yalova",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-78",
+          "name": "Karabük",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-79",
+          "name": "Kilis",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-80",
+          "name": "Osmaniye",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        },
+        {
+          "province_code": "TR-81",
+          "name": "Düzce",
+          "minimum_references_by_option": {
+            "minimal_proof": 100,
+            "recommended_mvp": 400,
+            "expansion": 1500
+          }
+        }
+      ]
+    },
+    "tier_2_dense_corridor": {
+      "purpose": "A separate development/investor-demo partition with dense, source-partitioned coverage. It cannot determine locked national holdout success.",
+      "targets": [
+        {
+          "target_id": "kayseri_city",
+          "kind": "city_region",
+          "name": "Kayseri",
+          "province_codes": [
+            "TR-38"
+          ],
+          "reference_targets_by_option": {
+            "minimal_proof": 750,
+            "recommended_mvp": 3400,
+            "expansion": 11500
+          },
+          "minimum_route_units_by_option": {
+            "minimal_proof": 6,
+            "recommended_mvp": 20,
+            "expansion": 60
+          }
+        },
+        {
+          "target_id": "ankara_city",
+          "kind": "city_region",
+          "name": "Ankara",
+          "province_codes": [
+            "TR-06"
+          ],
+          "reference_targets_by_option": {
+            "minimal_proof": 900,
+            "recommended_mvp": 4200,
+            "expansion": 14000
+          },
+          "minimum_route_units_by_option": {
+            "minimal_proof": 8,
+            "recommended_mvp": 24,
+            "expansion": 72
+          }
+        },
+        {
+          "target_id": "sivas_city",
+          "kind": "city_region",
+          "name": "Sivas",
+          "province_codes": [
+            "TR-58"
+          ],
+          "reference_targets_by_option": {
+            "minimal_proof": 650,
+            "recommended_mvp": 3000,
+            "expansion": 10000
+          },
+          "minimum_route_units_by_option": {
+            "minimal_proof": 6,
+            "recommended_mvp": 18,
+            "expansion": 54
+          }
+        },
+        {
+          "target_id": "kayseri_ankara_corridor",
+          "kind": "road_corridor",
+          "name": "Kayseri–Ankara road corridor",
+          "endpoint_province_codes": [
+            "TR-38",
+            "TR-06"
+          ],
+          "reference_targets_by_option": {
+            "minimal_proof": 800,
+            "recommended_mvp": 3500,
+            "expansion": 11500
+          },
+          "minimum_route_units_by_option": {
+            "minimal_proof": 4,
+            "recommended_mvp": 12,
+            "expansion": 36
+          }
+        },
+        {
+          "target_id": "kayseri_sivas_corridor",
+          "kind": "road_corridor",
+          "name": "Kayseri–Sivas road corridor",
+          "endpoint_province_codes": [
+            "TR-38",
+            "TR-58"
+          ],
+          "reference_targets_by_option": {
+            "minimal_proof": 800,
+            "recommended_mvp": 3500,
+            "expansion": 11500
+          },
+          "minimum_route_units_by_option": {
+            "minimal_proof": 4,
+            "recommended_mvp": 12,
+            "expansion": 36
+          }
+        }
+      ],
+      "required_scene_types": [
+        "city_center",
+        "suburban",
+        "industrial",
+        "rural_road",
+        "terrain_dominant"
+      ],
+      "minimum_share_per_required_scene_type": 0.12,
+      "required_strata": {
+        "road_context": {
+          "required_values": [
+            "divided_highway",
+            "ordinary_road",
+            "rural_road",
+            "junction",
+            "service_area"
+          ],
+          "minimum_references_per_value_by_option": {
+            "minimal_proof": 40,
+            "recommended_mvp": 160,
+            "expansion": 480
+          },
+          "minimum_references_per_required_target_by_option": {
+            "minimal_proof": 4,
+            "recommended_mvp": 16,
+            "expansion": 48
+          },
+          "required_target_ids_by_value": {
+            "divided_highway": [
+              "kayseri_ankara_corridor",
+              "kayseri_sivas_corridor"
+            ],
+            "ordinary_road": [
+              "kayseri_city",
+              "ankara_city",
+              "sivas_city",
+              "kayseri_ankara_corridor",
+              "kayseri_sivas_corridor"
+            ],
+            "rural_road": [
+              "kayseri_city",
+              "ankara_city",
+              "sivas_city",
+              "kayseri_ankara_corridor",
+              "kayseri_sivas_corridor"
+            ],
+            "junction": [
+              "kayseri_city",
+              "ankara_city",
+              "sivas_city",
+              "kayseri_ankara_corridor",
+              "kayseri_sivas_corridor"
+            ],
+            "service_area": [
+              "kayseri_ankara_corridor",
+              "kayseri_sivas_corridor"
+            ]
+          }
+        },
+        "terrain_class": {
+          "required_values": [
+            "mountainous",
+            "flat"
+          ],
+          "minimum_references_per_value_by_option": {
+            "minimal_proof": 80,
+            "recommended_mvp": 320,
+            "expansion": 960
+          },
+          "minimum_references_per_required_target_by_option": {
+            "minimal_proof": 8,
+            "recommended_mvp": 32,
+            "expansion": 96
+          },
+          "required_target_ids_by_value": {
+            "mountainous": [
+              "kayseri_city",
+              "sivas_city",
+              "kayseri_sivas_corridor"
+            ],
+            "flat": [
+              "ankara_city",
+              "kayseri_ankara_corridor"
+            ]
+          }
+        },
+        "vegetation_state": {
+          "required_values_where_observable": [
+            "leaf_on",
+            "leaf_off_or_dormant",
+            "cropland_active",
+            "sparse_or_arid",
+            "snow_cover",
+            "mixed"
+          ],
+          "minimum_distinct_values_overall_by_option": {
+            "minimal_proof": 2,
+            "recommended_mvp": 3,
+            "expansion": 4
+          },
+          "minimum_distinct_values_per_target_where_available": 2
+        },
+        "season": {
+          "required_values_where_observable": [
+            "winter",
+            "spring",
+            "summer",
+            "autumn"
+          ],
+          "minimum_distinct_values_overall_by_option": {
+            "minimal_proof": 2,
+            "recommended_mvp": 3,
+            "expansion": 4
+          },
+          "minimum_distinct_values_per_target_where_available": 2
+        },
+        "shortfall_rule": "Unknown or unavailable vegetation and season metadata remains unknown. A selected option cannot claim a stratum it did not observe; shortfalls are reported and never filled from blocked sources or inferred from location truth."
+      },
+      "maximum_single_city_or_corridor_share": 0.3,
+      "operator_image_rule": "The two operator smoke images, their known answers, coordinates, hashes, viewpoints, and nearby capture areas are unavailable to sampling. No route or patch may be selected because of those images."
+    },
+    "tier_3_locked_holdout": {
+      "purpose": "Independent national candidate-recall evaluation, never model selection or reference construction.",
+      "query_count_by_option": {
+        "minimal_proof": 120,
+        "recommended_mvp": 240,
+        "expansion": 600
+      },
+      "minimum_distinct_provinces_by_option": {
+        "minimal_proof": 30,
+        "recommended_mvp": 60,
+        "expansion": 78
+      },
+      "maximum_queries_per_province_by_option": {
+        "minimal_proof": 4,
+        "recommended_mvp": 4,
+        "expansion": 8
+      },
+      "minimum_distinct_sequences_by_option": {
+        "minimal_proof": 120,
+        "recommended_mvp": 240,
+        "expansion": 600
+      },
+      "minimum_distinct_capture_runs_by_option": {
+        "minimal_proof": 120,
+        "recommended_mvp": 240,
+        "expansion": 600
+      },
+      "maximum_queries_per_sequence": 1,
+      "maximum_queries_per_capture_run": 1,
+      "reference_source_name_overlap_allowed": false,
+      "contributor_overlap_rule": "Use contributors independent of reference construction wherever identity can be resolved. A shared corporate owner alone is not treated as an independent contributor; unresolved contributor identity or an undocumented overlap blocks admission rather than being assumed safe.",
+      "excluded_dense_province_codes": [
+        "TR-06",
+        "TR-38",
+        "TR-58"
+      ],
+      "dense_corridor_share": 0,
+      "urban_group_share_range": [
+        0.45,
+        0.55
+      ],
+      "rural_group_share_range": [
+        0.45,
+        0.55
+      ],
+      "difficulty_minimum_shares": {
+        "easy": 0.2,
+        "medium": 0.4,
+        "hard": 0.2
+      },
+      "separation_requirements": [
+        "No holdout query bytes, paths, hashes, crops, descriptors, source asset IDs, or location truth are available to reference construction or model selection.",
+        "Holdout source names do not appear in reference roles; if an independently licensed source cannot be obtained, the benchmark is blocked.",
+        "Holdout contributors are independent of reference construction wherever contributor identity can be resolved; unresolved or undocumented overlap is quarantined.",
+        "Each holdout query has a distinct non-null sequence ID and capture-run ID; no sequence or capture run crosses train, development, validation, or holdout roles.",
+        "Holdout is separated from train, development, and validation by province, spatial buffer, and capture-time groups under config/corpus/leakage-policy-v1.json.",
+        "Location truth is loaded by a scoring-only process only after inference has completed for every query in the frozen run.",
+        "Aerial/satellite index cells are generated from a predeclared national grid before holdout truth is accessible; no cell is centered, selected, or retained because of holdout answers.",
+        "The manifest contains opaque query IDs; the truth mapping and its decryption/access key are not in the repository or inference environment."
+      ],
+      "model_selection_prohibited": true,
+      "minimum_publishable_query_count": 100
+    }
+  },
+  "options": [
+    {
+      "option_id": "minimal_proof",
+      "label": "Minimal proof",
+      "tier_1_reference_count": 8100,
+      "tier_2_reference_count": 3900,
+      "reference_image_count": 12000,
+      "street_reference_count": 12000,
+      "aerial_satellite_patch_count": 0,
+      "holdout_query_count": 120,
+      "governed_asset_count": 12120,
+      "province_count": 81,
+      "dense_corridor_count": 2,
+      "planned_route_unit_count": 190,
+      "storage_gb": {
+        "compressed_images": 9.09,
+        "normalized_derivatives": 4.848,
+        "megaloc_descriptors": 0.405504,
+        "faiss_parquet_index": 0.0811008,
+        "metadata": 0.07272,
+        "primary_footprint": 14.4973248,
+        "staging_space": 7.2486624,
+        "rollback_version_space": 7.2486624,
+        "total_cloud_requirement": 28.9946496,
+        "estimated_local_output": 1.1686496
+      },
+      "compute_hours": {
+        "descriptor_generation_gpu": 1.25,
+        "evaluation_gpu": 2.5,
+        "total_gpu": 3.75
+      },
+      "expected_limitations": [
+        "Only 100 national references per province; long rural roads and seasonal variation will be sparse.",
+        "The 120-query holdout supports a directional go/no-go result, not granular province claims.",
+        "Source availability may prevent all heading and season targets even when legal admission passes."
+      ]
+    },
+    {
+      "option_id": "recommended_mvp",
+      "label": "Recommended MVP",
+      "tier_1_reference_count": 32400,
+      "tier_2_reference_count": 17600,
+      "reference_image_count": 50000,
+      "street_reference_count": 50000,
+      "aerial_satellite_patch_count": 0,
+      "holdout_query_count": 240,
+      "governed_asset_count": 50240,
+      "province_count": 81,
+      "dense_corridor_count": 2,
+      "planned_route_unit_count": 410,
+      "storage_gb": {
+        "compressed_images": 37.68,
+        "normalized_derivatives": 20.096,
+        "megaloc_descriptors": 1.6896,
+        "faiss_parquet_index": 0.33792,
+        "metadata": 0.30144,
+        "primary_footprint": 60.10496,
+        "staging_space": 30.05248,
+        "rollback_version_space": 30.05248,
+        "total_cloud_requirement": 120.20992,
+        "estimated_local_output": 4.75792
+      },
+      "compute_hours": {
+        "descriptor_generation_gpu": 5.25,
+        "evaluation_gpu": 5,
+        "total_gpu": 10.25
+      },
+      "expected_limitations": [
+        "Coverage is designed for candidate recall and cannot establish street- or meter-level accuracy.",
+        "Sparse-source provinces may remain below scene/time targets and must be reported, not backfilled from blocked sources.",
+        "A 240-query holdout is sufficient for national aggregate comparison but not 81 separate province estimates."
+      ]
+    },
+    {
+      "option_id": "expansion",
+      "label": "Expansion",
+      "tier_1_reference_count": 121500,
+      "tier_2_reference_count": 58500,
+      "reference_image_count": 180000,
+      "street_reference_count": 180000,
+      "aerial_satellite_patch_count": 0,
+      "holdout_query_count": 600,
+      "governed_asset_count": 180600,
+      "province_count": 81,
+      "dense_corridor_count": 2,
+      "planned_route_unit_count": 1068,
+      "storage_gb": {
+        "compressed_images": 135.45,
+        "normalized_derivatives": 72.24,
+        "megaloc_descriptors": 6.08256,
+        "faiss_parquet_index": 1.216512,
+        "metadata": 1.0836,
+        "primary_footprint": 216.072672,
+        "staging_space": 108.036336,
+        "rollback_version_space": 108.036336,
+        "total_cloud_requirement": 432.145344,
+        "estimated_local_output": 17.015344
+      },
+      "compute_hours": {
+        "descriptor_generation_gpu": 18.75,
+        "evaluation_gpu": 12.5,
+        "total_gpu": 31.25
+      },
+      "expected_limitations": [
+        "Expansion is not authorized by Phase 3A and requires measured throughput, licensing re-review, and a new capped budget.",
+        "The estimated local output exceeds current D-drive free space once a safety reserve is preserved; outputs must stay on approved cloud/external storage.",
+        "More assets do not remedy geographic or source bias without passing every stratum and independent-holdout gate."
+      ]
+    }
+  ],
+  "continuation_gates": {
+    "acquisition_and_governance": [
+      "Every acquisition-ready row passes the manifest validator and resolves to an admitted source-policy decision.",
+      "All 81 provinces meet the selected option's Tier 1 minimum without blocked, unknown, or research-only imagery.",
+      "Attribution and deletion/revocation mappings exist at asset and source-partition level.",
+      "Leakage audit has zero unresolved exclusions or split conflicts and emits an immutable receipt."
+    ],
+    "benchmark": {
+      "minimum_holdout_queries": 100,
+      "within_200km_recall_at_10_minimum": 0.7,
+      "province_recall_at_10_minimum": 0.55,
+      "median_nearest_candidate_distance_km_maximum": 150,
+      "maximum_absolute_urban_rural_recall_gap": 0.2,
+      "baseline_rule": "Freeze and run the existing six-reference baseline on the same locked holdout; the bootstrap 95 percent confidence interval for the change in within-200-km Recall@10 must have a lower bound above zero.",
+      "city_memorization_guard": "The national decision uses only the Tier 3 holdout, which excludes Kayseri, Ankara, Sivas, and both dense corridors. Tier 2 results are reported separately and cannot rescue a failed national gate.",
+      "truth_timing_rule": "Predictions for every frozen query complete before the scoring process loads any truth."
+    },
+    "decision": "Continue to Phase 3B only when every governance gate passes and every national benchmark threshold passes. Otherwise stop, report abstention/coverage gaps, and revise the plan without adding a blocked source."
+  }
+}

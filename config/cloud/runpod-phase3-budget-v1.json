@@ -1,0 +1,323 @@
+{
+  "version": "runpod-phase3-budget-v1",
+  "phase": "3A",
+  "enabled": false,
+  "approval_required": true,
+  "currency": "USD",
+  "pricing_snapshot_date": "2026-07-16",
+  "platform": "runpod_secure_cloud_pod",
+  "purchase_model": "on_demand",
+  "fallback_platform": {
+    "platform": "local_rtx_4060",
+    "vram_gb": 8,
+    "allowed_scenarios": [
+      "minimal_proof"
+    ],
+    "cloud_compute_cost_usd": 0.0,
+    "constraints": [
+      "chunked_execution_only",
+      "separately_approved_encrypted_storage_required",
+      "d_drive_staging_prohibited"
+    ]
+  },
+  "gpu_hourly_rate_assumption": {
+    "gpu_type": "NVIDIA RTX A5000",
+    "cloud_type": "SECURE",
+    "vram_gb": 24,
+    "cpu_ram_gb": 25,
+    "vcpu": 9,
+    "usd_per_gpu_hour": 0.27,
+    "source_url": "https://www.runpod.io/gpu-models/rtx-a5000",
+    "console_url": "https://console.runpod.io/deploy?gpu=RTX+A5000",
+    "availability_note": "Public Secure Cloud list price; region and stock are not guaranteed. Recheck the approval-day console and reject any higher rate or different shape."
+  },
+  "storage_gb": 150,
+  "storage_monthly_rate": 0.07,
+  "storage_security": {
+    "selected_persistent_storage": "network_volume",
+    "provider_encryption_controls": {
+      "volume_disk_optional_toggle_exposed": true,
+      "volume_disk_selected": false,
+      "container_disk_equivalent_toggle_exposed": false,
+      "network_volume_equivalent_toggle_exposed": false,
+      "source_url": "https://docs.runpod.io/pods/storage/types"
+    },
+    "dpa_broader_at_rest_representation_recorded": true,
+    "dpa_source_url": "https://www.runpod.io/legal/data-processing-agreement",
+    "terms_shared_responsibility_source_url": "https://www.runpod.io/legal/terms-of-service",
+    "application_layer_encryption_required": true,
+    "plaintext_persistent_storage_prohibited": true,
+    "customer_managed_application_keys_kept_outside_runpod": true,
+    "professional_review_required": true,
+    "launch_blocked_until_review_complete": true
+  },
+  "expected_gpu_hours": 11.25,
+  "maximum_gpu_hours": 16,
+  "soft_budget": 15.0,
+  "hard_budget": 25.0,
+  "automatic_stop_deadline": {
+    "mode": "pod_start_relative_plus_absolute_utc",
+    "pod_terminate_after_hours": 16,
+    "absolute_utc_required_before_launch": true,
+    "idle_shutdown_minutes": 15,
+    "idle_action": "checkpoint_sync_and_terminate"
+  },
+  "alert_thresholds": [
+    {
+      "metric": "fraction_of_hard_budget",
+      "values": [
+        0.5,
+        0.75,
+        0.9
+      ],
+      "action": "notify_operator_and_record_receipt"
+    },
+    {
+      "metric": "fraction_of_maximum_gpu_hours",
+      "values": [
+        0.5,
+        0.75,
+        0.9
+      ],
+      "action": "notify_operator_and_record_receipt"
+    }
+  ],
+  "watchdog_thresholds": {
+    "caps": [
+      "hard_budget",
+      "maximum_gpu_hours"
+    ],
+    "stop_new_work_fraction": 0.9,
+    "terminate_fraction": 1.0,
+    "external_lifecycle_watchdog_required": true
+  },
+  "required_output_backup": true,
+  "required_backup_outputs": [
+    "governed_source_archive",
+    "normalized_derivative_version",
+    "corpus_manifest",
+    "provenance_receipts",
+    "descriptor_index_version",
+    "deletion_revocation_map",
+    "cost_receipt",
+    "validation_report",
+    "checkpoint_completion_receipts"
+  ],
+  "backup_policy": {
+    "runpod_is_system_of_record": false,
+    "runpod_volume_counts_as_backup_copy": false,
+    "independent_corpus_system_of_record_required_before_upload": true,
+    "minimum_verified_copies_before_volume_deletion": 2,
+    "hash_algorithm": "sha256",
+    "network_volume_retention_days_after_run": 7,
+    "recommended_local_destination": "C:\\AtlasLensData\\phase3\\<run-id>",
+    "recommended_local_destination_scope": "selective_outputs_and_receipts_only",
+    "repository_destination_prohibited": true,
+    "d_drive_destination_prohibited": true,
+    "expansion_requires_separately_approved_external_backup": true
+  },
+  "runtime_paths": {
+    "network_volume_mount": "/workspace",
+    "corpus": "/workspace/corpus/<corpus-version>/immutable",
+    "manifests": "/workspace/corpus/<corpus-version>/manifests",
+    "model_cache": "/workspace/model-cache/<artifact-sha256>",
+    "checkpoints": "/workspace/checkpoints/<run-id>",
+    "descriptor_outputs": "/workspace/outputs/<run-id>",
+    "revocation": "/workspace/revocation/<source-name>",
+    "ephemeral_plaintext_shard": "/tmp/atlaslens/<run-id>"
+  },
+  "transfer_policy": {
+    "default_mode": "client_side_encrypted_s3_compatible_api",
+    "direct_source_to_volume_default": false,
+    "direct_source_to_volume_allowed_decisions": [
+      "GO",
+      "GO_WITH_ATTRIBUTION"
+    ],
+    "official_bulk_or_api_terms_required": true,
+    "provenance_receipt_required": true,
+    "long_lived_source_token_on_pod_prohibited": true,
+    "scraping_prohibited": true
+  },
+  "interruption_recovery": {
+    "checkpoint_max_references": 1000,
+    "checkpoint_max_minutes": 15,
+    "resume_identity": "completed_receipt_id",
+    "new_on_demand_pod_same_datacenter": true,
+    "reuse_existing_network_volume": true,
+    "community_cloud_failover": false
+  },
+  "shutdown_teardown_policy": {
+    "idle_minutes": 15,
+    "pod_final_state": "terminate",
+    "normal_and_abort_sequence": [
+      "stop_new_shards",
+      "finalize_or_mark_checkpoint_incomplete",
+      "sync_required_backup_outputs",
+      "verify_file_counts_and_sha256",
+      "terminate_pod",
+      "retain_network_volume_for_bounded_validation",
+      "verify_second_backup_and_source_retention_review",
+      "delete_network_volume_and_record_receipt"
+    ],
+    "network_volume_retention_days_maximum": 7,
+    "second_verified_backup_before_volume_deletion": true,
+    "deletion_receipt_required": true
+  },
+  "resource_limits": {
+    "gpu_count": 1,
+    "maximum_concurrent_pods": 1,
+    "maximum_network_volumes": 1,
+    "container_disk_gb": 50,
+    "network_volume_tier": "standard",
+    "network_volume_mount": "/workspace",
+    "preferred_datacenter_candidate": "EU-RO-1",
+    "datacenter_selection_rule": "SECURE EU datacenter offering both RTX A5000 and Standard network volume at approval time; otherwise wait",
+    "container_image": "nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:ac55d124da4882b497f732d8dfd9a702d5447a5f29d08d56da6f64f0a1eb34bc",
+    "python_version": "3.12",
+    "pytorch_version": "2.7.1",
+    "cuda_version": "12.8",
+    "public_http_ports": 0,
+    "auto_pay": false,
+    "notify_low_balance": true
+  },
+  "prohibited_resources": [
+    "community_cloud",
+    "spot_or_interruptible_compute",
+    "savings_plan",
+    "three_month_commitment",
+    "six_month_commitment",
+    "multi_gpu_pod",
+    "more_than_one_concurrent_pod",
+    "serverless_endpoint",
+    "instant_cluster",
+    "public_model_endpoint",
+    "high_performance_network_volume",
+    "automatic_region_or_gpu_substitution",
+    "auto_pay",
+    "public_notebook_or_http_port"
+  ],
+  "cost_assumptions": {
+    "network_storage_source_url": "https://docs.runpod.io/storage/network-volumes",
+    "pod_pricing_source_url": "https://docs.runpod.io/pods/pricing",
+    "network_storage_usd_per_gb_month_under_1tb": 0.07,
+    "container_disk_usd_per_gb_month_running": 0.1,
+    "month_hours": 730,
+    "runpod_ingress_egress_usd": 0.0,
+    "one_time_container_storage_cost_definition": "50 GB container disk prorated over expected Pod runtime; it is temporary and not retained",
+    "recurring_network_storage_cost_definition": "one full month of the rounded Standard network volume; it recurs until volume deletion",
+    "estimated_cost_definition": "expected one-time compute plus expected one-time container disk plus one full month of recurring network storage",
+    "maximum_first_month_cost_definition": "maximum-hours compute plus maximum-hours container disk plus one full month of recurring network storage, before excluded taxes and external costs",
+    "maximum_authorized_cost_definition": "policy cap for the selected execution and first storage month; renewal or changed pricing requires new approval"
+  },
+  "costs_excluded_or_unknown": [
+    "tax_vat_and_currency_conversion",
+    "source_license_or_acquisition_fees",
+    "source_provider_egress_or_api_fees",
+    "external_backup_media_or_service",
+    "staff_time",
+    "local_electricity",
+    "future_security_or_legal_review",
+    "regional_price_or_availability_change"
+  ],
+  "scenarios": [
+    {
+      "id": "minimal_proof",
+      "label": "Minimal proof",
+      "reference_image_count": 12000,
+      "holdout_query_count": 120,
+      "governed_asset_count": 12120,
+      "corpus_storage_required_gb": 28.9946496,
+      "network_volume_gb": 40,
+      "local_output_gb": 1.1686496,
+      "descriptor_generation_gpu_hours": 1.25,
+      "evaluation_gpu_hours": 2.5,
+      "setup_validation_gpu_hours": 0.5,
+      "expected_gpu_hours": 4.25,
+      "maximum_gpu_hours": 6,
+      "container_disk_gb": 50,
+      "pod_session_max_hours": 6,
+      "maximum_session_count": 1,
+      "one_time_compute_cost": 1.1475,
+      "temporary_container_storage_cost": 0.02911,
+      "one_time_container_storage_cost": 0.02911,
+      "ongoing_monthly_storage_cost": 2.8,
+      "recurring_network_storage_monthly_cost": 2.8,
+      "estimated_cost": 3.97661,
+      "estimated_first_month_cost": 3.97661,
+      "maximum_compute_cost": 1.62,
+      "maximum_container_storage_cost": 0.041096,
+      "maximum_first_month_cost": 4.461096,
+      "hard_budget_headroom_after_maximum_first_month_cost": 5.538904,
+      "maximum_authorized_cost": 10.0,
+      "soft_budget": 5.0,
+      "hard_budget": 10.0,
+      "main_limitation": "National recall density is thin and conclusions are proof-only."
+    },
+    {
+      "id": "recommended_mvp",
+      "label": "Recommended MVP",
+      "reference_image_count": 50000,
+      "holdout_query_count": 240,
+      "governed_asset_count": 50240,
+      "corpus_storage_required_gb": 120.20992,
+      "network_volume_gb": 150,
+      "local_output_gb": 4.75792,
+      "descriptor_generation_gpu_hours": 5.25,
+      "evaluation_gpu_hours": 5.0,
+      "setup_validation_gpu_hours": 1.0,
+      "expected_gpu_hours": 11.25,
+      "maximum_gpu_hours": 16,
+      "container_disk_gb": 50,
+      "pod_session_max_hours": 16,
+      "maximum_session_count": 1,
+      "one_time_compute_cost": 3.0375,
+      "temporary_container_storage_cost": 0.077055,
+      "one_time_container_storage_cost": 0.077055,
+      "ongoing_monthly_storage_cost": 10.5,
+      "recurring_network_storage_monthly_cost": 10.5,
+      "estimated_cost": 13.614555,
+      "estimated_first_month_cost": 13.614555,
+      "maximum_compute_cost": 4.32,
+      "maximum_container_storage_cost": 0.109589,
+      "maximum_first_month_cost": 14.929589,
+      "hard_budget_headroom_after_maximum_first_month_cost": 10.070411,
+      "maximum_authorized_cost": 25.0,
+      "soft_budget": 15.0,
+      "hard_budget": 25.0,
+      "main_limitation": "Still a pilot corpus; it supports candidate-recall decisions, not meter-level accuracy claims."
+    },
+    {
+      "id": "expansion",
+      "label": "Expansion",
+      "reference_image_count": 180000,
+      "holdout_query_count": 600,
+      "governed_asset_count": 180600,
+      "corpus_storage_required_gb": 432.145344,
+      "network_volume_gb": 500,
+      "local_output_gb": 17.015344,
+      "descriptor_generation_gpu_hours": 18.75,
+      "evaluation_gpu_hours": 12.5,
+      "setup_validation_gpu_hours": 2.0,
+      "expected_gpu_hours": 33.25,
+      "maximum_gpu_hours": 48,
+      "container_disk_gb": 50,
+      "pod_session_max_hours": 24,
+      "maximum_session_count": 2,
+      "one_time_compute_cost": 8.9775,
+      "temporary_container_storage_cost": 0.22774,
+      "one_time_container_storage_cost": 0.22774,
+      "ongoing_monthly_storage_cost": 35.0,
+      "recurring_network_storage_monthly_cost": 35.0,
+      "estimated_cost": 44.20524,
+      "estimated_first_month_cost": 44.20524,
+      "maximum_compute_cost": 12.96,
+      "maximum_container_storage_cost": 0.328767,
+      "maximum_first_month_cost": 48.288767,
+      "hard_budget_headroom_after_maximum_first_month_cost": 16.711233,
+      "maximum_authorized_cost": 65.0,
+      "soft_budget": 50.0,
+      "hard_budget": 65.0,
+      "main_limitation": "Not authorized until Recommended MVP passes; full local output sync also needs a separate external-backup decision."
+    }
+  ]
+}

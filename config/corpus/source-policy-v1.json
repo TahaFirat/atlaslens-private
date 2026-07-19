@@ -1,0 +1,942 @@
+{
+  "schema_version": "atlaslens-source-policy-v1",
+  "policy_version": "2026-07-16",
+  "evidence_date": "2026-07-16",
+  "purpose": "Point-in-time technical due diligence for a commercially cautious Türkiye reference corpus. A source decision does not replace asset-level provenance review or legal advice.",
+  "legal_disclaimer": "This policy records technical licensing risk, not legal clearance or legal advice. Rights in code, model weights, imagery, metadata, APIs, cached files and derived embeddings are evaluated separately.",
+  "decision_values": [
+    "GO",
+    "GO_WITH_ATTRIBUTION",
+    "FIRST_PARTY_ONLY",
+    "WRITTEN_PERMISSION_REQUIRED",
+    "LEGAL_REVIEW_REQUIRED",
+    "RESEARCH_ONLY",
+    "BLOCKED",
+    "UNKNOWN"
+  ],
+  "acquisition_ready_decisions": [
+    "GO",
+    "GO_WITH_ATTRIBUTION",
+    "FIRST_PARTY_ONLY"
+  ],
+  "default_rules": [
+    "Absence of an explicit applicable license means no commercial permission.",
+    "A code license does not grant rights in model weights, training data, imagery or API content.",
+    "Display or API access rights do not imply persistent caching, embedding or indexing rights; each permission is evaluated independently.",
+    "Every acquired asset must carry a provenance receipt, applicable license snapshot and deletion state.",
+    "Share-alike sources must remain source-partitioned until counsel confirms the scope of reciprocal obligations.",
+    "A revocation or valid removal request must be traceable from source asset to every normalized derivative, descriptor, index shard, backup and report.",
+    "Component rights never inherit: code, released weights, training corpora, input imagery, cached objects, descriptors and indexes each require an applicable grant."
+  ],
+  "component_rights_separation": {
+    "megaloc": {
+      "aggregate_source_id": "megaloc_code_model",
+      "code": {
+        "license": "MIT in the official repository",
+        "decision": "GO_WITH_ATTRIBUTION",
+        "evidence_url": "https://github.com/gmberton/MegaLoc/blob/main/LICENSE",
+        "scope": "Repository software only"
+      },
+      "released_weights": {
+        "artifact_license": "MIT as declared by the author-maintained model card",
+        "artifact_license_decision": "GO_WITH_ATTRIBUTION",
+        "commercial_deployment_decision": "LEGAL_REVIEW_REQUIRED",
+        "evidence_url": "https://huggingface.co/gberton/MegaLoc",
+        "scope": "Pinned released weight artifact only; no training-corpus or input-imagery rights inherit"
+      },
+      "training_corpora": {
+        "decision": "LEGAL_REVIEW_REQUIRED",
+        "named_sources": [
+          "GSV-Cities",
+          "Mapillary Street-Level Sequences (MSLS)",
+          "MegaScenes",
+          "ScanNet",
+          "San Francisco eXtra Large (SF-XL)"
+        ],
+        "evidence_url": "https://arxiv.org/abs/2502.17237",
+        "scope": "Five independently governed training corpora identified by the paper; rights are not granted by either MIT declaration"
+      },
+      "future_atlaslens_inputs": {
+        "decision": "UNKNOWN",
+        "scope": "Each reference image, cache, descriptor and index shard follows its own source-policy record and asset manifest; MegaLoc grants no rights over them"
+      }
+    },
+    "sample4geo": {
+      "code": {
+        "source_id": "sample4geo_code",
+        "decision": "BLOCKED"
+      },
+      "released_weights": {
+        "source_id": "sample4geo_pretrained_weights",
+        "decision": "BLOCKED"
+      },
+      "referenced_datasets": [
+        {
+          "source_id": "cvusa",
+          "decision": "BLOCKED"
+        },
+        {
+          "source_id": "cvact",
+          "decision": "BLOCKED"
+        },
+        {
+          "source_id": "vigor",
+          "decision": "BLOCKED"
+        },
+        {
+          "source_id": "university_1652",
+          "decision": "RESEARCH_ONLY"
+        }
+      ],
+      "evidence_url": "https://github.com/Skyy93/Sample4Geo/blob/main/README.md",
+      "non_inheritance_rule": "The Sample4Geo repository, linked weights, and each of CVUSA, CVACT, VIGOR and University-1652 are separate assets; no component promotes another."
+    },
+    "plonk": {
+      "aggregate_source_id": "plonk_models_lineage",
+      "code_decision": "GO_WITH_ATTRIBUTION",
+      "released_weight_artifact_decision": "GO_WITH_ATTRIBUTION",
+      "commercial_deployment_decision": "LEGAL_REVIEW_REQUIRED",
+      "training_corpus_decision": "LEGAL_REVIEW_REQUIRED",
+      "training_variants": [
+        "OSV-5M",
+        "YFCC-100M",
+        "iNaturalist-21"
+      ],
+      "future_atlaslens_input_decision": "UNKNOWN",
+      "evidence_urls": [
+        "https://github.com/nicolas-dufour/plonk",
+        "https://huggingface.co/nicolas-dufour/PLONK_OSV_5M",
+        "https://huggingface.co/nicolas-dufour/PLONK_YFCC",
+        "https://huggingface.co/nicolas-dufour/PLONK_iNaturalist"
+      ],
+      "non_inheritance_rule": "MIT code/model-card declarations do not grant training-media, new input-imagery, cache, descriptor or index rights."
+    }
+  },
+  "sources": [
+    {
+      "source_id": "atlaslens_first_party_imagery",
+      "source_name": "First-party AtlasLens-captured imagery",
+      "official_url": "https://www.kvkk.gov.tr/Icerik/2050/Kisisel-Veriler",
+      "asset_type": "Street-level imagery and capture metadata",
+      "owner_controller": "AtlasLens or the contracting AtlasLens legal entity; data-controller status must be documented",
+      "code_license": "NOT_APPLICABLE",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "FIRST_PARTY_OWNED_AFTER_DOCUMENTED_CAPTURE_AND_CONTRIBUTOR_ASSIGNMENT",
+      "commercial_use": "Potentially allowed only after ownership, contributor releases, lawful personal-data basis and capture-location rules are documented",
+      "redistribution_rights": "AtlasLens policy and subject/property rights control; no redistribution by default",
+      "derivative_work_rights": "Potentially allowed after ownership and privacy gates; preserve provenance and removal linkage",
+      "embedding_index_rights": "Potentially allowed when capture terms expressly cover ML-derived descriptors and persistent indexes",
+      "caching_permission": "Allowed only under an approved first-party capture, access, retention and deletion policy; no current acquisition is authorized",
+      "attribution_requirements": "Internal asset owner and capture-run attribution are mandatory; public credit depends on contributor agreement",
+      "share_alike_risk": "None from a third-party content license, but contributor, privacy and property rights remain",
+      "api_terms": "NOT_APPLICABLE",
+      "caching_indexing_permission": "Allowed only by the approved first-party capture policy and consent/notice package",
+      "deletion_revocation_requirements": "Delete or anonymize personal data when the processing basis ends; cascade an approved deletion through raw assets, derivatives, descriptors, index shards and backups",
+      "rate_limits": "NOT_APPLICABLE",
+      "personal_data_considerations": "Faces, number plates, bystanders, precise trajectories, capture time and contributor identifiers may be personal data; apply minimization, access control, retention limits and verified face/plate blurring before index admission",
+      "current_decision": "FIRST_PARTY_ONLY",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Which AtlasLens legal entity is controller, what lawful basis applies per capture mode, and which public-road/property releases are required?",
+      "required_next_action": "Counsel-approved capture policy, privacy notice, contributor/IP assignment, blur QA, retention schedule and deletion runbook before any acquisition",
+      "primary_evidence_urls": [
+        "https://www.kvkk.gov.tr/Icerik/2050/Kisisel-Veriler",
+        "https://www.kvkk.gov.tr/Icerik/2033/Aydinlatma-Yukumlulugu-",
+        "https://www.kvkk.gov.tr/Icerik/2038/kisisel-verilerin-silinmesi-yok-edilmesi-veya-anonim-hale-getirilmesi",
+        "https://www.kvkk.gov.tr/Icerik/2040/Veri-Guvenligine-Iliskin-Yukumlulukler"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "atlaslens_partner_imagery",
+      "source_name": "Contracted or partner-provided imagery",
+      "official_url": "https://www.mevzuat.gov.tr/mevzuatmetin/1.5.5846.pdf",
+      "asset_type": "Fleet, logistics, dashcam or partner street-level imagery and metadata",
+      "owner_controller": "Partner and/or original contributors; controller/processor roles must be allocated by contract",
+      "code_license": "NOT_APPLICABLE",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "CONTRACT_SPECIFIC_NO_RIGHTS_UNTIL_EXECUTED",
+      "commercial_use": "Not granted without an executed agreement and chain-of-title warranty",
+      "redistribution_rights": "Contract specific; default is prohibited",
+      "derivative_work_rights": "Must expressly include normalization, cropping, blurring, quality transformations and derived features",
+      "embedding_index_rights": "Must expressly include commercial ML processing, persistent descriptors, source-specific indexes and evaluation outputs",
+      "caching_permission": "Not granted by assumption; the executed contract must specify raw/derived cache locations, duration, cloud/backups and termination handling",
+      "attribution_requirements": "Contract specific; asset-level partner and contributor provenance remains mandatory",
+      "share_alike_risk": "Unknown until every upstream contribution and license is disclosed",
+      "api_terms": "Contract and delivery-channel terms apply",
+      "caching_indexing_permission": "Not permitted until expressly granted in writing",
+      "deletion_revocation_requirements": "Contract must define takedown triggers, response SLA, downstream deletion, backup expiry, audit evidence and post-termination handling",
+      "rate_limits": "Contract specific",
+      "personal_data_considerations": "Partner must document lawful collection, notices/consents where required, data-subject request handling, face/plate controls, precise-route risk and cross-border/cloud processing",
+      "current_decision": "WRITTEN_PERMISSION_REQUIRED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Can the partner prove ownership and personal-data authority for every capture run and grant descriptor/index rights?",
+      "required_next_action": "Execute a source schedule and data-processing/IP agreement covering commercial use, cloud subprocessors, embeddings, deletion and warranties before delivery",
+      "primary_evidence_urls": [
+        "https://www.mevzuat.gov.tr/mevzuatmetin/1.5.5846.pdf",
+        "https://www.kvkk.gov.tr/Icerik/2050/Kisisel-Veriler",
+        "https://www.kvkk.gov.tr/Icerik/2038/kisisel-verilerin-silinmesi-yok-edilmesi-veya-anonim-hale-getirilmesi"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "kartaview",
+      "source_name": "KartaView",
+      "official_url": "https://kartaview.org/terms",
+      "asset_type": "Crowdsourced street-level imagery, sequences and spatial metadata",
+      "owner_controller": "Contributors retain content ownership; KartaView/Grab controls the service",
+      "code_license": "MIT as stated in the official terms",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "CC-BY-SA-4.0 as stated in the official terms",
+      "commercial_use": "Section 4's CC-BY-SA grant permits commercial reuse subject to attribution/share-alike, but section 15's platform-content restrictions create an unresolved internal-terms ambiguity for commercial storage/indexing",
+      "redistribution_rights": "Allowed under CC-BY-SA-4.0 conditions, including attribution, license notice and indication of changes",
+      "derivative_work_rights": "Allowed under CC-BY-SA-4.0; adaptations must satisfy share-alike",
+      "embedding_index_rights": "Not expressly classified in the reviewed terms; do not infer whether a descriptor database is an adaptation or collection",
+      "caching_permission": "CC-BY-SA permits licensed copies, but KartaView terms sections 4 and 15 leave API-scale persistent caching ambiguous; no AtlasLens cache is approved",
+      "attribution_requirements": "Credit KartaView/Grab and contributors, link the license and identify modifications as required by the applicable asset/service terms",
+      "share_alike_risk": "High and unresolved for normalized imagery, descriptor collections and merged indexes",
+      "api_terms": "Official terms sections 4 and 15 and endpoint documentation apply together; no endpoint-specific bulk-index authorization was found",
+      "caching_indexing_permission": "No explicit persistent commercial descriptor-index permission found in the reviewed primary evidence",
+      "deletion_revocation_requirements": "Preserve source IDs and contributor linkage; define takedown polling and cascading removal before any use",
+      "rate_limits": "No current fixed bulk-acquisition limit found in the reviewed primary evidence; written confirmation is required",
+      "personal_data_considerations": "Street scenes can contain faces, number plates, homes and contributor trajectories; verify source blur state and apply independent privacy QA",
+      "current_decision": "LEGAL_REVIEW_REQUIRED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "How do the CC-BY-SA grant in section 4 and platform-content restriction in section 15 interact, would descriptors/index shards trigger share-alike, and does the service authorize planned bulk retrieval?",
+      "required_next_action": "Obtain counsel analysis of sections 4/15 and share-alike scope, plus written service confirmation for bulk caching/indexing before acquisition",
+      "primary_evidence_urls": [
+        "https://kartaview.org/terms",
+        "https://kartaview.org/doc/photos",
+        "https://kartaview.org/doc/sequences"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "mapillary",
+      "source_name": "Mapillary",
+      "official_url": "https://help.mapillary.com/hc/en-us/articles/115001770409-CC-BY-SA-license-for-open-data",
+      "asset_type": "Crowdsourced street-level imagery, sequences and map features",
+      "owner_controller": "Contributors retain imagery rights; Meta Platforms/Mapillary controls the service and API",
+      "code_license": "NOT_APPLICABLE",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "CC-BY-SA as described by Mapillary; asset and service terms must be snapshotted",
+      "commercial_use": "The open-data guidance describes commercial reuse under CC-BY-SA, but API access does not by itself grant persistent commercial indexing",
+      "redistribution_rights": "Subject to CC-BY-SA attribution, license and share-alike conditions plus service terms",
+      "derivative_work_rights": "Subject to CC-BY-SA and service terms",
+      "embedding_index_rights": "No express permission found for a persistent commercial descriptor index",
+      "caching_permission": "Not established from publicly reviewable terms; current full terms are login-gated and written permission is required for planned persistent/bulk caching",
+      "attribution_requirements": "For each image preserve title or image link, contributor username/profile link and license identification using Mapillary's published attribution guidance",
+      "share_alike_risk": "High and unresolved for image adaptations and descriptor/index outputs",
+      "api_terms": "Mapillary API access documentation and Mapillary terms apply; current terms were not fully reviewable without an account session",
+      "caching_indexing_permission": "Not established; written permission is required for planned caching, bulk processing and persistent indexing",
+      "deletion_revocation_requirements": "Mapillary documents owner deletion and reporting; poll source state and cascade removals from raw, derivative, descriptor, index and backup layers",
+      "rate_limits": "Current project-specific rate limits were not established from publicly reviewed documentation",
+      "personal_data_considerations": "Faces, number plates, homes and contributor movement can be personal data despite platform blurring; conduct independent privacy and blur QA",
+      "current_decision": "WRITTEN_PERMISSION_REQUIRED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Do current service/API terms authorize bulk commercial download, long-term caching and a descriptor index, and how must share-alike apply?",
+      "required_next_action": "Request written clarification from Mapillary/Meta and obtain counsel review before any token creation or acquisition",
+      "primary_evidence_urls": [
+        "https://help.mapillary.com/hc/en-us/articles/115001770409-CC-BY-SA-license-for-open-data",
+        "https://help.mapillary.com/hc/en-us/articles/360010234680-Accessing-imagery-and-data-through-the-Mapillary-API",
+        "https://help.mapillary.com/hc/en-us/articles/4424873641106-Deleting-your-Mapillary-imagery",
+        "https://www.mapillary.com/terms"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "panoramax",
+      "source_name": "Panoramax",
+      "official_url": "https://docs.panoramax.fr/federated-catalog/",
+      "asset_type": "Federated street-level imagery and sequence metadata",
+      "owner_controller": "Each Panoramax instance and its contributors; federation-wide rights are not uniform",
+      "code_license": "Repository/component specific; not a grant over hosted imagery",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "INSTANCE_SPECIFIC_ETALAB-2.0_OR_CC-BY-SA-4.0_WHEN_DECLARED; otherwise proprietary",
+      "commercial_use": "Potentially allowed only for an asset whose instance declares an applicable open license",
+      "redistribution_rights": "Instance-license specific; reciprocal conditions may apply",
+      "derivative_work_rights": "Instance-license specific; federation documentation discusses open derived data rather than closed outputs",
+      "embedding_index_rights": "Not expressly resolved for closed commercial descriptors or indexes",
+      "caching_permission": "Instance and licence specific; there is no federation-wide authorization for AtlasLens persistent caching, and proprietary instances are rejected",
+      "attribution_requirements": "Preserve instance, contributor, asset URL, declared license and required notices at asset and report level",
+      "share_alike_risk": "High; federation guidance is designed to keep derived data open and warns against closed derived datasets and AI outputs",
+      "api_terms": "Instance API and legal notice apply independently; license metadata must be read per asset",
+      "caching_indexing_permission": "No federation-wide authorization for a closed persistent index",
+      "deletion_revocation_requirements": "Track instance and asset IDs, poll availability/license state and cascade valid removals",
+      "rate_limits": "Instance specific; no universal rate limit",
+      "personal_data_considerations": "Street imagery and sequences may reveal faces, plates, homes and trajectories; verify each instance's blur and privacy controls",
+      "current_decision": "LEGAL_REVIEW_REQUIRED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Can AtlasLens satisfy the relevant open-license obligations for descriptors and index outputs without contaminating proprietary partitions?",
+      "required_next_action": "Select named instances only, snapshot per-asset licenses, obtain operator approval for bulk use and receive counsel advice on derived-index openness",
+      "primary_evidence_urls": [
+        "https://docs.panoramax.fr/federated-catalog/",
+        "https://docs.panoramax.fr/backend/install/settings/",
+        "https://docs.panoramax.fr/backend/api/api/",
+        "https://panoramax.fr/mentions-legales",
+        "https://panoramax.fr/foire-aux-questions/juridique/"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "wikimedia_commons",
+      "source_name": "Wikimedia Commons",
+      "official_url": "https://commons.wikimedia.org/wiki/Commons:Reusing_content_outside_Wikimedia/en",
+      "asset_type": "File-by-file photographs, panoramas and geotagged media",
+      "owner_controller": "Individual authors/rightsholders; Wikimedia Foundation hosts metadata and files",
+      "code_license": "NOT_APPLICABLE",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "PER_ASSET_ONLY; restrict production candidates to verified CC0, CC-BY or approved public-domain records",
+      "commercial_use": "Allowed only when the individual file's license permits it; Wikimedia does not warrant every rights assertion",
+      "redistribution_rights": "Per-file license; preserve author, source, license and modification notices",
+      "derivative_work_rights": "Per-file license; do not mix share-alike assets into unrestricted partitions",
+      "embedding_index_rights": "Not separately stated; for permissive files treat as a derivative-use question and preserve provenance, while share-alike files require legal review",
+      "caching_permission": "Permitted only per admitted file's exact licence and non-copyright restrictions; retain the file-page revision and support takedown deletion",
+      "attribution_requirements": "Asset-level title, creator, canonical file page, license/version, license URL and modification statement",
+      "share_alike_risk": "Varies by file; CC-BY-SA assets must be separately partitioned or excluded",
+      "api_terms": "MediaWiki/Commons access rules and file-specific licenses apply",
+      "caching_indexing_permission": "Allowed only after per-file license and non-copyright rights review",
+      "deletion_revocation_requirements": "Snapshot the file page and source revision; monitor deletion/license disputes and cascade removal when rights fail",
+      "rate_limits": "Follow Wikimedia API etiquette and current endpoint limits; no acquisition is approved in Phase 3A",
+      "personal_data_considerations": "Free copyright status does not eliminate personality, privacy, trademark or cultural-property restrictions",
+      "current_decision": "GO_WITH_ATTRIBUTION",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Which exact Türkiye files pass license, provenance, privacy, resolution and geographic-quality gates?",
+      "required_next_action": "After approval, create a file-page allowlist and provenance receipt per asset; reject missing, disputed, NC, ND and incompatible share-alike records",
+      "primary_evidence_urls": [
+        "https://commons.wikimedia.org/wiki/Commons:Reusing_content_outside_Wikimedia/en",
+        "https://commons.wikimedia.org/wiki/Commons:Licensing"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "openstreetmap_metadata",
+      "source_name": "OpenStreetMap metadata",
+      "official_url": "https://osmfoundation.org/wiki/License/Licence_and_Legal_FAQ",
+      "asset_type": "Road, place, land-use and geometry metadata; not imagery",
+      "owner_controller": "OpenStreetMap contributors; OpenStreetMap Foundation administers licensing",
+      "code_license": "NOT_APPLICABLE",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "ODbL-1.0 for the OpenStreetMap database",
+      "commercial_use": "Allowed with ODbL compliance",
+      "redistribution_rights": "Produced works require attribution; public derivative databases may require ODbL licensing and access to the derivative database",
+      "derivative_work_rights": "Allowed subject to ODbL database obligations",
+      "embedding_index_rights": "Metadata-derived database status must be classified; do not merge OSM database content invisibly into a proprietary corpus manifest",
+      "caching_permission": "A versioned extract may be cached under ODbL compliance; public OSM tiles and shared API infrastructure are not bulk cache sources",
+      "attribution_requirements": "Credit OpenStreetMap and contributors and link the copyright/license information according to OSMF attribution guidance",
+      "share_alike_risk": "Material at the database layer; source-partition and document collective-versus-derivative database analysis",
+      "api_terms": "Do not use public OSM tile servers as a bulk or commercial imagery source; use approved extracts/services under their own terms",
+      "caching_indexing_permission": "Database use allowed under ODbL; implementation must preserve attribution and any applicable share-alike obligations",
+      "deletion_revocation_requirements": "Record extract date/version and handle redactions or contributor-data removals in later corpus versions",
+      "rate_limits": "Service specific; public tile and API infrastructure is not the planned bulk source",
+      "personal_data_considerations": "Avoid contributor-history data and sensitive tags unless necessary; precise location metadata can create privacy or safety risk",
+      "current_decision": "GO_WITH_ATTRIBUTION",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Will the planned metadata layer be a collective database, derivative database or produced work under ODbL?",
+      "required_next_action": "Use a versioned Türkiye extract, keep it as a separate licensed layer, publish required attribution and obtain counsel classification before external database distribution",
+      "primary_evidence_urls": [
+        "https://osmfoundation.org/wiki/License/Licence_and_Legal_FAQ",
+        "https://osmfoundation.org/wiki/Licence/Attribution_Guidelines"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "geonames_metadata",
+      "source_name": "GeoNames metadata",
+      "official_url": "https://www.geonames.org/export/",
+      "asset_type": "Place names, administrative hierarchy and coordinates; not imagery",
+      "owner_controller": "GeoNames and contributing data sources identified in its documentation",
+      "code_license": "NOT_APPLICABLE",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "CC-BY-4.0 for the downloadable database as stated by GeoNames",
+      "commercial_use": "Allowed with attribution",
+      "redistribution_rights": "Allowed under CC-BY-4.0 with attribution and source notices",
+      "derivative_work_rights": "Allowed under CC-BY-4.0",
+      "embedding_index_rights": "Metadata use is allowed with attribution; do not represent it as an imagery-rights source",
+      "caching_permission": "A dated country dump may be cached under CC-BY-4.0 with attribution; prefer it over live web-service caching",
+      "attribution_requirements": "Credit GeoNames and preserve any upstream notices documented for selected fields",
+      "share_alike_risk": "Low for CC-BY itself; upstream source notices still require review",
+      "api_terms": "Free web service documentation states account and request limits; downloadable dumps are preferred for approved bulk work",
+      "caching_indexing_permission": "Versioned dump use is permitted under CC-BY-4.0 with attribution",
+      "deletion_revocation_requirements": "Record dump date and replace corrected/deleted records in later immutable corpus versions",
+      "rate_limits": "Free web services document 10,000 credits per day per application and 1,000 credits per hour; a dated country dump is preferred",
+      "personal_data_considerations": "Primarily place metadata; exclude contributor/account data and sensitive locations not required for recall evaluation",
+      "current_decision": "GO_WITH_ATTRIBUTION",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Which upstream-attribution notices apply to the exact Türkiye fields selected?",
+      "required_next_action": "After approval, use a dated country dump rather than live API calls, retain its readme/license and generate report-level attribution",
+      "primary_evidence_urls": [
+        "https://www.geonames.org/export/",
+        "https://download.geonames.org/export/dump/readme.txt"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "copernicus_sentinel",
+      "source_name": "Copernicus Sentinel data",
+      "official_url": "https://sentinels.copernicus.eu/documents/247904/690755/Sentinel_Data_Legal_Notice",
+      "asset_type": "Satellite imagery and derived patches from Sentinel missions",
+      "owner_controller": "European Union/Copernicus programme; distribution services have separate portal terms",
+      "code_license": "NOT_APPLICABLE",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "COPERNICUS_SENTINEL_DATA_LEGAL_NOTICE",
+      "commercial_use": "Sentinel data is made available on a free, full and open basis for lawful reproduction, distribution, adaptation and combination, subject to the notice",
+      "redistribution_rights": "Allowed for Sentinel data under the legal notice; contributing-mission and portal content may have different rights",
+      "derivative_work_rights": "Allowed for Sentinel data, including modification and combination",
+      "embedding_index_rights": "Reasonably supported for licensed Sentinel data as an adaptation, with required source notice; do not extend this conclusion to non-Sentinel portal content",
+      "caching_permission": "Sentinel data may be cached under the Sentinel legal notice; this does not apply to portal content, contributing missions or complementary datasets",
+      "attribution_requirements": "Use the applicable Copernicus/Sentinel source acknowledgment and identify modified data and acquisition year",
+      "share_alike_risk": "No share-alike requirement identified in the Sentinel legal notice",
+      "api_terms": "Copernicus Data Space Ecosystem service terms govern account and service access separately from Sentinel-data rights",
+      "caching_indexing_permission": "Permitted for Sentinel data under the data legal notice, subject to service-access controls and provenance",
+      "deletion_revocation_requirements": "Retain product identifiers, processing lineage and notice snapshot; honor lawful restrictions or corrected products in later versions",
+      "rate_limits": "Service and account quota specific; no calls or account creation are approved in Phase 3A",
+      "personal_data_considerations": "Satellite resolution reduces direct identification risk but location inference and sensitive-site concerns remain",
+      "current_decision": "GO_WITH_ATTRIBUTION",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Which Sentinel product, resolution, cloud threshold and service channel best satisfy the approved pilot without importing third-party mission restrictions?",
+      "required_next_action": "After approval, restrict acquisition to named Sentinel products, snapshot product metadata/legal notice and exclude portal screenshots and separately licensed contributing missions",
+      "primary_evidence_urls": [
+        "https://sentinels.copernicus.eu/documents/247904/690755/Sentinel_Data_Legal_Notice",
+        "https://dataspace.copernicus.eu/terms-and-conditions"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "openaerialmap",
+      "source_name": "OpenAerialMap / Open Imagery Network",
+      "official_url": "https://openaerialmap.org/legal/",
+      "asset_type": "Contributor-supplied aerial imagery and scene metadata",
+      "owner_controller": "Original imagery rightsholders; OpenAerialMap/Open Imagery Network hosts catalog and access services",
+      "code_license": "AGPL-3.0 for the official OpenAerialMap repository; this does not license imagery",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "CC-BY-4.0 as stated by the official legal page, subject to per-scene provenance",
+      "commercial_use": "Allowed under CC-BY-4.0 if the uploader had authority and attribution is preserved",
+      "redistribution_rights": "Allowed under CC-BY-4.0 with attribution",
+      "derivative_work_rights": "Allowed under CC-BY-4.0 with attribution and modification notice",
+      "embedding_index_rights": "Supported as derivative use for verified CC-BY scenes, but asset-level provenance and removal linkage remain mandatory",
+      "caching_permission": "Permitted for verified CC-BY-4.0 scenes with attribution and provenance; planned bulk API/service caching still requires operator confirmation",
+      "attribution_requirements": "Credit Open Imagery Network contributors and the original source/rightsholder recorded for each scene",
+      "share_alike_risk": "No CC-BY share-alike; uploader chain-of-title risk remains",
+      "api_terms": "Official legal guidance asks users to contact the service for use beyond reasonable API/imagery access",
+      "caching_indexing_permission": "Allowed only for verified scenes after planned bulk volume is cleared with the operator",
+      "deletion_revocation_requirements": "Preserve scene/source IDs, monitor takedowns and cascade invalid or withdrawn scenes",
+      "rate_limits": "No numeric bulk limit found in reviewed legal guidance; contact the service before acquisition",
+      "personal_data_considerations": "Review resolution, homes, people/vehicles and sensitive-site content; license alone does not clear privacy",
+      "current_decision": "GO_WITH_ATTRIBUTION",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Which Türkiye scenes exist, did each uploader have rights, and what bulk volume will the operator authorize?",
+      "required_next_action": "After approval, request a scene-level inventory and operator confirmation, then accept only CC-BY-4.0 scenes with provenance and privacy QA",
+      "primary_evidence_urls": [
+        "https://openaerialmap.org/legal/",
+        "https://github.com/hotosm/openaerialmap"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "commercial_aerial_satellite",
+      "source_name": "Commercial aerial/satellite providers (including Planet, Airbus and BlackSky)",
+      "official_url": "https://www.planet.com/licensing-information/",
+      "asset_type": "Commercial satellite/aerial imagery, tiles, APIs and derived products",
+      "owner_controller": "Selected provider and upstream sensor/product owners under an order form and EULA",
+      "code_license": "NOT_APPLICABLE",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "CONTRACT_AND_PRODUCT_SPECIFIC",
+      "commercial_use": "Only as expressly granted by the order, customer category and product license",
+      "redistribution_rights": "Usually limited and product/order specific; no assumption of raw or derived-product redistribution",
+      "derivative_work_rights": "Must be negotiated for normalized patches, mosaics, descriptors, indexes and externally shared outputs",
+      "embedding_index_rights": "Not inferred from visualization or ordinary internal-use rights; must be explicit",
+      "caching_permission": "Contract and order specific; raw, derivative, cloud, backup and post-termination caching must be expressly granted",
+      "attribution_requirements": "Provider/product/order specific",
+      "share_alike_risk": "Generally contractual rather than open-license share-alike; downstream/output restrictions may be broader",
+      "api_terms": "Provider platform/API terms and the executed order govern access, caching, local storage and automation",
+      "caching_indexing_permission": "Not granted until a written license expressly allows persistent storage, cloud processing, backups and descriptors",
+      "deletion_revocation_requirements": "Contract must define termination, revocation, retention, backup deletion, derived-output survival and audit evidence",
+      "rate_limits": "Plan/product/account specific",
+      "personal_data_considerations": "Assess resolution, sensitive sites, local remote-sensing rules and inference risks",
+      "current_decision": "WRITTEN_PERMISSION_REQUIRED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Which provider will contractually authorize persistent commercial descriptors/indexes and deletion-capable cloud processing within budget?",
+      "required_next_action": "Request written quotes and EULAs covering AtlasLens commercial use, ML/index rights, cloud subprocessors, backups, output rights and revocation before purchase",
+      "primary_evidence_urls": [
+        "https://www.planet.com/licensing-information/",
+        "https://www.planet.com/terms-of-use/",
+        "https://space-solutions.airbus.com/legal/terms-and-conditions/",
+        "https://blacksky.com/product-services-usage-rights/"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "google_street_view",
+      "source_name": "Google Street View imagery",
+      "official_url": "https://cloud.google.com/maps-platform/terms",
+      "asset_type": "Street-level panoramas, static images and Street View metadata",
+      "owner_controller": "Google and third-party imagery rightsholders",
+      "code_license": "NOT_APPLICABLE",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "PROPRIETARY_GOOGLE_MAPS_PLATFORM_TERMS",
+      "commercial_use": "Limited to permitted Google Maps Platform use; not a grant for AtlasLens corpus acquisition or model/index construction",
+      "redistribution_rights": "Restricted by Google terms and attribution rules",
+      "derivative_work_rights": "Google terms prohibit creating content from Google Maps content and expressly give a Street View-derived city tree-location index as a prohibited example",
+      "embedding_index_rights": "Prohibited for the proposed persistent corpus/index use",
+      "caching_permission": "BLOCKED except any narrow service-specific cache expressly allowed by Google, none of which authorizes this persistent corpus",
+      "attribution_requirements": "Google and third-party attributions are required for permitted display use but do not cure prohibited acquisition/indexing",
+      "share_alike_risk": "Not applicable; proprietary-use restrictions control",
+      "api_terms": "Google Maps Platform terms section 3.2.3 prohibits prefetching, indexing, storing, resharing, rehosting and bulk Street View download; caching is barred except narrow service-specific allowances, and Google content cannot train, test, validate or fine-tune ML/AI",
+      "caching_indexing_permission": "BLOCKED for persistent AtlasLens reference images, descriptors or index trees",
+      "deletion_revocation_requirements": "No AtlasLens acquisition is permitted; any accidentally captured Google imagery or derived descriptor must be quarantined and deleted",
+      "rate_limits": "Not applicable because this use is blocked",
+      "personal_data_considerations": "Google's blurring does not create a transferable right to repurpose imagery or eliminate all privacy risk",
+      "current_decision": "BLOCKED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "None for Phase 3A production indexing; a materially different licensed Google product would require a new review",
+      "required_next_action": "Keep Google Street View out of manifests, acquisition tools, descriptor stores and benchmarks; use only for separately permitted human display if ever reviewed",
+      "primary_evidence_urls": [
+        "https://cloud.google.com/maps-platform/terms",
+        "https://about.google/intl/en-GB_ALL/brand-resource-center/products-and-services/geo-guidelines/",
+        "https://maps.google.com/help/terms_maps/"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "google_maps_earth_screenshots",
+      "source_name": "Google Maps, Google Earth and Earth Studio screenshots",
+      "official_url": "https://about.google/intl/en-GB_ALL/brand-resource-center/products-and-services/geo-guidelines/",
+      "asset_type": "Map, satellite, aerial, 3D and screenshot exports",
+      "owner_controller": "Google and listed third-party data providers",
+      "code_license": "NOT_APPLICABLE",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "PROPRIETARY_GOOGLE_TERMS_AND_ATTRIBUTION_RULES",
+      "commercial_use": "Any limited publication/display permission is not permission to build an imagery corpus or commercial index",
+      "redistribution_rights": "Restricted and context specific; attribution must remain visible for permitted uses",
+      "derivative_work_rights": "No production corpus, training set, benchmark asset or descriptor derivation is authorized",
+      "embedding_index_rights": "Prohibited for the proposed use",
+      "caching_permission": "BLOCKED for AtlasLens screenshots, exports, normalized files and offline corpus copies",
+      "attribution_requirements": "Required for permitted display, but attribution does not override caching, indexing or derivative restrictions",
+      "share_alike_risk": "Not applicable; proprietary restrictions control",
+      "api_terms": "Google Maps Platform and Maps/Earth additional terms apply",
+      "caching_indexing_permission": "BLOCKED for acquisition, normalization, embeddings and persistent index storage",
+      "deletion_revocation_requirements": "Quarantine and remove any screenshot and every downstream derivative if found in corpus paths",
+      "rate_limits": "Not applicable because acquisition/indexing is blocked",
+      "personal_data_considerations": "A screenshot may also expose user/session data, annotations or sensitive locations",
+      "current_decision": "BLOCKED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "None for Phase 3A corpus use",
+      "required_next_action": "Add source-name/domain rejection rules and do not accept operator-provided Google screenshots as references or evaluation queries",
+      "primary_evidence_urls": [
+        "https://about.google/intl/en-GB_ALL/brand-resource-center/products-and-services/geo-guidelines/",
+        "https://cloud.google.com/maps-platform/terms",
+        "https://www.google.com/help/terms_maps-earth/"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "megaloc_code_model",
+      "source_name": "MegaLoc code and pretrained model",
+      "official_url": "https://github.com/gmberton/MegaLoc",
+      "asset_type": "Geolocalization repository code, released descriptor-model weights, named training-corpus lineage and separately governed input imagery",
+      "owner_controller": "MegaLoc authors for code/model releases; training-data rightsholders remain separate",
+      "code_license": "MIT in the official repository",
+      "weight_license": "MIT as declared by the author-maintained Hugging Face model card",
+      "component_decisions": {
+        "repository_code": {
+          "license_decision": "GO_WITH_ATTRIBUTION",
+          "deployment_decision": "GO_WITH_ATTRIBUTION"
+        },
+        "released_weights": {
+          "license_decision": "GO_WITH_ATTRIBUTION",
+          "commercial_deployment_decision": "LEGAL_REVIEW_REQUIRED"
+        },
+        "training_corpora": {
+          "decision": "LEGAL_REVIEW_REQUIRED",
+          "named_sources": [
+            "GSV-Cities",
+            "Mapillary Street-Level Sequences (MSLS)",
+            "MegaScenes",
+            "ScanNet",
+            "San Francisco eXtra Large (SF-XL)"
+          ]
+        },
+        "future_atlaslens_input_imagery": {
+          "decision": "UNKNOWN"
+        }
+      },
+      "imagery_data_license": "SOURCE_SPECIFIC_NOT_GRANTED_BY_CODE_OR_WEIGHT_LICENSE; paper names GSV-Cities, MSLS, MegaScenes, ScanNet and SF-XL",
+      "commercial_use": "MIT code/model terms appear permissive, but commercial deployment remains held for training-lineage and model-artifact legal review",
+      "redistribution_rights": "Code/model redistribution subject to MIT notices; no training-image redistribution right follows",
+      "derivative_work_rights": "Code/model modification subject to MIT; corpus derivatives require their own rights",
+      "embedding_index_rights": "The model license does not license input imagery; descriptors may be generated only from acquisition-ready source assets",
+      "caching_permission": "The pinned model artifact may be cached under its MIT declaration; training images and AtlasLens inputs follow separate source rights",
+      "attribution_requirements": "Retain MIT copyright/license notices and project/model citations; preserve corpus-source attribution independently",
+      "share_alike_risk": "No share-alike in MIT, but training-domain/source-license risk is not resolved by MIT",
+      "api_terms": "Hugging Face access/hosting terms are separate from the model card license",
+      "caching_indexing_permission": "Model caching follows artifact terms; corpus/index permission is source specific",
+      "deletion_revocation_requirements": "Model artifact and every corpus-derived descriptor must have separate lineage; source revocation deletes affected descriptors without implying model deletion unless model rights fail",
+      "rate_limits": "Hosting-service specific; artifact already exists locally and no download is approved",
+      "personal_data_considerations": "Model use can amplify location/privacy risks; source blurring and access controls remain required",
+      "current_decision": "LEGAL_REVIEW_REQUIRED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Does the exact pinned artifact have a complete, commercially defensible training-data and release lineage?",
+      "required_next_action": "Record exact artifact hash/model-card snapshot and obtain counsel sign-off; never treat MegaLoc's license as corpus clearance",
+      "primary_evidence_urls": [
+        "https://github.com/gmberton/MegaLoc",
+        "https://github.com/gmberton/MegaLoc/blob/main/LICENSE",
+        "https://huggingface.co/gberton/MegaLoc",
+        "https://arxiv.org/abs/2502.17237"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "sample4geo_code",
+      "source_name": "Sample4Geo code",
+      "official_url": "https://github.com/Skyy93/Sample4Geo",
+      "asset_type": "Cross-view geolocalization implementation",
+      "owner_controller": "Sample4Geo repository authors",
+      "code_license": "NONE_FOUND",
+      "weight_license": "NOT_APPLICABLE_TO_THIS_RECORD",
+      "imagery_data_license": "NOT_APPLICABLE_TO_THIS_RECORD",
+      "commercial_use": "Not granted; public source visibility is not a commercial software license",
+      "redistribution_rights": "Not granted",
+      "derivative_work_rights": "Not granted",
+      "embedding_index_rights": "Not applicable to unlicensed code; no use in production tooling",
+      "caching_permission": "No licensed production copy/vendor cache is permitted; ordinary repository viewing does not create reuse rights",
+      "attribution_requirements": "Citation requested by the README does not substitute for a license",
+      "share_alike_risk": "Unknown because no explicit license was found",
+      "api_terms": "NOT_APPLICABLE",
+      "caching_indexing_permission": "Repository may be viewed/forked only as allowed by platform terms; production copying or integration is blocked",
+      "deletion_revocation_requirements": "Do not vendor or execute the code; remove any accidental copy",
+      "rate_limits": "NOT_APPLICABLE",
+      "personal_data_considerations": "NOT_APPLICABLE_TO_CODE",
+      "current_decision": "BLOCKED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Will the authors publish an explicit code license covering commercial use and modification?",
+      "required_next_action": "Obtain a written license from the authors or use an independently licensed alternative; do not copy code",
+      "primary_evidence_urls": [
+        "https://github.com/Skyy93/Sample4Geo",
+        "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository"
+      ],
+      "license_absence_evidence": {
+        "applies_to": [
+          "code"
+        ],
+        "checked_urls": [
+          "https://github.com/Skyy93/Sample4Geo",
+          "https://github.com/Skyy93/Sample4Geo/tree/main"
+        ],
+        "finding": "No explicit LICENSE file or repository license declaration was found in the author-maintained repository on the evidence date; GitHub documents that default copyright applies without a license."
+      }
+    },
+    {
+      "source_id": "sample4geo_pretrained_weights",
+      "source_name": "Sample4Geo pretrained weights",
+      "official_url": "https://github.com/Skyy93/Sample4Geo",
+      "asset_type": "Pretrained cross-view model weights linked by the official repository",
+      "owner_controller": "Sample4Geo authors and underlying training-data rightsholders",
+      "code_license": "NOT_APPLICABLE_TO_THIS_RECORD",
+      "weight_license": "NONE_FOUND",
+      "imagery_data_license": "NONE_FOUND",
+      "commercial_use": "Not granted",
+      "redistribution_rights": "Not granted",
+      "derivative_work_rights": "Not granted for weights or outputs",
+      "embedding_index_rights": "Not granted",
+      "caching_permission": "BLOCKED; do not download or retain an unlicensed weight artifact",
+      "attribution_requirements": "A paper citation does not supply weight or training-data rights",
+      "share_alike_risk": "Unknown; upstream dataset/service terms may impose incompatible restrictions",
+      "api_terms": "Third-party file-host terms do not create an intellectual-property license",
+      "caching_indexing_permission": "Blocked",
+      "deletion_revocation_requirements": "Do not download; quarantine and remove any unverified artifact",
+      "rate_limits": "NOT_APPLICABLE",
+      "personal_data_considerations": "Training imagery provenance and personal-data processing are undocumented in an applicable weight license",
+      "current_decision": "BLOCKED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Will the authors provide a weight license and full training-source lineage that authorizes commercial deployment?",
+      "required_next_action": "Obtain written weight permission and dataset-by-dataset lineage review; otherwise exclude",
+      "primary_evidence_urls": [
+        "https://github.com/Skyy93/Sample4Geo",
+        "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository"
+      ],
+      "license_absence_evidence": {
+        "applies_to": [
+          "weights",
+          "imagery_data"
+        ],
+        "checked_urls": [
+          "https://github.com/Skyy93/Sample4Geo",
+          "https://github.com/Skyy93/Sample4Geo/blob/main/README.md"
+        ],
+        "finding": "The official repository links pretrained weights but provides no explicit weight license and no license grant for the underlying training imagery."
+      }
+    },
+    {
+      "source_id": "cvusa",
+      "source_name": "CVUSA",
+      "official_url": "https://github.com/viibridges/crossnet",
+      "asset_type": "Academic cross-view street/aerial benchmark imagery",
+      "owner_controller": "Dataset/repository authors and underlying imagery providers",
+      "code_license": "NONE_FOUND",
+      "weight_license": "NONE_FOUND",
+      "imagery_data_license": "NONE_FOUND",
+      "commercial_use": "Not granted",
+      "redistribution_rights": "Not granted",
+      "derivative_work_rights": "Not granted",
+      "embedding_index_rights": "Not granted",
+      "caching_permission": "BLOCKED; no code, weight or imagery cache is approved",
+      "attribution_requirements": "Academic citation does not replace a license",
+      "share_alike_risk": "Unknown because source imagery licenses and dataset terms are not explicit",
+      "api_terms": "Underlying imagery/service terms may apply but are not a commercial dataset grant",
+      "caching_indexing_permission": "Blocked",
+      "deletion_revocation_requirements": "Do not download or admit to AtlasLens storage; remove accidental copies and descriptors",
+      "rate_limits": "NOT_APPLICABLE",
+      "personal_data_considerations": "Street-view content may contain people, vehicles and precise location information",
+      "current_decision": "BLOCKED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Can the authors/rightsholders supply explicit dataset, imagery and weight licenses?",
+      "required_next_action": "Obtain written licenses and underlying provider authorization; otherwise exclude from production and benchmark acquisition",
+      "primary_evidence_urls": [
+        "https://github.com/viibridges/crossnet",
+        "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository"
+      ],
+      "license_absence_evidence": {
+        "applies_to": [
+          "code",
+          "weights",
+          "imagery_data"
+        ],
+        "checked_urls": [
+          "https://github.com/viibridges/crossnet",
+          "https://github.com/viibridges/crossnet/tree/master"
+        ],
+        "finding": "No explicit license grant for code, model weights or benchmark imagery was found in the author-maintained repository reviewed on the evidence date."
+      }
+    },
+    {
+      "source_id": "cvact",
+      "source_name": "CVACT",
+      "official_url": "https://github.com/Liumouliu/OriCNN",
+      "asset_type": "Academic cross-view street/aerial benchmark imagery and reference implementation",
+      "owner_controller": "Dataset/repository authors and underlying imagery providers",
+      "code_license": "MIT for repository software",
+      "weight_license": "NONE_FOUND",
+      "imagery_data_license": "AUTHOR_README_RESEARCH_ONLY_NO_REDISTRIBUTION; NONE_FOUND for an underlying-provider commercial grant",
+      "commercial_use": "MIT applies to code only; the author README limits the ACT dataset to research and does not grant commercial imagery/weight use",
+      "redistribution_rights": "Code only under MIT; the author README expressly says not to distribute the dataset, and no weight redistribution grant was found",
+      "derivative_work_rights": "Code only under MIT; no commercial imagery/weight derivative grant was found",
+      "embedding_index_rights": "Not granted for benchmark imagery",
+      "caching_permission": "No production cache; even an isolated research copy would require eligibility, author-term and underlying-provider review",
+      "attribution_requirements": "Retain MIT notice for code and cite the paper for any professionally approved research use; neither clears imagery/providers",
+      "share_alike_risk": "Not the controlling risk; author research/no-redistribution terms, missing weight rights and proprietary source lineage dominate",
+      "api_terms": "Underlying Google imagery/service terms apply independently and do not become research rights through the author README",
+      "caching_indexing_permission": "Blocked for production dataset imagery and weights; isolated research caching is not approved without professional review",
+      "deletion_revocation_requirements": "Do not acquire for Phase 3A; remove accidental assets, weights and derivatives",
+      "rate_limits": "NOT_APPLICABLE",
+      "personal_data_considerations": "Street imagery may contain personal and precise-location data",
+      "current_decision": "BLOCKED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Is AtlasLens eligible for the author-stated research-only use, and can the authors/source providers grant commercial dataset and weight rights?",
+      "required_next_action": "Treat MIT as code-only and exclude imagery/weights; any isolated research proposal needs counsel and source-provider review, while production requires written rights",
+      "primary_evidence_urls": [
+        "https://github.com/Liumouliu/OriCNN",
+        "https://github.com/Liumouliu/OriCNN/blob/master/LICENSE",
+        "https://cloud.google.com/maps-platform/terms"
+      ],
+      "license_absence_evidence": {
+        "applies_to": [
+          "weights",
+          "imagery_data"
+        ],
+        "checked_urls": [
+          "https://github.com/Liumouliu/OriCNN",
+          "https://github.com/Liumouliu/OriCNN/blob/master/LICENSE"
+        ],
+        "finding": "The repository's MIT license is software-only. The README limits ACT to research and prohibits distribution, but no underlying-provider commercial imagery grant or separate pretrained-weight license was found."
+      }
+    },
+    {
+      "source_id": "vigor",
+      "source_name": "VIGOR",
+      "official_url": "https://github.com/Jeff-Zilence/VIGOR",
+      "asset_type": "Academic cross-view panorama/aerial benchmark and code",
+      "owner_controller": "VIGOR authors for code/compilation; Google and other rightsholders for source imagery",
+      "code_license": "MIT for repository software",
+      "weight_license": "NONE_FOUND",
+      "imagery_data_license": "NONE_FOUND; paper states Google Maps Static API and Google Street View Static API lineage",
+      "commercial_use": "Code may be used under MIT; dataset imagery and weights are not cleared",
+      "redistribution_rights": "Code only under MIT; imagery redistribution not granted",
+      "derivative_work_rights": "Code only under MIT; imagery-derived embeddings/indexes are not authorized",
+      "embedding_index_rights": "Blocked because no dataset license exists and Google source terms prohibit the proposed index use",
+      "caching_permission": "BLOCKED for dataset imagery and weights; MIT applies only to repository code",
+      "attribution_requirements": "MIT notice and paper citation do not cure source-imagery restrictions",
+      "share_alike_risk": "Not applicable; missing license and proprietary-source restrictions dominate",
+      "api_terms": "Google Maps Platform terms apply to the source lineage",
+      "caching_indexing_permission": "Blocked",
+      "deletion_revocation_requirements": "Do not download; remove any dataset assets or descriptors from AtlasLens paths",
+      "rate_limits": "NOT_APPLICABLE",
+      "personal_data_considerations": "Panoramas may contain people, vehicles and precise locations",
+      "current_decision": "BLOCKED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "No production path exists without a new independently licensed image corpus",
+      "required_next_action": "Exclude VIGOR imagery and weights; MIT code may be evaluated independently only if technically needed later",
+      "primary_evidence_urls": [
+        "https://github.com/Jeff-Zilence/VIGOR",
+        "https://raw.githubusercontent.com/Jeff-Zilence/VIGOR/master/LICENSE",
+        "https://openaccess.thecvf.com/content/CVPR2021/papers/Zhu_VIGOR_Cross-View_Image_Geo-Localization_Beyond_One-to-One_Retrieval_CVPR_2021_paper.pdf",
+        "https://cloud.google.com/maps-platform/terms"
+      ],
+      "license_absence_evidence": {
+        "applies_to": [
+          "weights",
+          "imagery_data"
+        ],
+        "checked_urls": [
+          "https://github.com/Jeff-Zilence/VIGOR",
+          "https://github.com/Jeff-Zilence/VIGOR/blob/master/README.md"
+        ],
+        "finding": "The official repository provides an MIT code license but no separate dataset or weight license; the paper documents Google-sourced imagery."
+      }
+    },
+    {
+      "source_id": "university_1652",
+      "source_name": "University-1652",
+      "official_url": "https://huggingface.co/datasets/layumi/university-1652/blob/main/README.md",
+      "asset_type": "Academic drone/satellite/ground cross-view benchmark imagery",
+      "owner_controller": "Dataset authors and underlying Google/source rightsholders",
+      "code_license": "MIT in the author-maintained baseline repository; code only",
+      "weight_license": "NONE_FOUND_SEPARATE_FROM_REPOSITORY_CODE_LICENSE",
+      "component_decisions": {
+        "baseline_code": "GO_WITH_ATTRIBUTION",
+        "released_weights": "LEGAL_REVIEW_REQUIRED",
+        "dataset_imagery": "RESEARCH_ONLY"
+      },
+      "imagery_data_license": "FAIR_NONCOMMERCIAL_RESEARCH_LICENSE as stated by the author-maintained dataset card",
+      "commercial_use": "Explicitly prohibited by the dataset card",
+      "redistribution_rights": "Restricted by the dataset terms and underlying source rights",
+      "derivative_work_rights": "Research-only; commercial integration and extraction are prohibited",
+      "embedding_index_rights": "Research-only in a physically and logically isolated benchmark if all terms are accepted; never a production reference index",
+      "caching_permission": "Only a gated isolated research copy after professional approval; no production cache, no redistribution, and delete on takedown or revocation",
+      "attribution_requirements": "Dataset/paper citation and underlying source notices as required",
+      "share_alike_risk": "Noncommercial and source-right restrictions dominate",
+      "api_terms": "Underlying Google imagery terms remain relevant",
+      "caching_indexing_permission": "Only isolated noncommercial research use under the dataset terms; no AtlasLens production index",
+      "deletion_revocation_requirements": "Keep outside production storage; delete research copy and derivatives at license termination or rights challenge",
+      "rate_limits": "NOT_APPLICABLE",
+      "personal_data_considerations": "Ground imagery may include people/vehicles and precise locations",
+      "current_decision": "RESEARCH_ONLY",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Can AtlasLens's company context satisfy the license's noncommercial academic-use restriction at all?",
+      "required_next_action": "Obtain counsel confirmation before even isolated research use; otherwise do not download",
+      "primary_evidence_urls": [
+        "https://huggingface.co/datasets/layumi/university-1652/blob/main/README.md",
+        "https://github.com/layumi/University1652-Baseline",
+        "https://github.com/layumi/University1652-Baseline/blob/master/LICENSE",
+        "https://cloud.google.com/maps-platform/terms"
+      ],
+      "license_absence_evidence": {
+        "applies_to": [
+          "weights"
+        ],
+        "checked_urls": [
+          "https://huggingface.co/datasets/layumi/university-1652/blob/main/README.md",
+          "https://github.com/layumi/University1652-Baseline",
+          "https://github.com/layumi/University1652-Baseline/blob/master/LICENSE"
+        ],
+        "finding": "The author baseline repository is MIT-licensed as code and links trained models, but no separate weight-artifact license was found; dataset terms independently remain noncommercial research-only."
+      }
+    },
+    {
+      "source_id": "osv5m",
+      "source_name": "OSV-5M",
+      "official_url": "https://huggingface.co/datasets/osv5m/osv5m",
+      "asset_type": "Large street-level geolocation training dataset and code",
+      "owner_controller": "OSV-5M authors for compilation/code; Mapillary contributors/Meta for source imagery/service",
+      "code_license": "MIT in the official repository",
+      "weight_license": "NOT_APPLICABLE_TO_DATASET_RECORD",
+      "imagery_data_license": "CONFLICTING_PRIMARY_DECLARATIONS: current dataset card states CC-BY-SA-4.0; paper supplement states inherited CC-BY-SA-2.0",
+      "commercial_use": "Potentially allowed by CC-BY-SA, but blocked from acquisition-ready status until license-version, API, privacy and reciprocal obligations are resolved",
+      "redistribution_rights": "Share-alike and contributor attribution apply; exact license version is unresolved",
+      "derivative_work_rights": "Share-alike conditions apply; descriptor/index classification is unresolved",
+      "embedding_index_rights": "Not expressly granted as a closed commercial index",
+      "caching_permission": "Not established for AtlasLens commercial persistence because licence-version, Mapillary-service and removal obligations remain unresolved",
+      "attribution_requirements": "Preserve image username/contributor and source link plus license/version; dataset-level citation alone is insufficient",
+      "share_alike_risk": "High",
+      "api_terms": "The supplement states Mapillary API lineage; Mapillary service/API terms apply independently",
+      "caching_indexing_permission": "Not established for persistent commercial AtlasLens use",
+      "deletion_revocation_requirements": "Implement source-image flag/removal polling and cascade deletion across raw, derivative, descriptor and index layers",
+      "rate_limits": "Original Mapillary acquisition limits are not a reusable authorization for AtlasLens",
+      "personal_data_considerations": "The official datasheet identifies privacy/surveillance/OSINT risks and contributor attribution requirements",
+      "current_decision": "LEGAL_REVIEW_REQUIRED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Which CC-BY-SA version governs each image, do Mapillary terms permit this reuse, and can AtlasLens comply for descriptors/indexes?",
+      "required_next_action": "Do not download; obtain author/Mapillary clarification, reconcile license versions and complete counsel/privacy review",
+      "primary_evidence_urls": [
+        "https://huggingface.co/datasets/osv5m/osv5m",
+        "https://github.com/gastruc/osv5m",
+        "https://openaccess.thecvf.com/content/CVPR2024/supplemental/Astruc_OpenStreetView-5M_The_Many_CVPR_2024_supplemental.pdf"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "plonk_models_lineage",
+      "source_name": "PLONK code, pretrained weights and training-domain lineage",
+      "official_url": "https://github.com/nicolas-dufour/plonk",
+      "asset_type": "Geolocation code and pretrained OSV-5M, YFCC-100M and iNaturalist variants",
+      "owner_controller": "PLONK authors for code/model release; source-media rightsholders and dataset controllers remain separate",
+      "code_license": "MIT in the official repository",
+      "weight_license": "MIT on the author-maintained Hugging Face model cards",
+      "imagery_data_license": "VARIES_BY_TRAINING_DOMAIN_AND_ASSET; not granted by MIT model cards",
+      "commercial_use": "Code/weights appear MIT-licensed, but production use requires variant-specific training-lineage review",
+      "redistribution_rights": "Code/weights under MIT notices; no source-image redistribution right follows",
+      "derivative_work_rights": "Code/weights under MIT; input-corpus and source-media terms remain independent",
+      "embedding_index_rights": "A PLONK model license does not authorize descriptors from unlicensed input imagery",
+      "caching_permission": "A pinned MIT-labelled model artifact may be cached; every training corpus and new input image follows independent rights",
+      "attribution_requirements": "Retain MIT notices and model/paper citation; preserve all corpus-source attribution separately",
+      "share_alike_risk": "OSV-5M variant inherits material CC-BY-SA lineage risk; YFCC and iNaturalist require asset/dataset-specific analysis",
+      "api_terms": "Hugging Face hosting terms and underlying dataset/service terms apply separately",
+      "caching_indexing_permission": "Model caching may follow MIT, but corpus and persistent descriptor-index rights remain source specific",
+      "deletion_revocation_requirements": "Maintain model-variant hash and training lineage; remove source-derived assets/descriptors independently when a source right fails",
+      "rate_limits": "Hosting-service specific; existing local readiness does not authorize downloads",
+      "personal_data_considerations": "OSV/YFCC imagery may contain people, plates, homes and precise locations; iNaturalist can expose sensitive species locations",
+      "current_decision": "LEGAL_REVIEW_REQUIRED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Which exact local PLONK variant/hash is in scope, and is its training lineage commercially defensible?",
+      "required_next_action": "Inventory exact model hashes and review OSV-5M, YFCC-100M and iNaturalist lineage separately before production use",
+      "primary_evidence_urls": [
+        "https://github.com/nicolas-dufour/plonk",
+        "https://huggingface.co/nicolas-dufour/PLONK_OSV_5M",
+        "https://huggingface.co/nicolas-dufour/PLONK_YFCC",
+        "https://huggingface.co/nicolas-dufour/PLONK_iNaturalist"
+      ],
+      "license_absence_evidence": null
+    },
+    {
+      "source_id": "turkiye_hgm_orthophoto",
+      "source_name": "Türkiye Harita Genel Müdürlüğü orthophoto products",
+      "official_url": "https://www.harita.gov.tr/urun/ortofoto/98",
+      "asset_type": "Türkiye orthophotos, tile services and sample geographic products",
+      "owner_controller": "T.C. Millî Savunma Bakanlığı Harita Genel Müdürlüğü",
+      "code_license": "NOT_APPLICABLE",
+      "weight_license": "NOT_APPLICABLE",
+      "imagery_data_license": "PRODUCT_CONTRACT_SPECIFIC; sample files are restricted to stated testing/academic purposes",
+      "commercial_use": "Not established for AtlasLens descriptors/indexes without a written product license and quote",
+      "redistribution_rights": "Not granted by the public product description",
+      "derivative_work_rights": "Must be explicitly licensed for patches, normalized imagery, descriptors and indexes",
+      "embedding_index_rights": "Not stated; written permission required",
+      "caching_permission": "Not granted by public product pages; contract must cover local/cloud copies, derivatives, backups, expiry and destruction evidence",
+      "attribution_requirements": "Product/contract specific",
+      "share_alike_risk": "No open share-alike grant identified; contractual/public-sector restrictions control",
+      "api_terms": "The official tiled/WMS product page describes contract and fee-based encrypted use",
+      "caching_indexing_permission": "Not granted by the public pages",
+      "deletion_revocation_requirements": "Contract must specify expiry, archive, downstream deletion and evidence of destruction",
+      "rate_limits": "Product/service/contract specific",
+      "personal_data_considerations": "Assess resolution, sensitive installations, security restrictions and applicable public-sector geodata controls",
+      "current_decision": "WRITTEN_PERMISSION_REQUIRED",
+      "evidence_date": "2026-07-16",
+      "unresolved_question": "Will HGM license commercial ML preprocessing, cloud storage, descriptors, indexes and benchmark reporting?",
+      "required_next_action": "Request a written product/EULA response and quote after pilot approval; do not use downloadable samples as corpus data",
+      "primary_evidence_urls": [
+        "https://www.harita.gov.tr/urun/ortofoto/98",
+        "https://www.harita.gov.tr/urun/ortofoto-goruntulerin-tile-bolumlenmis-veri-uygulamalarinin-sifreli-olarak-kullanimi/21",
+        "https://www.harita.gov.tr/sayisal-cografi-urun-ornekleri/sayfa/13"
+      ],
+      "license_absence_evidence": null
+    }
+  ]
+}

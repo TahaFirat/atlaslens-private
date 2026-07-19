@@ -1,0 +1,172 @@
+{
+  "schema_version": "atlaslens-external-models-v1",
+  "reviewed_at": "2026-07-14",
+  "policy": {
+    "weights_only": true,
+    "dataset_downloads_allowed": false,
+    "request_time_downloads_allowed": false,
+    "external_checkout_root": ".local/vendor",
+    "worker_root": ".local/workers",
+    "weight_root": ".local/models/phase6b",
+    "phase6c_weight_root": ".local/models/phase6c"
+  },
+  "tooling": {
+    "huggingface_hub": "1.23.0",
+    "osv5m_torchvision": "0.28.0"
+  },
+  "models": [
+    {
+      "name": "geoclip",
+      "source_repository": "https://github.com/VicenteVivan/geo-clip",
+      "source_revision": "7a1a23b49648a5872a771cfda28490a17ab17d15",
+      "install_method": "package",
+      "package": "geoclip==1.2.0",
+      "package_sha256": "c29ae90b01cf177ffa50707686fc8d0bd104bc5ee8537b6c7480ed4e1a0a5a2d",
+      "model_id": "geoclip",
+      "model_revision": "1.2.0",
+      "license": "MIT",
+      "dataset_required_for_inference": false,
+      "execution_mode": "in_process"
+    },
+    {
+      "name": "megaloc",
+      "source_repository": "https://github.com/gmberton/MegaLoc",
+      "source_revision": "1af071c68fc3ab6c6018c5c868391763516e50f7",
+      "install_method": "isolated_worker",
+      "model_id": "gberton/MegaLoc",
+      "model_revision": "7cb9f7970d366fdf059963d04d372e503e8e9df9",
+      "weight_file": "model.safetensors",
+      "weight_size": 914577436,
+      "weight_sha256": "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8",
+      "license": "MIT",
+      "dataset_required_for_inference": false,
+      "execution_mode": "isolated_worker",
+      "python": "3.12",
+      "packages": {
+        "torch": "2.7.1",
+        "torchvision": "0.22.1",
+        "huggingface_hub": "0.33.4",
+        "safetensors": "0.5.3",
+        "pillow": "11.3.0"
+      },
+      "notes": "Required Phase 6C visual-place descriptor. Only the pinned safetensors checkpoint is downloaded; no upstream reference dataset or gallery is accepted."
+    },
+    {
+      "name": "g3",
+      "source_repository": "https://github.com/Jia-py/G3",
+      "source_revision": "b4e3acf7c0ac51221f21b7877fefb4826715c9e2",
+      "install_method": "conditional_isolated_worker",
+      "model_id": "Jia-py/G3-checkpoint",
+      "model_revision": "12d886fc2a1e59b3b52821acee193084420409cc",
+      "weight_file": "g3.pth",
+      "weight_size": 1765267460,
+      "weight_sha256": "c5bfddfd1c2c77e67fb4da985a2409bdc8dcf05a0e859e6aeeddc5f88ead05ab",
+      "excluded_artifacts": [
+        "g3.index"
+      ],
+      "license": "Apache-2.0",
+      "dataset_required_for_inference": false,
+      "execution_mode": "not_integrated",
+      "python": "3.9",
+      "notes": "Conditional verifier only. The pinned source currently hard-codes CUDA in its coordinate encoder and its published retrieval index is about 38 GB, so AtlasLens records the reviewed source/model provenance but does not download or claim an operational G3 runtime."
+    },
+    {
+      "name": "osv5m",
+      "source_repository": "https://github.com/gastruc/osv5m",
+      "source_revision": "4e6075387ecde4255410785ffb83830c9aa099f6",
+      "install_method": "isolated_worker",
+      "model_id": "osv5m/baseline",
+      "model_revision": "71548b90ac4a1aa7c37839841f411a06da82b1a6",
+      "license": "MIT",
+      "dataset_required_for_inference": false,
+      "execution_mode": "isolated_worker",
+      "python": "3.10",
+      "notes": "The official checkpoint is a research pickle artifact; keep it outside the API environment and review before production use."
+    },
+    {
+      "name": "plonk",
+      "source_repository": "https://github.com/nicolas-dufour/plonk",
+      "source_revision": "76d46410910c9dfec9e19ed371450ebc7051cdf3",
+      "install_method": "isolated_worker",
+      "package": "diff-plonk==0.4",
+      "package_sha256": "5d229d146e465957f887ff95f94ce614f9a37b13c6670dcfd3a352794014fe3e",
+      "model_id": "scene-routed",
+      "model_revision": "76d46410910c9dfec9e19ed371450ebc7051cdf3",
+      "license": "MIT",
+      "dataset_required_for_inference": false,
+      "execution_mode": "isolated_worker",
+      "python": "3.10",
+      "variants": [
+        {
+          "name": "osv",
+          "model_id": "nicolas-dufour/PLONK_OSV_5M",
+          "revision": "e23229f4dd91d52560e8827f5bb2c68257fa162f"
+        },
+        {
+          "name": "yfcc",
+          "model_id": "nicolas-dufour/PLONK_YFCC",
+          "revision": "4f358d09938a89ed239a847777729e95c5d187bc"
+        },
+        {
+          "name": "inat",
+          "model_id": "nicolas-dufour/PLONK_iNaturalist",
+          "revision": "8da6edcbdd01ff04a61f9d06e2de23ea300d1a35"
+        }
+      ],
+      "auxiliary": {
+        "name": "dinov2",
+        "source_repository": "https://github.com/facebookresearch/dinov2",
+        "source_revision": "7764ea0f912e53c92e82eb78a2a1631e92725fc8",
+        "model_id": "dinov2_vitl14_reg",
+        "weight_url": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_reg4_pretrain.pth",
+        "weight_sha256": "36e4deffbaef061a2576705b0c36f93621e2ae20bf6274694821b0b492551b51",
+        "license": "Apache-2.0"
+      },
+      "notes": "The upstream repository name is PLONK_iNaturalist; PLONK_iNat is retained only as a configuration alias for compatibility."
+    },
+    {
+      "name": "paddleocr",
+      "source_repository": "https://github.com/PaddlePaddle/PaddleOCR",
+      "source_revision": "211989f046cc1878460f9e65574690c00a127a1a",
+      "install_method": "isolated_worker",
+      "package": "paddleocr==3.7.0; paddlepaddle==3.3.1",
+      "package_sha256": "324b5122cf3887dfbd15db17f36e2421ef923fd4569d26111bf1a21fe84d442b",
+      "model_id": "PP-OCRv5-server-det+latin-mobile-rec",
+      "model_revision": "ca867c897ecbca8873081573a802ad70d499cb94+ab2cd5cc5fa6309be2e5acdfe66eca2c2c127d57",
+      "license": "Apache-2.0",
+      "dataset_required_for_inference": false,
+      "execution_mode": "isolated_worker",
+      "python": "3.12",
+      "device": "cpu",
+      "components": [
+        {
+          "model_id": "PP-OCRv5_server_det",
+          "revision": "ca867c897ecbca8873081573a802ad70d499cb94",
+          "weight_sha256": "183146fe9d9910352f68482f623bcbbb9fa7b9e8fa1463b9ad288cef00524d2d"
+        },
+        {
+          "model_id": "latin_PP-OCRv5_mobile_rec",
+          "revision": "ab2cd5cc5fa6309be2e5acdfe66eca2c2c127d57",
+          "weight_sha256": "53cdc8b481a7394bb108f96d0fb3432b0a8f392e22c7d18f06dbb2d42b8b25f9"
+        }
+      ],
+      "notes": "The package hash is the official Windows CPython 3.12 paddlepaddle 3.3.1 wheel. Turkish/Latin OCR uses the explicit PP-OCRv5 server detector and Latin mobile recognizer; bootstrap is the only download path."
+    },
+    {
+      "name": "rapidocr",
+      "source_repository": "https://github.com/RapidAI/RapidOCR",
+      "source_revision": "7fe716f8e38bb9a43f2680159f38deb14d8b1930",
+      "install_method": "package",
+      "package": "rapidocr==3.9.1; onnxruntime==1.27.0",
+      "package_sha256": "600885e4e94e0b427abad394fccb0ec1d3c9118a215ca435bf7680aeae0e292b",
+      "model_id": "PP-OCRv6-small-onnx",
+      "model_revision": "rapidocr-3.9.1",
+      "license": "Apache-2.0",
+      "dataset_required_for_inference": false,
+      "execution_mode": "isolated_process",
+      "python": "3.12",
+      "device": "cpu",
+      "notes": "Uses the existing AtlasLens killable ProcessRapidOCRWorker and only ONNX files bundled in the pinned wheel."
+    }
+  ]
+}

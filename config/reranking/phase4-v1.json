@@ -1,0 +1,30 @@
+{
+  "version": "phase4-v1",
+  "clustering": {
+    "radius_km": 50.0,
+    "uncertainty_floor_km": 1.0,
+    "dispersion_multiplier": 1.5,
+    "max_hits_per_source": 2,
+    "max_hypotheses": 12
+  },
+  "scoring": {
+    "weights": {
+      "retrieval_similarity": 0.4,
+      "support_count": 0.15,
+      "source_diversity": 0.2,
+      "hash_diversity": 0.1,
+      "compactness": 0.15
+    },
+    "support_normalizer": 4,
+    "contradiction_penalty": 0.5,
+    "contradiction_threshold": 0.6,
+    "minimum_relative_score": 0.35,
+    "minimum_supporting_hits": 2,
+    "max_candidates": 8
+  },
+  "pipeline": {
+    "timeout_seconds": 10.0,
+    "max_candidates": 5,
+    "max_references_per_candidate": 3
+  }
+}

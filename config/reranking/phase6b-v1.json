@@ -1,0 +1,38 @@
+{
+  "version": "phase6b-v1",
+  "distance_bands": {
+    "point_km": 10.0,
+    "city_km": 75.0,
+    "regional_km": 350.0,
+    "country_km": 1500.0,
+    "strong_disagreement_km": 3000.0
+  },
+  "weights": {
+    "within_provider_rank": 0.34,
+    "sample_density": 0.08,
+    "provider_diversity": 0.06,
+    "independent_family_agreement": 0.14,
+    "same_family_support": 0.03,
+    "candidate_margin": 0.05,
+    "ocr_place_agreement": 0.20,
+    "geographic_spread_penalty": 0.10,
+    "ocr_contradiction_penalty": 0.30
+  },
+  "max_candidates": 5,
+  "maximum_provider_diversity": 4,
+  "maximum_independent_families": 3,
+  "minimum_ocr_strength": 0.55,
+  "strong_ocr_strength": 0.75,
+  "provider_family_defaults": {
+    "geoclip": "mp16_family",
+    "osv5m": "osv5m_family",
+    "plonk": "yfcc_family"
+  },
+  "model_family_overrides": {
+    "geoclip": "mp16_family",
+    "osv5m/baseline": "osv5m_family",
+    "nicolas-dufour/PLONK_OSV_5M": "osv5m_family",
+    "nicolas-dufour/PLONK_YFCC": "yfcc_family",
+    "nicolas-dufour/PLONK_iNaturalist": "inat_family"
+  }
+}

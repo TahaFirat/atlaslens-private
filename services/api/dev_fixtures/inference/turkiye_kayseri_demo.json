@@ -1,0 +1,37 @@
+{
+  "schema_version": "atlaslens-development-inference-fixture-v1",
+  "scenario_id": "turkiye_kayseri_demo",
+  "provider_id": "development-mock-geolocation",
+  "model_name": "AtlasLens deterministic development fixture",
+  "model_revision": "turkiye-kayseri-demo-v1",
+  "runtime_revision": "fixture-json-v1",
+  "score_semantics": "uncalibrated_gallery_softmax",
+  "normalization_method": "softmax_over_fixed_gallery",
+  "calibration_state": "uncalibrated",
+  "candidates": [
+    {
+      "rank": 1,
+      "original_rank": 1,
+      "latitude": 38.7225,
+      "longitude": 35.4875,
+      "raw_score": 0.5,
+      "limitations": ["simulation_only", "not_a_geolocation_claim"]
+    },
+    {
+      "rank": 2,
+      "original_rank": 2,
+      "latitude": 38.7312,
+      "longitude": 35.4787,
+      "raw_score": 0.3,
+      "limitations": ["simulation_only", "not_a_geolocation_claim"]
+    },
+    {
+      "rank": 3,
+      "original_rank": 3,
+      "latitude": 38.7139,
+      "longitude": 35.5031,
+      "raw_score": 0.2,
+      "limitations": ["simulation_only", "not_a_geolocation_claim"]
+    }
+  ]
+}

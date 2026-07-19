@@ -1,0 +1,183 @@
+{
+  "schema_version": "atlaslens-scene-groups-v1",
+  "source_label_set": "mapillary-vistas-v2",
+  "groups": {
+    "road_surface": [
+      "Bike Lane",
+      "Crosswalk - Plain",
+      "Driveway",
+      "Parking",
+      "Parking Aisle",
+      "Pedestrian Area",
+      "Rail Track",
+      "Road",
+      "Road Median",
+      "Road Shoulder",
+      "Road Side",
+      "Service Lane"
+    ],
+    "built_environment": [
+      "Barrier",
+      "Bridge",
+      "Building",
+      "Concrete Block",
+      "Curb",
+      "Curb Cut",
+      "Fence",
+      "Garage",
+      "Guard Rail",
+      "Sidewalk",
+      "Temporary Barrier",
+      "Traffic Island",
+      "Tunnel",
+      "Wall"
+    ],
+    "vegetation": [
+      "Vegetation"
+    ],
+    "terrain": [
+      "Ground",
+      "Mountain",
+      "Sand",
+      "Snow",
+      "Terrain"
+    ],
+    "sky": [
+      "Sky"
+    ],
+    "water": [
+      "Water"
+    ],
+    "vehicles": [
+      "Bicycle",
+      "Boat",
+      "Bus",
+      "Car",
+      "Car Mount",
+      "Caravan",
+      "Ego Vehicle",
+      "Motorcycle",
+      "On Rails",
+      "Other Vehicle",
+      "Trailer",
+      "Truck",
+      "Vehicle Group",
+      "Wheeled Slow"
+    ],
+    "people": [
+      "Bicyclist",
+      "Motorcyclist",
+      "Other Rider",
+      "Person",
+      "Person Group"
+    ],
+    "traffic_signs": [
+      "Traffic Sign - Ambiguous",
+      "Traffic Sign - Direction (Back)",
+      "Traffic Sign - Direction (Front)",
+      "Traffic Sign - Parking",
+      "Traffic Sign - Temporary (Back)",
+      "Traffic Sign - Temporary (Front)",
+      "Traffic Sign (Back)",
+      "Traffic Sign (Front)",
+      "Traffic Sign Frame"
+    ],
+    "traffic_lights": [
+      "Traffic Light - Cyclists",
+      "Traffic Light - General (Horizontal)",
+      "Traffic Light - General (Single)",
+      "Traffic Light - General (Upright)",
+      "Traffic Light - Other",
+      "Traffic Light - Pedestrians"
+    ],
+    "road_markings": [
+      "Lane Marking (only) - Crosswalk",
+      "Lane Marking (only) - Dashed Line",
+      "Lane Marking (only) - Other",
+      "Lane Marking (only) - Test",
+      "Lane Marking - Ambiguous",
+      "Lane Marking - Arrow (Left)",
+      "Lane Marking - Arrow (Other)",
+      "Lane Marking - Arrow (Right)",
+      "Lane Marking - Arrow (Split Left or Straight)",
+      "Lane Marking - Arrow (Split Right or Straight)",
+      "Lane Marking - Arrow (Straight)",
+      "Lane Marking - Crosswalk",
+      "Lane Marking - Dashed Line",
+      "Lane Marking - Give Way (Row)",
+      "Lane Marking - Give Way (Single)",
+      "Lane Marking - Hatched (Chevron)",
+      "Lane Marking - Hatched (Diagonal)",
+      "Lane Marking - Other",
+      "Lane Marking - Stop Line",
+      "Lane Marking - Straight Line",
+      "Lane Marking - Symbol (Bicycle)",
+      "Lane Marking - Symbol (Other)",
+      "Lane Marking - Text",
+      "Lane Marking - Zigzag Line",
+      "Lane Separator"
+    ],
+    "street_infrastructure": [
+      "Banner",
+      "Bench",
+      "Bike Rack",
+      "CCTV Camera",
+      "Catch Basin",
+      "Fire Hydrant",
+      "Junction Box",
+      "Mailbox",
+      "Manhole",
+      "Parking Meter",
+      "Phone Booth",
+      "Pole",
+      "Pole Group",
+      "Pothole",
+      "Signage - Advertisement",
+      "Signage - Ambiguous",
+      "Signage - Back",
+      "Signage - Information",
+      "Signage - Other",
+      "Signage - Store",
+      "Street Light",
+      "Traffic Cone",
+      "Trash Can",
+      "Utility Pole",
+      "Water Valve"
+    ]
+  },
+  "tags": [
+    {
+      "name": "urban",
+      "reason": "Road and built-environment coverage exceed reviewed scene-component thresholds.",
+      "minimums": {
+        "road_surface": 0.08,
+        "built_environment": 0.12
+      },
+      "maximums": {}
+    },
+    {
+      "name": "road_heavy",
+      "reason": "Road-surface classes occupy at least 30 percent of the image.",
+      "minimums": {
+        "road_surface": 0.3
+      },
+      "maximums": {}
+    },
+    {
+      "name": "vegetation_sparse",
+      "reason": "Vegetation classes occupy no more than 3 percent of the image.",
+      "minimums": {},
+      "maximums": {
+        "vegetation": 0.03
+      }
+    },
+    {
+      "name": "street_infrastructure_visible",
+      "reason": "Reviewed street-infrastructure classes occupy a measurable image area.",
+      "minimums": {
+        "street_infrastructure": 0.005
+      },
+      "maximums": {}
+    }
+  ]
+}

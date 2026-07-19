@@ -1,0 +1,62 @@
+{
+  "schema_version": "atlaslens-source-policy-v1",
+  "policy_version": "phase3b3-mapillary-private-demo-v1",
+  "evidence_date": "2026-07-17",
+  "purpose": "Private, bounded Phase 3B3 technical demonstration using imagery acquired only through the official Mapillary API. This record is not legal advice, production approval, public-deployment approval or commercial clearance.",
+  "logical_source_partition": "mapillary_public_imagery_private_demo",
+  "technical_demo_only": true,
+  "public_distribution_allowed": false,
+  "production_activation_allowed": false,
+  "commercial_deployment_decision": "LEGAL_REVIEW_REQUIRED",
+  "coordinate_uncertainty": {
+    "required": true,
+    "semantics": "A positive conservative ingestion radius selected by the operator; not a Mapillary-supplied accuracy claim."
+  },
+  "decision_values": [
+    "GO",
+    "GO_WITH_ATTRIBUTION",
+    "FIRST_PARTY_ONLY",
+    "WRITTEN_PERMISSION_REQUIRED",
+    "LEGAL_REVIEW_REQUIRED",
+    "RESEARCH_ONLY",
+    "BLOCKED",
+    "UNKNOWN"
+  ],
+  "acquisition_ready_decisions": [
+    "GO_WITH_ATTRIBUTION"
+  ],
+  "admission_semantics": "GO_WITH_ATTRIBUTION authorizes only the explicitly bounded private pilot's source admission and derived technical index. The Phase 3B1 commercial_use_decision compatibility field does not promote the application or model to commercial or production clearance.",
+  "requirements": [
+    "Use only the official Mapillary Graph API; scraping is prohibited.",
+    "Preserve per-image creator attribution, stable Mapillary image ID, source page and CC-BY-SA-4.0 notice.",
+    "Never persist access tokens, Authorization headers or temporary signed image URLs.",
+    "Keep Mapillary imagery, descriptors and index logically separate from first-party, proprietary, user-media and evidence records.",
+    "Hard limits are 2000 images and 2 GiB of downloaded image bytes; no public publication or redistribution.",
+    "Reconciliation or revocation must cascade from stable image ID to raw cache, normalized asset, descriptor and index membership.",
+    "Production and commercial use remain blocked pending professional legal, privacy and share-alike review."
+  ],
+  "license": {
+    "identifier": "CC-BY-SA-4.0",
+    "url": "https://creativecommons.org/licenses/by-sa/4.0/",
+    "attribution_root": "https://www.mapillary.com/",
+    "share_alike_review": "Required before public, production or commercial deployment"
+  },
+  "sources": [
+    {
+      "source_id": "mapillary_public_imagery_private_demo",
+      "source_name": "Mapillary public imagery (private technical demo)",
+      "current_decision": "GO_WITH_ATTRIBUTION",
+      "evidence_date": "2026-07-17",
+      "official_api_url": "https://graph.mapillary.com",
+      "official_product_url": "https://www.mapillary.com/",
+      "license_identifier": "CC-BY-SA-4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "allowed_scope": "Bounded private non-production technical demo only",
+      "commercial_use": "LEGAL_REVIEW_REQUIRED",
+      "public_distribution": "BLOCKED",
+      "persistent_signed_urls": "BLOCKED",
+      "attribution": "Per-image creator identifier, source page, Mapillary name and license URL are mandatory",
+      "required_next_action": "Obtain professional legal/privacy/share-alike review before any broader use"
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "schema_version": "atlaslens-mapillary-aoi-v1",
+  "catalog_version": "phase3b3-aoi-v1",
+  "official_api_base_url": "https://graph.mapillary.com",
+  "official_bbox_area_limit_square_degrees": 0.01,
+  "aois": [
+    {
+      "aoi_id": "kayseri-urban-v1",
+      "version": "v1",
+      "display_name": "Kayseri urban pilot cells",
+      "region_kind": "urban",
+      "province": "Kayseri",
+      "city": "Kayseri",
+      "spatial_cell_size_degrees": 0.005,
+      "tiles": [
+        {"west": 35.4000, "south": 38.6900, "east": 35.4500, "north": 38.7400},
+        {"west": 35.4500, "south": 38.6900, "east": 35.5000, "north": 38.7400},
+        {"west": 35.4000, "south": 38.7400, "east": 35.4500, "north": 38.7900},
+        {"west": 35.4500, "south": 38.7400, "east": 35.5000, "north": 38.7900}
+      ]
+    },
+    {
+      "aoi_id": "ankara-urban-v1",
+      "version": "v1",
+      "display_name": "Ankara urban pilot cells",
+      "region_kind": "urban",
+      "province": "Ankara",
+      "city": "Ankara",
+      "spatial_cell_size_degrees": 0.005,
+      "tiles": [
+        {"west": 32.8000, "south": 39.8800, "east": 32.8500, "north": 39.9300},
+        {"west": 32.8500, "south": 39.8800, "east": 32.9000, "north": 39.9300},
+        {"west": 32.8000, "south": 39.9300, "east": 32.8500, "north": 39.9800},
+        {"west": 32.8500, "south": 39.9300, "east": 32.9000, "north": 39.9800}
+      ]
+    },
+    {
+      "aoi_id": "sivas-urban-v1",
+      "version": "v1",
+      "display_name": "Sivas urban pilot cells",
+      "region_kind": "urban",
+      "province": "Sivas",
+      "city": "Sivas",
+      "spatial_cell_size_degrees": 0.005,
+      "tiles": [
+        {"west": 36.9800, "south": 39.7200, "east": 37.0300, "north": 39.7700},
+        {"west": 37.0300, "south": 39.7200, "east": 37.0800, "north": 39.7700},
+        {"west": 36.9800, "south": 39.7700, "east": 37.0300, "north": 39.8200},
+        {"west": 37.0300, "south": 39.7700, "east": 37.0800, "north": 39.8200}
+      ]
+    },
+    {
+      "aoi_id": "kayseri-ankara-corridor-v1",
+      "version": "v1",
+      "display_name": "Kayseri–Ankara named corridor pilot cells",
+      "region_kind": "corridor",
+      "province": "Kayseri–Ankara",
+      "city": null,
+      "spatial_cell_size_degrees": 0.01,
+      "tiles": [
+        {"west": 35.3000, "south": 38.8100, "east": 35.3400, "north": 38.8500},
+        {"west": 34.1600, "south": 39.1100, "east": 34.2000, "north": 39.1500},
+        {"west": 33.5000, "south": 39.5700, "east": 33.5400, "north": 39.6100},
+        {"west": 32.9300, "south": 39.8600, "east": 32.9700, "north": 39.9000}
+      ]
+    },
+    {
+      "aoi_id": "kayseri-sivas-corridor-v1",
+      "version": "v1",
+      "display_name": "Kayseri–Sivas named corridor pilot cells",
+      "region_kind": "corridor",
+      "province": "Kayseri–Sivas",
+      "city": null,
+      "spatial_cell_size_degrees": 0.01,
+      "tiles": [
+        {"west": 35.7000, "south": 38.7800, "east": 35.7400, "north": 38.8200},
+        {"west": 36.1800, "south": 39.0200, "east": 36.2200, "north": 39.0600},
+        {"west": 36.6100, "south": 39.3500, "east": 36.6500, "north": 39.3900},
+        {"west": 36.9500, "south": 39.6700, "east": 36.9900, "north": 39.7100}
+      ]
+    }
+  ]
+}

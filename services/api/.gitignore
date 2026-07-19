@@ -1,0 +1,13 @@
+.pytest-tmp/
+tmp/
+data/
+.venv/
+.uv-cache/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite*
+

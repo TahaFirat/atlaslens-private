@@ -1,0 +1,98 @@
+{
+  "version": "phase6c-v1",
+  "cluster_radius_km": 75.0,
+  "minimum_uncertainty_radius_km": 5.0,
+  "diversity_radius_km": 300.0,
+  "maximum_candidates_per_diversity_region": 3,
+  "max_candidates": 16,
+  "maximum_provider_diversity": 8,
+  "maximum_independent_families": 6,
+  "minimum_independent_families_for_publication": 2,
+  "weights": {
+    "within_provider_rank": 0.42,
+    "sample_density": 0.08,
+    "provider_diversity": 0.08,
+    "independent_family_corroboration": 0.20,
+    "correlated_source_support": 0.04,
+    "geographic_spread_penalty": 0.12
+  },
+  "source_correlation_groups": {
+    "geoclip_mp16_family": "geoclip_mp16_training",
+    "osv5m_family": "osv5m_training",
+    "plonk_osv_family": "osv5m_training",
+    "plonk_yfcc_family": "plonk_yfcc_training",
+    "plonk_inat_family": "plonk_inat_training",
+    "megaloc_retrieval_family": "megaloc_descriptor_retrieval",
+    "g3_family": "geoclip_mp16_training",
+    "ocr_text_family": "ocr_text",
+    "openai_review_family": "openai_review"
+  },
+  "ablation_profiles": {
+    "geoclip_original_only": [
+      "geoclip_original"
+    ],
+    "geoclip_original_hierarchical": [
+      "geoclip_original",
+      "geoclip_hierarchical"
+    ],
+    "geoclip_osv5m": [
+      "geoclip_original",
+      "osv_direct_regression"
+    ],
+    "geoclip_plonk": [
+      "geoclip_original",
+      "plonk_samples"
+    ],
+    "geoclip_megaloc": [
+      "geoclip_original",
+      "megaloc_retrieval"
+    ],
+    "all_local_without_ocr": [
+      "geoclip_original",
+      "geoclip_hierarchical",
+      "osv_direct_regression",
+      "plonk_samples",
+      "megaloc_retrieval"
+    ],
+    "all_local_with_ocr": [
+      "geoclip_original",
+      "geoclip_hierarchical",
+      "osv_direct_regression",
+      "plonk_samples",
+      "megaloc_retrieval",
+      "ocr_place_match"
+    ],
+    "all_local_with_g3": [
+      "geoclip_original",
+      "geoclip_hierarchical",
+      "osv_direct_regression",
+      "plonk_samples",
+      "megaloc_retrieval",
+      "ocr_place_match",
+      "g3_verification"
+    ],
+    "optional_openai_assist": [
+      "geoclip_original",
+      "geoclip_hierarchical",
+      "osv_direct_regression",
+      "plonk_samples",
+      "megaloc_retrieval",
+      "g3_verification",
+      "ocr_place_match",
+      "openai_review"
+    ],
+    "phase6c_final": [
+      "geoclip_original",
+      "geoclip_hierarchical",
+      "osv_direct_regression",
+      "plonk_samples",
+      "megaloc_retrieval",
+      "g3_verification",
+      "ocr_place_match",
+      "openai_review"
+    ]
+  },
+  "external_baseline_profiles": [
+    "phase6b_baseline"
+  ]
+}
