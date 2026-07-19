@@ -95,6 +95,28 @@ def test_operator_receipt_round_trip_is_atomic_and_pod_hash_bound(tmp_path: Path
         read_operator_receipt(path)
 
 
+def test_create_id_is_atomically_bound_before_response_field_validation(
+    tmp_path: Path,
+) -> None:
+    module = _load_supervisor()
+    path = tmp_path / "operator" / "phase3f-current.json"
+    receipt = _receipt(pod_id=None, stage="preflight")
+    write_operator_receipt(path, receipt)
+    pod = PodRecord("created-pod", receipt.run_marker)
+
+    module._bind_operator_pod(
+        path,
+        expected_run_id=receipt.run_id,
+        pod=pod,
+    )
+
+    bound = read_operator_receipt(path)
+    assert bound.pod_id == "created-pod"
+    assert bound.stage == "running"
+    assert bound.cleanup_verified is False
+    assert not tuple(path.parent.glob("*.partial"))
+
+
 def test_stale_or_live_operator_receipt_fails_closed(tmp_path: Path) -> None:
     path = tmp_path / "phase3f-current.json"
     write_operator_receipt(path, _receipt())

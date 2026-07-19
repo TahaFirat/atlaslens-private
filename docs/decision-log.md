@@ -1,5 +1,28 @@
 # Decision log
 
+## 2026-07-19 - Phase 3F binds a 201 Pod ID before validating create fields
+
+- Context: Run `c1b3f58f9eddc945db24399c7173e493` ended with
+  `create_response_interruptible`, a null receipt Pod ID and restored empty
+  inventory. The adapter could reach that code only after HTTP 201, a JSON object,
+  a valid `id` and a matching `name`; however, the ID was returned to the session
+  only after all response fields passed, so the atomic receipt missed the cleanup
+  target. The old sanitized state did not retain response keys or the JSON type of
+  `interruptible`, so that historical type cannot be reconstructed honestly.
+- Decision: Classify create HTTP status before Pod fields and parse only HTTP 201
+  as success. Map capacity, auth, permission, rate and provider statuses to stable
+  secret-free codes with no retry. On 201, bind the valid Pod ID atomically before
+  all other validation, carry it on any post-ID exception into the one-Pod cleanup,
+  reject boolean `true`, and use an authenticated Pod GET to require exact boolean
+  `false` without truthiness conversion. Retain only sanitized status, top-level
+  key names, presence flags and JSON type metadata for future diagnostics.
+- Alternatives: Parse error objects as Pods; bind only after complete validation;
+  coerce strings/nulls to booleans; retry create; persist raw provider responses.
+- Consequences: A successful-looking 201 can no longer lose its termination target,
+  while non-201 errors never trigger Pod-field validation. Raw responses, Pod IDs,
+  credentials and account-private values remain excluded from diagnostics.
+- Target phase: Product Phase 3F bounded RunPod pilot only.
+
 ## 2026-07-19 - Phase 3F treats advertised RunPod stock as unconfirmed capacity
 
 - Context: RunPod's authenticated GPU detail response can advertise High, Medium

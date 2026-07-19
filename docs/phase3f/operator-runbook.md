@@ -65,6 +65,15 @@ configured hourly ceiling. An advertised-but-unconfirmed offer may make exactly
 one REST create attempt. A sanitized allocation/no-capacity response becomes
 `GPU_CAPACITY_RACE_NO_POD`; no alternate GPU or Pod is tried, no successful-run
 receipt or spend is recorded, and all four inventories must be restored to zero.
+Create response handling classifies HTTP status before looking at any Pod field.
+Only HTTP 201 enters success parsing. Status 400/404/409/422 is a capacity race;
+401 is `RUNPOD_AUTH_INVALID`, 403 is `RUNPOD_PERMISSION_DENIED`, 429 is
+`RUNPOD_RATE_LIMITED`, and 5xx is `RUNPOD_PROVIDER_ERROR`. On HTTP 201 the Pod ID
+is atomically bound to the operator receipt before any remaining field is
+validated. The response must not advertise `interruptible=true`; an authenticated
+`GET /pods/{id}` must then verify exact JSON boolean `false`. Missing, null or
+string values are never coerced. Every post-ID validation failure carries the
+receipt-bound Pod into the one-Pod `finally` termination path.
 Mapillary access is mapped through the named RunPod secret reference. Source,
 canonical-LF vendor files and the exact model are checksum-verified before
 transfer. The cloud job is watched in the foreground, output is downloaded and
@@ -78,6 +87,8 @@ Stop on these operator blockers: `ACTIVE_POD_INVENTORY_NOT_ZERO`,
 `OPERATOR_PROCESS_ALREADY_RUNNING`, `STALE_OPERATOR_RECEIPT_REQUIRES_TERMINATE`,
 `NO_ELIGIBLE_GPU_OFFER`, `GPU_AVAILABILITY_GRAPHQL_ERRORS`,
 `GPU_CAPACITY_RACE_NO_POD`,
+`RUNPOD_AUTH_INVALID`, `RUNPOD_PERMISSION_DENIED`, `RUNPOD_RATE_LIMITED`,
+`RUNPOD_PROVIDER_ERROR`,
 `projected_cost_exceeds_target`,
 `soft_stop_budget_reached`, `termination_budget_reached`,
 `absolute_budget_reached`, `runtime_limit_reached`,

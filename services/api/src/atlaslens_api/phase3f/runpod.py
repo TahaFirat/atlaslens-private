@@ -10,7 +10,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Final, cast
@@ -41,18 +41,12 @@ MAPILLARY_ENV_REFERENCE: Final = (
 )
 _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _URL = re.compile(r"https?://[^\s]+", re.I)
-_CAPACITY_ERROR_STATUSES: Final = frozenset({400, 409, 422, 503})
-_CAPACITY_ERROR_PHRASES: Final = (
-    "insufficient capacity",
-    "no capacity",
-    "out of capacity",
-    "no available gpu",
-    "no gpu available",
-    "no available machine",
-    "no machines available",
-    "no longer any instances available",
-    "unable to find a suitable machine",
+_CAPACITY_ERROR_STATUSES: Final = frozenset({400, 404, 409, 422})
+_SENSITIVE_JSON_KEY = re.compile(
+    r"(?:authorization|cookie|credential|password|secret|token|api[-_]?key)", re.I
 )
+_SAFE_JSON_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+_MISSING: Final = object()
 _GPU_LIST_QUERY: Final = """query AtlasLensPhase3FGpuTypes {
   gpuTypes {
     id
@@ -68,6 +62,14 @@ class RunPodAPIError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class RunPodCreateError(RunPodAPIError):
+    """Post-ID create failure carrying the private cleanup target in memory only."""
+
+    def __init__(self, code: str, pod_record: PodRecord) -> None:
+        super().__init__(code)
+        self.pod_record = pod_record
 
 
 def _require(condition: bool, code: str) -> None:
@@ -271,6 +273,28 @@ class GraphQLErrorDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class CreateResponseDiagnostic:
+    http_status: int
+    top_level_keys: tuple[str, ...]
+    id_present: bool | None
+    interruptible_present: bool | None
+    interruptible_json_type: str
+    classification: str
+    secret_free: bool = True
+
+    def to_public_dict(self) -> dict[str, object]:
+        return {
+            "http_status": self.http_status,
+            "response_top_level_keys": list(self.top_level_keys),
+            "id_present": self.id_present,
+            "interruptible_present": self.interruptible_present,
+            "interruptible_json_type": self.interruptible_json_type,
+            "response_classification": self.classification,
+            "secret_free": self.secret_free,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RunPodInventory:
     pods: tuple[PodRecord, ...]
     endpoint_ids: tuple[str, ...]
@@ -297,6 +321,7 @@ class RunPodV1Client:
         config: RunPodConfig,
         timeout_seconds: float = 15.0,
         transport: httpx.BaseTransport | None = None,
+        bind_created_pod: Callable[[PodRecord], None] | None = None,
     ) -> None:
         _require(
             bool(api_token)
@@ -312,6 +337,8 @@ class RunPodV1Client:
         self._last_availability_report: GPUAvailabilityReport | None = None
         self._last_graphql_errors: tuple[GraphQLErrorDiagnostic, ...] = ()
         self._last_created_hourly_price: Decimal | None = None
+        self._last_create_response_diagnostic: CreateResponseDiagnostic | None = None
+        self._bind_created_pod = bind_created_pod
         self._api_request_count = 0
         self._cloud_mutation_count = 0
         self._client = httpx.Client(
@@ -349,6 +376,10 @@ class RunPodV1Client:
     @property
     def last_created_hourly_price(self) -> Decimal | None:
         return self._last_created_hourly_price
+
+    @property
+    def last_create_response_diagnostic(self) -> CreateResponseDiagnostic | None:
+        return self._last_create_response_diagnostic
 
     @property
     def api_request_count(self) -> int:
@@ -946,7 +977,8 @@ class RunPodV1Client:
             "POST",
             "pods",
             expected_status=201,
-            classify_capacity_race=True,
+            response_observer=self._observe_create_response,
+            status_classifier=self._classify_create_status,
             json_body={
                 "name": request.run_marker,
                 "imageName": self._config.image_name,
@@ -956,6 +988,7 @@ class RunPodV1Client:
                 "gpuTypePriority": "availability",
                 "gpuCount": 1,
                 "containerDiskInGb": self._config.container_disk_gb,
+                "templateId": None,
                 "volumeInGb": 0,
                 "ports": ports,
                 "supportPublicIp": bool(ports),
@@ -966,30 +999,60 @@ class RunPodV1Client:
         )
         row = _object(payload, "create_response_invalid")
         pod_id = _resource_id(row.get("id"), "create_response_invalid")
-        _require(row.get("name") == request.run_marker, "create_response_marker_mismatch")
-        _require(row.get("interruptible") is False, "create_response_interruptible")
-        _require(row.get("endpointId") is None, "create_response_endpoint_bound")
-        _require(row.get("networkVolume") is None, "create_response_network_volume")
-        _require(row.get("volumeInGb") == 0, "create_response_volume")
-        disk = row.get("containerDiskInGb")
-        _require(
-            isinstance(disk, int) and 1 <= disk <= MAX_CONTAINER_DISK_GB,
-            "create_response_disk_invalid",
-        )
-        returned_ports = _sequence(row.get("ports"), "create_response_ports_invalid")
-        _require(set(returned_ports).issubset({"22/tcp"}), "create_response_ports_invalid")
-        gpu = _object(row.get("gpu"), "create_response_gpu_invalid")
-        _require(gpu.get("count") == 1, "create_response_gpu_invalid")
-        actual_price = _decimal(row.get("costPerHr"), "create_response_price_invalid")
-        _require(
-            Decimal("0") < actual_price <= offer.hourly_price <= request.hourly_cost_usd,
-            "create_response_price_exceeded",
-        )
-        self._last_created_hourly_price = actual_price
         try:
-            return PodRecord(pod_id, request.run_marker)
+            created = PodRecord(pod_id, request.run_marker)
         except Phase3FSafetyError as exc:
             raise RunPodAPIError("create_response_invalid") from exc
+        try:
+            if self._bind_created_pod is not None:
+                self._bind_created_pod(created)
+            _require(row.get("name") == request.run_marker, "create_response_marker_mismatch")
+            self._validate_interruptible(row, pod_id)
+            _require(row.get("endpointId") is None, "create_response_endpoint_bound")
+            _require(row.get("networkVolume") is None, "create_response_network_volume")
+            _require(row.get("volumeInGb") == 0, "create_response_volume")
+            disk = row.get("containerDiskInGb")
+            _require(
+                isinstance(disk, int) and 1 <= disk <= MAX_CONTAINER_DISK_GB,
+                "create_response_disk_invalid",
+            )
+            returned_ports = _sequence(row.get("ports"), "create_response_ports_invalid")
+            _require(set(returned_ports).issubset({"22/tcp"}), "create_response_ports_invalid")
+            gpu = _object(row.get("gpu"), "create_response_gpu_invalid")
+            _require(gpu.get("count") == 1, "create_response_gpu_invalid")
+            actual_price = _decimal(row.get("costPerHr"), "create_response_price_invalid")
+            _require(
+                Decimal("0") < actual_price <= offer.hourly_price <= request.hourly_cost_usd,
+                "create_response_price_exceeded",
+            )
+            self._last_created_hourly_price = actual_price
+        except RunPodCreateError:
+            raise
+        except RunPodAPIError as exc:
+            raise RunPodCreateError(exc.code, created) from None
+        except BaseException:
+            raise RunPodCreateError("create_response_validation_failed", created) from None
+        return created
+
+    def _validate_interruptible(self, row: Mapping[str, object], pod_id: str) -> None:
+        value = row.get("interruptible", _MISSING)
+        if value is True:
+            raise RunPodAPIError("create_response_interruptible_true")
+        try:
+            payload = self._request_json(
+                "GET",
+                f"pods/{pod_id}",
+                expected_status=200,
+                params={"includeMachine": "false", "includeNetworkVolume": "false"},
+            )
+            verified = _object(payload, "pod_interruptible_verification_failed")
+            _require(verified.get("id") == pod_id, "pod_interruptible_verification_failed")
+            _require(
+                verified.get("interruptible", _MISSING) is False,
+                "pod_interruptible_verification_failed",
+            )
+        except RunPodAPIError:
+            raise RunPodAPIError("pod_interruptible_verification_failed") from None
 
     def terminate_pod(self, pod_id: str) -> None:
         safe_id = _resource_id(pod_id, "pod_id_invalid")
@@ -1067,7 +1130,8 @@ class RunPodV1Client:
         expected_status: int,
         params: Mapping[str, str] | None = None,
         json_body: Mapping[str, object] | None = None,
-        classify_capacity_race: bool = False,
+        response_observer: Callable[[int, bytearray], None] | None = None,
+        status_classifier: Callable[[int], str] | None = None,
     ) -> object:
         self._api_request_count += 1
         headers = {
@@ -1094,10 +1158,15 @@ class RunPodV1Client:
             raise
         except httpx.HTTPError:
             raise RunPodAPIError("transport_failed") from None
+        if response_observer is not None:
+            response_observer(status, body)
         if status != expected_status:
-            if classify_capacity_race and self._is_capacity_race(status, body):
-                raise RunPodAPIError("GPU_CAPACITY_ALLOCATION_REJECTED")
-            raise RunPodAPIError(f"unexpected_status_{status}")
+            code = (
+                f"unexpected_status_{status}"
+                if status_classifier is None
+                else status_classifier(status)
+            )
+            raise RunPodAPIError(code)
         if expected_status == 204:
             _require(not body, "delete_response_not_empty")
             return None
@@ -1107,14 +1176,91 @@ class RunPodV1Client:
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise RunPodAPIError("response_json_invalid") from None
 
-    def _is_capacity_race(self, status: int, body: bytearray) -> bool:
-        if status not in _CAPACITY_ERROR_STATUSES:
-            return False
-        text = bytes(body).decode("utf-8", errors="ignore").casefold()
-        return any(phrase in text for phrase in _CAPACITY_ERROR_PHRASES)
+    def _classify_create_status(self, status: int) -> str:
+        if status in _CAPACITY_ERROR_STATUSES:
+            return "GPU_CAPACITY_ALLOCATION_REJECTED"
+        if status == 401:
+            return "RUNPOD_AUTH_INVALID"
+        if status == 403:
+            return "RUNPOD_PERMISSION_DENIED"
+        if status == 429:
+            return "RUNPOD_RATE_LIMITED"
+        if 500 <= status <= 599:
+            return "RUNPOD_PROVIDER_ERROR"
+        return "RUNPOD_CREATE_RESPONSE_REJECTED"
+
+    def _observe_create_response(self, status: int, body: bytearray) -> None:
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._last_create_response_diagnostic = CreateResponseDiagnostic(
+                http_status=status,
+                top_level_keys=(),
+                id_present=None,
+                interruptible_present=None,
+                interruptible_json_type="unavailable",
+                classification=(
+                    "http_201_non_json" if status == 201 else "provider_error_non_json"
+                ),
+            )
+            return
+        if not isinstance(payload, Mapping):
+            self._last_create_response_diagnostic = CreateResponseDiagnostic(
+                http_status=status,
+                top_level_keys=(),
+                id_present=None,
+                interruptible_present=None,
+                interruptible_json_type="unavailable",
+                classification=(
+                    "http_201_invalid_json_shape"
+                    if status == 201
+                    else "provider_error_invalid_json_shape"
+                ),
+            )
+            return
+        row = cast(Mapping[str, object], payload)
+        keys = tuple(
+            sorted(
+                key
+                if _SAFE_JSON_KEY.fullmatch(key) and not _SENSITIVE_JSON_KEY.search(key)
+                else "<redacted-key>"
+                for key in row
+            )
+        )
+        interruptible = row.get("interruptible", _MISSING)
+        self._last_create_response_diagnostic = CreateResponseDiagnostic(
+            http_status=status,
+            top_level_keys=keys,
+            id_present="id" in row,
+            interruptible_present="interruptible" in row,
+            interruptible_json_type=self._json_type(interruptible),
+            classification=(
+                "http_201_create_success_object"
+                if status == 201
+                else "provider_error_object"
+            ),
+        )
+
+    def _json_type(self, value: object) -> str:
+        if value is _MISSING:
+            return "missing"
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, int | float):
+            return "number"
+        if isinstance(value, Mapping):
+            return "object"
+        if isinstance(value, Sequence):
+            return "array"
+        return "unknown"
 
 
 __all__ = [
+    "CreateResponseDiagnostic",
     "GPUAvailabilityReport",
     "GPUCandidateDiagnostic",
     "GPUOffer",
@@ -1126,6 +1272,7 @@ __all__ = [
     "PodConnection",
     "REST_BASE_URL",
     "RunPodAPIError",
+    "RunPodCreateError",
     "RunPodConfig",
     "RunPodInventory",
     "RunPodV1Client",

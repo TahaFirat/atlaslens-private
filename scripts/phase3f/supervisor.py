@@ -41,6 +41,7 @@ from atlaslens_api.phase3f.runpod import (  # noqa: E402
 from atlaslens_api.phase3f.safety import (  # noqa: E402
     BudgetPolicy,
     Phase3FSafetyError,
+    PodRecord,
     PodRequest,
     RunPodLease,
     SinglePodSession,
@@ -421,9 +422,13 @@ def _operation(
     operator_receipt_path: Path,
     remote_job_seconds: int,
 ) -> dict[str, object]:
-    write_operator_receipt(
-        operator_receipt_path,
-        operator_receipt.update_lifecycle(stage="running", pod_id=lease.pod.pod_id),
+    bound_receipt = read_operator_receipt(operator_receipt_path)
+    _require(
+        bound_receipt.run_id == operator_receipt.run_id
+        and bound_receipt.run_marker == operator_receipt.run_marker
+        and bound_receipt.pod_id == lease.pod.pod_id
+        and bound_receipt.stage == "running",
+        "OPERATOR_RECEIPT_POD_BINDING_MISSING",
     )
     _emit("PHASE3F_POD_CREATED", run_id=run_id)
     _emit("PHASE3F_WAITING_FOR_SSH", run_id=run_id)
@@ -742,6 +747,24 @@ def _record_failed_operator_state(
         pass
 
 
+def _bind_operator_pod(
+    receipt_path: Path,
+    *,
+    expected_run_id: str,
+    pod: PodRecord,
+) -> None:
+    receipt = read_operator_receipt(receipt_path)
+    _require(receipt.run_id == expected_run_id, "OPERATOR_RECEIPT_RUN_ID_MISMATCH")
+    _require(receipt.run_marker == pod.run_marker, "OPERATOR_RECEIPT_POD_MARKER_MISMATCH")
+    _require(receipt.pod_id in {None, pod.pod_id}, "OPERATOR_RECEIPT_POD_ID_CONFLICT")
+    _require(receipt.stage in {"preflight", "running"}, "OPERATOR_RECEIPT_STAGE_INVALID")
+    if receipt.pod_id is None or receipt.stage != "running":
+        write_operator_receipt(
+            receipt_path,
+            receipt.update_lifecycle(stage="running", pod_id=pod.pod_id),
+        )
+
+
 def _run_execute(
     args: argparse.Namespace,
     *,
@@ -819,7 +842,15 @@ def _run_execute(
             min_gpu_memory_gb=16,
             ssh_public_key=public_key,
         )
-        with RunPodV1Client(api_token=token, config=config) as client:
+        with RunPodV1Client(
+            api_token=token,
+            config=config,
+            bind_created_pod=lambda pod: _bind_operator_pod(
+                receipt_path,
+                expected_run_id=run_id,
+                pod=pod,
+            ),
+        ) as client:
             before = client.inventory()
             require_empty_inventory(before)
             _emit("PHASE3F_CLOUD_INVENTORY_EMPTY", resources=0)
@@ -864,6 +895,12 @@ def _run_execute(
                     ),
                 )
             except (Phase3FSafetyError, RunPodAPIError) as exc:
+                diagnostic = client.last_create_response_diagnostic
+                if diagnostic is not None:
+                    _emit(
+                        "PHASE3F_CREATE_RESPONSE_CLASSIFIED",
+                        **diagnostic.to_public_dict(),
+                    )
                 if exc.code == "GPU_CAPACITY_RACE_NO_POD":
                     after_capacity_race = _post_inventory(client, before)
                     require_inventory_restored(before, after_capacity_race)

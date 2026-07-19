@@ -12,9 +12,16 @@ from atlaslens_api.phase3f.runpod import (
     REST_BASE_URL,
     RunPodAPIError,
     RunPodConfig,
+    RunPodCreateError,
     RunPodV1Client,
 )
-from atlaslens_api.phase3f.safety import MAX_RUNTIME_SECONDS, PodRecord, PodRequest
+from atlaslens_api.phase3f.safety import (
+    MAX_RUNTIME_SECONDS,
+    Phase3FSafetyError,
+    PodRecord,
+    PodRequest,
+    SinglePodSession,
+)
 
 TOKEN = "runpod-test-token-never-log"
 IMAGE = "registry.example/atlaslens@sha256:" + "a" * 64
@@ -25,6 +32,7 @@ PREFERENCES = (
 )
 SSH_PUBLIC_KEY = "ssh-ed25519 " + "A" * 68 + " atlaslens-phase3f"
 _DEFAULT = object()
+_MISSING_FIELD = object()
 
 
 def _config(**overrides: object) -> RunPodConfig:
@@ -105,6 +113,23 @@ def _gpu_list_response() -> dict[str, object]:
             ]
         }
     }
+
+
+def _created_payload(*, interruptible: object = False) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": "created-pod",
+        "name": "phase3f-run-001",
+        "containerDiskInGb": 40,
+        "endpointId": None,
+        "networkVolume": None,
+        "volumeInGb": 0,
+        "ports": [],
+        "gpu": {"count": 1},
+        "costPerHr": "0.45",
+    }
+    if interruptible is not _MISSING_FIELD:
+        payload["interruptible"] = interruptible
+    return payload
 
 
 def _graphql_response(
@@ -593,6 +618,12 @@ def test_create_is_one_secure_rest_call_with_no_volume_or_extra_ports() -> None:
         _assert_secret_safe(request)
         if str(request.url) == GRAPHQL_URL:
             return _graphql_response(request)
+        if request.method == "GET":
+            assert request.url.path.endswith("/pods/created-pod")
+            return httpx.Response(
+                200,
+                json={"id": "created-pod", "interruptible": False},
+            )
         assert request.url.path.endswith("/pods")
         create_requests.append(request)
         body = json.loads(request.content)
@@ -605,6 +636,7 @@ def test_create_is_one_secure_rest_call_with_no_volume_or_extra_ports() -> None:
             "gpuTypePriority": "availability",
             "gpuCount": 1,
             "containerDiskInGb": 40,
+            "templateId": None,
             "volumeInGb": 0,
             "ports": ["22/tcp"],
             "supportPublicIp": True,
@@ -619,8 +651,14 @@ def test_create_is_one_secure_rest_call_with_no_volume_or_extra_ports() -> None:
                 "PUBLIC_KEY": SSH_PUBLIC_KEY,
             },
         }
+        assert isinstance(body["interruptible"], bool)
+        assert body["interruptible"] is False
+        assert body["gpuCount"] == 1
+        assert body["gpuTypeIds"] == ["NVIDIA RTX A5000"]
+        assert body["volumeInGb"] == 0
+        assert body["templateId"] is None
+        assert "endpointId" not in body
         assert "networkVolumeId" not in body
-        assert "templateId" not in body
         return httpx.Response(
             201,
             json={
@@ -648,9 +686,268 @@ def test_create_is_one_secure_rest_call_with_no_volume_or_extra_ports() -> None:
         transport=httpx.MockTransport(handler),
     ) as client:
         pod = client.create_pod(_request(public_ports=(22,)))
+        diagnostic = client.last_create_response_diagnostic
     assert pod == PodRecord("created-pod", "phase3f-run-001")
     assert len(create_requests) == 1
     assert create_requests[0].method == "POST"
+    assert diagnostic is not None
+    assert diagnostic.http_status == 201
+    assert diagnostic.top_level_keys == (
+        "containerDiskInGb",
+        "costPerHr",
+        "endpointId",
+        "gpu",
+        "id",
+        "interruptible",
+        "name",
+        "networkVolume",
+        "ports",
+        "volumeInGb",
+    )
+    assert diagnostic.interruptible_present is True
+    assert diagnostic.interruptible_json_type == "boolean"
+
+
+@pytest.mark.parametrize(
+    ("interruptible", "expected_type"),
+    [
+        (_MISSING_FIELD, "missing"),
+        (None, "null"),
+        ("false", "string"),
+    ],
+)
+def test_indeterminate_create_interruptible_uses_authenticated_get_verification(
+    interruptible: object,
+    expected_type: str,
+) -> None:
+    get_calls = 0
+    bound: list[PodRecord] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_calls
+        _assert_secret_safe(request)
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "GET":
+            get_calls += 1
+            assert request.url.path.endswith("/pods/created-pod")
+            return httpx.Response(
+                200,
+                json={"id": "created-pod", "interruptible": False},
+            )
+        assert request.method == "POST"
+        return httpx.Response(
+            201,
+            json=_created_payload(interruptible=interruptible),
+        )
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        bind_created_pod=bound.append,
+    ) as client:
+        pod = client.create_pod(_request())
+        diagnostic = client.last_create_response_diagnostic
+
+    assert pod == PodRecord("created-pod", "phase3f-run-001")
+    assert bound == [pod]
+    assert get_calls == 1
+    assert diagnostic is not None
+    assert diagnostic.http_status == 201
+    assert diagnostic.id_present is True
+    assert diagnostic.interruptible_json_type == expected_type
+    assert diagnostic.classification == "http_201_create_success_object"
+
+
+def test_boolean_true_is_bound_then_terminated_with_post_id_cleanup() -> None:
+    pod_present = False
+    create_calls = 0
+    delete_calls = 0
+    bound: list[PodRecord] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present, create_calls, delete_calls
+        _assert_secret_safe(request)
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "GET" and request.url.path.endswith("/pods"):
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        if request.method == "DELETE":
+            delete_calls += 1
+            assert request.url.path.endswith("/pods/created-pod")
+            pod_present = False
+            return httpx.Response(204)
+        create_calls += 1
+        pod_present = True
+        return httpx.Response(201, json=_created_payload(interruptible=True))
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        bind_created_pod=bound.append,
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(
+            RunPodCreateError,
+            match="create_response_interruptible_true",
+        ):
+            session.execute(_request(), lambda _lease: None)
+        diagnostic = client.last_create_response_diagnostic
+
+    assert bound == [PodRecord("created-pod", "phase3f-run-001")]
+    assert create_calls == 1
+    assert delete_calls == 1
+    assert pod_present is False
+    assert session.last_audit is not None
+    assert session.last_audit.create_attempts == 1
+    assert session.last_audit.termination_attempts == 1
+    assert session.last_audit.termination_verified is True
+    assert diagnostic is not None
+    assert diagnostic.interruptible_json_type == "boolean"
+
+
+def test_get_verification_not_false_terminates_bound_pod() -> None:
+    pod_present = False
+    delete_calls = 0
+    bound: list[PodRecord] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present, delete_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "GET" and request.url.path.endswith("/pods/created-pod"):
+            return httpx.Response(
+                200,
+                json={"id": "created-pod", "interruptible": True},
+            )
+        if request.method == "GET":
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        if request.method == "DELETE":
+            delete_calls += 1
+            pod_present = False
+            return httpx.Response(204)
+        pod_present = True
+        return httpx.Response(
+            201,
+            json=_created_payload(interruptible=_MISSING_FIELD),
+        )
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        bind_created_pod=bound.append,
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(
+            RunPodCreateError,
+            match="pod_interruptible_verification_failed",
+        ):
+            session.execute(_request(), lambda _lease: None)
+
+    assert bound == [PodRecord("created-pod", "phase3f-run-001")]
+    assert delete_calls == 1
+    assert pod_present is False
+    assert session.last_audit is not None
+    assert session.last_audit.termination_verified is True
+
+
+@pytest.mark.parametrize("status", [400, 404, 409, 422])
+def test_capacity_status_is_classified_after_http_before_pod_fields(status: int) -> None:
+    pod_list_calls = 0
+    create_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_list_calls, create_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "GET":
+            pod_list_calls += 1
+            return httpx.Response(200, json=[])
+        create_calls += 1
+        return httpx.Response(
+            status,
+            json={
+                "interruptible": True,
+                "api_token": TOKEN,
+                "error": "allocation unavailable",
+            },
+        )
+
+    with _client(handler) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(Phase3FSafetyError, match="GPU_CAPACITY_RACE_NO_POD"):
+            session.execute(_request(), lambda _lease: None)
+        diagnostic = client.last_create_response_diagnostic
+
+    assert create_calls == 1
+    assert pod_list_calls == 3
+    assert session.last_audit is not None
+    assert session.last_audit.create_attempts == 1
+    assert session.last_audit.termination_attempts == 0
+    assert session.last_audit.termination_verified is True
+    assert diagnostic is not None
+    assert diagnostic.http_status == status
+    assert diagnostic.id_present is False
+    assert diagnostic.classification == "provider_error_object"
+    assert "api_token" not in diagnostic.top_level_keys
+    assert "<redacted-key>" in diagnostic.top_level_keys
+    assert TOKEN not in repr(diagnostic.to_public_dict())
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (401, "RUNPOD_AUTH_INVALID"),
+        (403, "RUNPOD_PERMISSION_DENIED"),
+        (429, "RUNPOD_RATE_LIMITED"),
+        (500, "RUNPOD_PROVIDER_ERROR"),
+        (503, "RUNPOD_PROVIDER_ERROR"),
+    ],
+)
+def test_non_success_create_status_has_stable_sanitized_classification(
+    status: int,
+    code: str,
+) -> None:
+    create_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        create_calls += 1
+        return httpx.Response(
+            status,
+            json={"interruptible": "false", "secret": TOKEN, "message": "rejected"},
+        )
+
+    with (
+        _client(handler) as client,
+        pytest.raises(RunPodAPIError, match=code) as error,
+    ):
+        client.create_pod(_request())
+    diagnostic = client.last_create_response_diagnostic
+
+    assert create_calls == 1
+    assert diagnostic is not None
+    assert diagnostic.http_status == status
+    assert diagnostic.id_present is False
+    assert diagnostic.interruptible_json_type == "string"
+    assert diagnostic.classification == "provider_error_object"
+    assert TOKEN not in str(error.value)
+    assert TOKEN not in repr(diagnostic.to_public_dict())
 
 
 def test_create_never_retries_a_server_failure() -> None:
@@ -665,7 +962,7 @@ def test_create_never_retries_a_server_failure() -> None:
 
     with (
         _client(handler) as client,
-        pytest.raises(RunPodAPIError, match="unexpected_status_503") as error,
+        pytest.raises(RunPodAPIError, match="RUNPOD_PROVIDER_ERROR") as error,
     ):
         client.create_pod(_request())
     assert create_calls == 1

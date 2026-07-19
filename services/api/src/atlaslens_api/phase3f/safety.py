@@ -19,7 +19,8 @@ ABSOLUTE_BUDGET_USD = Decimal("10")
 MAX_HOURLY_COST_USD = Decimal("0.50")
 MAX_RUNTIME_SECONDS = 5 * 60 * 60 + 45 * 60
 
-_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SAFE_RESOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,190}$")
+_SAFE_MARKER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_GPU_TYPE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._():+-]{0,190}$")
 _SENSITIVE_KEY = re.compile(
     r"(?:authorization|cookie|credential|password|secret|token|api[-_]?key)", re.I
@@ -175,9 +176,9 @@ class PodRecord:
     run_marker: str | None = None
 
     def __post_init__(self) -> None:
-        _require(bool(_SAFE_ID.fullmatch(self.pod_id)), "pod_id_invalid")
+        _require(bool(_SAFE_RESOURCE_ID.fullmatch(self.pod_id)), "pod_id_invalid")
         if self.run_marker is not None:
-            _require(bool(_SAFE_ID.fullmatch(self.run_marker)), "run_marker_invalid")
+            _require(bool(_SAFE_MARKER.fullmatch(self.run_marker)), "run_marker_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,8 +220,8 @@ class PodRequest:
     public_ports: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        _require(bool(_SAFE_ID.fullmatch(self.run_marker)), "run_marker_invalid")
-        _require(bool(_SAFE_ID.fullmatch(self.idempotency_key)), "idempotency_key_invalid")
+        _require(bool(_SAFE_MARKER.fullmatch(self.run_marker)), "run_marker_invalid")
+        _require(bool(_SAFE_MARKER.fullmatch(self.idempotency_key)), "idempotency_key_invalid")
         hourly = _decimal(self.hourly_cost_usd, "hourly_cost_invalid")
         if self.gpu_type_id is not None:
             _require(
@@ -358,6 +359,9 @@ class SinglePodSession:
             value = operation(RunPodLease(created, request, self._policy))
             operation_completed = True
         except BaseException as exc:
+            failed_pod = getattr(exc, "pod_record", None)
+            if isinstance(failed_pod, PodRecord):
+                created = failed_pod
             operation_error = exc
 
         cleanup_error = self._cleanup(request.run_marker, before, created)
