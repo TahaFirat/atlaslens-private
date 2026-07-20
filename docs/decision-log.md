@@ -1,5 +1,39 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F attests GPU allocation after eventual consistency
+
+- Context: The latest bounded run was reported with HTTP 201, an atomically
+  receipt-bound Pod ID and a create representation containing top-level
+  `machine` but no top-level `gpu`. The immediate `gpu`-object requirement raised
+  `create_response_gpu_invalid`; the exact bound Pod was terminated and the four
+  inventories returned to zero. Its v2 receipt proves binding and records the
+  `terminated`/`cleanup_verified=true` state but not the provider termination
+  call or full inventory response. Those results and the machine/no-gpu shape
+  come from the sanitized operator evidence rather than the receipt body.
+- Decision: Treat create-time allocation fields as provisional. After binding
+  the HTTP-201 ID, poll authenticated `GET /pods/{id}?includeMachine=true` on a
+  monotonic deadline no longer than 180 seconds, without another POST. Normalize
+  exact GPU identity only from RunPod's documented `gpu.id`,
+  `machine.gpuTypeId`, or `machine.gpuType.id`; normalize assigned count only
+  from `gpu.count` or `machine.gpuType.count`. All recognized paths must agree.
+  Require the exact ID/name, `RUNNING`, count one, on-demand price evidence,
+  non-interruptible evidence, public allocation and an inventory containing only
+  the bound Pod with no endpoint, network volume or template. Missing/null
+  provisioning fields remain pending; mismatches fail immediately; timeout is
+  `POD_GPU_ATTESTATION_TIMEOUT`.
+- Alternatives: Spend another paid create to discover schema timing; accept a
+  display name or `machine.minPodGpuCount`; trust create intent without an
+  authenticated allocation representation; poll without a wall deadline; retry
+  POST; terminate Pods by shared marker instead of exact bound ID.
+- Consequences: Receipt v2 retains backward read compatibility and atomically
+  records sanitized create class, normalized path, poll count/time, status,
+  selected/observed allowlisted GPU or mismatch hash, count, price evidence and
+  outcome. Failure telemetry cannot replace the exact cleanup carrier. Cleanup
+  is true only after Pod, endpoint, network-volume and template inventories all
+  match their pre-create state. The offline fixture captures the live sanitized
+  machine/no-gpu shape; no provider mutation is required for schema discovery.
+- Target phase: Product Phase 3F bounded RunPod pilot only.
+
 ## 2026-07-20 - Phase 3F accepts bounded on-demand attestation when RunPod omits interruptible
 
 - Context: Run `f3a1a535bc90d1954a19377a01e66a55` was reported with HTTP 201,

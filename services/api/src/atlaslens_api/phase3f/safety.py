@@ -394,15 +394,14 @@ class SinglePodSession:
 
     def _cleanup(
         self,
-        marker: str,
+        _marker: str,
         before: PodInventory,
         created: PodRecord | None,
     ) -> Phase3FSafetyError | None:
         termination_ids: set[str] = set()
         discovery_failed = False
         try:
-            current = PodInventory.capture(self._safe_list("cleanup_inventory_unavailable"))
-            termination_ids.update(item.pod_id for item in current.for_marker(marker))
+            PodInventory.capture(self._safe_list("cleanup_inventory_unavailable"))
         except Phase3FSafetyError:
             discovery_failed = True
         if created is not None:

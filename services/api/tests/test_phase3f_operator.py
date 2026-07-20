@@ -25,6 +25,7 @@ from atlaslens_api.phase3f.operator import (
 from atlaslens_api.phase3f.runpod import (
     GPUAvailabilityReport,
     GPUOffer,
+    PodGPUAttestationProgressDiagnostic,
     PodRentalAttestationDiagnostic,
     RunPodInventory,
 )
@@ -150,12 +151,53 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
         get_interruptible_json_type="missing",
         pod_inventory_count=1,
         explicit_false_source=None,
+        create_http_class="success_201",
+        normalized_gpu_path="machine.gpuTypeId",
+        gpu_poll_count=2,
+        gpu_poll_elapsed_seconds=1.0,
+        observed_gpu_id="NVIDIA RTX A5000",
+        gpu_count=1,
+        cost_attestation="graphql_uninterruptable_price_match",
+    )
+    pending = PodGPUAttestationProgressDiagnostic(
+        outcome="pending",
+        failure_code=None,
+        normalized_gpu_path="machine.gpuTypeId",
+        poll_count=2,
+        poll_elapsed_seconds=1.0,
+        final_desired_status="RUNNING",
+        expected_gpu_id="NVIDIA RTX A5000",
+        observed_gpu_id="NVIDIA RTX A5000",
+        gpu_count=1,
+        cost_attestation="graphql_uninterruptable_price_match",
+    )
+
+    module._record_operator_gpu_attestation_progress(
+        path,
+        expected_run_id=receipt.run_id,
+        diagnostic=pending,
     )
 
     module._record_operator_rental_attestation(
         path,
         expected_run_id=receipt.run_id,
         attestation=attestation,
+    )
+    module._record_operator_gpu_attestation_progress(
+        path,
+        expected_run_id=receipt.run_id,
+        diagnostic=PodGPUAttestationProgressDiagnostic(
+            outcome="attested",
+            failure_code=None,
+            normalized_gpu_path="machine.gpuTypeId",
+            poll_count=2,
+            poll_elapsed_seconds=1.0,
+            final_desired_status="RUNNING",
+            expected_gpu_id="NVIDIA RTX A5000",
+            observed_gpu_id="NVIDIA RTX A5000",
+            gpu_count=1,
+            cost_attestation="graphql_uninterruptable_price_match",
+        ),
     )
 
     recorded = read_operator_receipt(path)
@@ -168,6 +210,12 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
     assert recorded.create_cost_per_hr == Decimal("0.160")
     assert recorded.get_interruptible_json_type == "missing"
     assert recorded.pod_inventory_count == 1
+    assert recorded.gpu_attestation_outcome == "attested"
+    assert recorded.normalized_gpu_path == "machine.gpuTypeId"
+    assert recorded.gpu_poll_count == 2
+    assert recorded.observed_gpu_id == "NVIDIA RTX A5000"
+    assert recorded.gpu_count == 1
+    assert recorded.cost_attestation == "graphql_uninterruptable_price_match"
     assert recorded.to_dict()["secret_values_included"] is False
     assert "interruptible_field_verified" not in recorded.to_dict()
     assert not tuple(path.parent.glob("*.partial"))
@@ -196,6 +244,18 @@ def test_legacy_operator_receipt_remains_readable(tmp_path: Path) -> None:
         "get_interruptible_json_type",
         "pod_inventory_count",
         "explicit_false_source",
+        "gpu_attestation_outcome",
+        "gpu_attestation_failure_code",
+        "normalized_gpu_path",
+        "gpu_poll_count",
+        "gpu_poll_elapsed_seconds",
+        "final_desired_status",
+        "expected_gpu_id",
+        "observed_gpu_id",
+        "observed_gpu_id_sha256",
+        "gpu_count",
+        "cost_attestation",
+        "create_http_class",
     ):
         del payload[field]
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -205,6 +265,33 @@ def test_legacy_operator_receipt_remains_readable(tmp_path: Path) -> None:
     assert restored.pod_id == current.pod_id
     assert restored.pod_bound_at is None
     assert restored.rental_evidence is None
+
+
+def test_previous_v2_operator_receipt_remains_readable(tmp_path: Path) -> None:
+    path = tmp_path / "phase3f-current.json"
+    payload = _receipt().to_dict()
+    for field in (
+        "gpu_attestation_outcome",
+        "gpu_attestation_failure_code",
+        "normalized_gpu_path",
+        "gpu_poll_count",
+        "gpu_poll_elapsed_seconds",
+        "final_desired_status",
+        "expected_gpu_id",
+        "observed_gpu_id",
+        "observed_gpu_id_sha256",
+        "gpu_count",
+        "cost_attestation",
+        "create_http_class",
+    ):
+        del payload[field]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    restored = read_operator_receipt(path)
+
+    assert restored.pod_id == "phase3f-pod"
+    assert restored.gpu_attestation_outcome is None
+    assert restored.create_http_class is None
 
 
 def test_stale_or_live_operator_receipt_fails_closed(tmp_path: Path) -> None:

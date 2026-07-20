@@ -94,18 +94,22 @@ def test_operation_failure_still_terminates_and_session_cannot_retry() -> None:
     assert client.create_calls == 1
 
 
-def test_ambiguous_create_is_discovered_by_marker_and_terminated() -> None:
+def test_ambiguous_create_without_exact_id_is_not_marker_terminated() -> None:
     client = _RunPodStub()
     client.raise_after_create = True
     session = SinglePodSession(client)
 
-    with pytest.raises(RuntimeError, match="provider failed"):
+    with pytest.raises(Phase3FSafetyError, match="termination_not_verified"):
         session.execute(_request(), lambda _lease: None)
 
     assert client.create_calls == 1
-    assert client.terminate_calls == ["phase3f-pod"]
+    assert client.terminate_calls == []
+    assert client.pods == [
+        PodRecord("pre-existing", "another-run"),
+        PodRecord("phase3f-pod", "phase3f-run-001"),
+    ]
     assert session.last_audit is not None
-    assert session.last_audit.termination_verified is True
+    assert session.last_audit.termination_verified is False
 
 
 def test_capacity_race_has_zero_retry_and_restores_empty_inventory() -> None:

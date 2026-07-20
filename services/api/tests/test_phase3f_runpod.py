@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from atlaslens_api.phase3f.runpod import (
     POD_VOLUME_GB,
     REST_BASE_URL,
     GPUOffer,
+    PodGPUAttestationProgressDiagnostic,
     RunPodAPIError,
     RunPodConfig,
     RunPodCreateError,
@@ -39,6 +41,7 @@ PREFERENCES = (
 SSH_PUBLIC_KEY = "ssh-ed25519 " + "A" * 68 + " atlaslens-phase3f"
 _DEFAULT = object()
 _MISSING_FIELD = object()
+FIXTURES = Path(__file__).with_name("fixtures") / "phase3f"
 
 
 def _config(**overrides: object) -> RunPodConfig:
@@ -161,6 +164,39 @@ def _created_payload(
     return payload
 
 
+def _attested_pod_payload(
+    *,
+    interruptible: object = False,
+    cost_per_hr: object = "0.45",
+    gpu_shape: str = "gpu.id",
+    gpu_type_id: str = "NVIDIA RTX A5000",
+    gpu_count: int = 1,
+    desired_status: str = "RUNNING",
+) -> dict[str, object]:
+    payload = _created_payload(
+        interruptible=interruptible,
+        cost_per_hr=cost_per_hr,
+        gpu_type_id=gpu_type_id,
+        desired_status=desired_status,
+    )
+    payload["publicIp"] = "192.0.2.10"
+    payload["templateId"] = None
+    if gpu_shape == "machine.gpuTypeId":
+        payload.pop("gpu")
+        payload["machine"] = {
+            "gpuTypeId": gpu_type_id,
+            "gpuType": {"count": gpu_count},
+        }
+    elif gpu_shape == "machine.gpuType.id":
+        payload.pop("gpu")
+        payload["machine"] = {
+            "gpuType": {"id": gpu_type_id, "count": gpu_count}
+        }
+    else:
+        payload["gpu"] = {"id": gpu_type_id, "count": gpu_count}
+    return payload
+
+
 def _graphql_response(
     request: httpx.Request,
     *,
@@ -220,6 +256,17 @@ def _assert_secret_safe(request: httpx.Request) -> None:
     assert request.headers["Authorization"] == f"Bearer {TOKEN}"
     assert TOKEN not in str(request.url)
     assert request.url.query == b"" or b"api_key" not in request.url.query
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def test_inventory_lists_only_documented_rest_v1_resources() -> None:
@@ -648,11 +695,14 @@ def test_create_uses_minimal_official_gpu_payload_with_pod_volume() -> None:
         if str(request.url) == GRAPHQL_URL:
             return _graphql_response(request)
         if request.method == "GET":
-            assert request.url.path.endswith("/pods/created-pod")
-            return httpx.Response(
-                200,
-                json={"id": "created-pod", "interruptible": False},
-            )
+            if request.url.path.endswith("/pods/created-pod"):
+                return httpx.Response(200, json=_attested_pod_payload())
+            if request.url.path.endswith("/pods"):
+                return httpx.Response(
+                    200,
+                    json=[{"id": "created-pod", "name": "phase3f-run-001"}],
+                )
+            return httpx.Response(200, json=[])
         assert request.url.path.endswith("/pods")
         create_requests.append(request)
         body = json.loads(request.content)
@@ -742,7 +792,360 @@ def test_create_uses_minimal_official_gpu_payload_with_pod_volume() -> None:
     assert attestation is not None
     assert attestation.evidence == "explicit_interruptible_false"
     assert attestation.explicit_false_source == "create_response"
-    assert attestation.get_verification_http_status is None
+    assert attestation.get_verification_http_status == 200
+    assert attestation.normalized_gpu_path == "gpu.id"
+    assert attestation.gpu_poll_count == 1
+
+
+@pytest.mark.parametrize(
+    ("gpu_shape", "expected_path"),
+    [
+        ("machine.gpuTypeId", "machine.gpuTypeId"),
+        ("machine.gpuType.id", "machine.gpuType.id"),
+    ],
+)
+def test_sanitized_machine_only_create_fixture_polls_authenticated_gpu_shape(
+    gpu_shape: str,
+    expected_path: str,
+) -> None:
+    create_fixture = json.loads(
+        (FIXTURES / "runpod_create_201_machine_no_gpu.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    detail_calls = 0
+    post_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal detail_calls, post_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        path = request.url.path
+        if request.method == "POST":
+            post_calls += 1
+            return httpx.Response(201, json=create_fixture)
+        if path.endswith("/pods/created-pod"):
+            detail_calls += 1
+            if detail_calls == 1:
+                pending = _attested_pod_payload(gpu_shape=gpu_shape)
+                pending["machine"] = None
+                pending["publicIp"] = None
+                pending["desiredStatus"] = None
+                pending.pop("gpu", None)
+                return httpx.Response(200, json=pending)
+            return httpx.Response(
+                200,
+                json=_attested_pod_payload(gpu_shape=gpu_shape),
+            )
+        if path.endswith("/pods"):
+            return httpx.Response(
+                200,
+                json=[{"id": "created-pod", "name": "phase3f-run-001"}],
+            )
+        return httpx.Response(200, json=[])
+
+    clock = _FakeClock()
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    ) as client:
+        assert client.create_pod(_request()) == PodRecord(
+            "created-pod", "phase3f-run-001"
+        )
+        attestation = client.last_rental_attestation
+
+    assert post_calls == 1
+    assert detail_calls == 2
+    assert attestation is not None
+    assert attestation.normalized_gpu_path == expected_path
+    assert attestation.gpu_poll_count == 2
+    assert attestation.gpu_count == 1
+
+
+def test_progress_callback_failure_preserves_receipt_bound_cleanup_carrier() -> None:
+    pod_present = False
+    deleted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            pod_present = True
+            return httpx.Response(201, json=_created_payload())
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            pod_present = False
+            return httpx.Response(204)
+        if request.url.path.endswith("/pods"):
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        return httpx.Response(200, json=[])
+
+    def fail_receipt_write(_diagnostic: object) -> None:
+        raise OSError("simulated receipt write failure")
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        record_gpu_attestation_progress=fail_receipt_write,
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(
+            RunPodCreateError,
+            match="create_response_validation_failed",
+        ):
+            session.execute(_request(), lambda _lease: None)
+
+    assert deleted == ["/v1/pods/created-pod"]
+    assert pod_present is False
+    assert session.last_audit is not None
+    assert session.last_audit.termination_verified is True
+
+
+@pytest.mark.parametrize(
+    ("get_overrides", "expected_code"),
+    [
+        ({"gpu_type_id": "NVIDIA L4"}, "pod_gpu_attestation_gpu_mismatch"),
+        ({"gpu_count": 2}, "pod_gpu_attestation_gpu_count_mismatch"),
+        ({"cost_per_hr": "0.46"}, "pod_gpu_attestation_price_mismatch"),
+        ({"interruptible": True}, "pod_interruptible_true"),
+        ({"interruptible": 0}, "pod_interruptible_type_invalid"),
+        ({"interruptible": []}, "pod_interruptible_type_invalid"),
+        ({"interruptible": {}}, "pod_interruptible_type_invalid"),
+        ({"desired_status": "EXITED"}, "pod_gpu_attestation_status_mismatch"),
+    ],
+)
+def test_authenticated_poll_mismatch_fails_once_and_terminates_bound_pod(
+    get_overrides: dict[str, object],
+    expected_code: str,
+) -> None:
+    create_fixture = json.loads(
+        (FIXTURES / "runpod_create_201_machine_no_gpu.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    pod_present = False
+    post_calls = 0
+    deleted: list[str] = []
+    progress: list[PodGPUAttestationProgressDiagnostic] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present, post_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        path = request.url.path
+        if request.method == "POST":
+            post_calls += 1
+            pod_present = True
+            return httpx.Response(201, json=create_fixture)
+        if request.method == "DELETE":
+            deleted.append(path)
+            pod_present = False
+            return httpx.Response(204)
+        if path.endswith("/pods/created-pod"):
+            return httpx.Response(200, json=_attested_pod_payload(**get_overrides))
+        if path.endswith("/pods"):
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        return httpx.Response(200, json=[])
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        record_gpu_attestation_progress=progress.append,
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(RunPodCreateError, match=expected_code):
+            session.execute(_request(), lambda _lease: None)
+
+    assert post_calls == 1
+    assert deleted == ["/v1/pods/created-pod"]
+    assert pod_present is False
+    final_progress = progress[-1]
+    assert final_progress.outcome == "failed"
+    assert final_progress.poll_count == 1
+    if expected_code == "pod_gpu_attestation_gpu_mismatch":
+        assert final_progress.observed_gpu_id is None
+        assert final_progress.observed_gpu_id_sha256 == hashlib.sha256(
+            b"NVIDIA L4"
+        ).hexdigest()
+        assert "NVIDIA L4" not in repr(final_progress.to_public_dict())
+
+
+@pytest.mark.parametrize("invalid_value", [0, [], {}])
+def test_invalid_create_interruptible_type_terminates_exact_bound_pod(
+    invalid_value: object,
+) -> None:
+    pod_present = False
+    post_calls = 0
+    deleted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present, post_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        path = request.url.path
+        if request.method == "POST":
+            post_calls += 1
+            pod_present = True
+            return httpx.Response(
+                201,
+                json=_created_payload(interruptible=invalid_value),
+            )
+        if request.method == "DELETE":
+            deleted.append(path)
+            pod_present = False
+            return httpx.Response(204)
+        if path.endswith("/pods"):
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        return httpx.Response(200, json=[])
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(
+            RunPodCreateError,
+            match="create_response_interruptible_invalid",
+        ):
+            session.execute(_request(), lambda _lease: None)
+
+    assert post_calls == 1
+    assert deleted == ["/v1/pods/created-pod"]
+    assert pod_present is False
+
+
+def test_gpu_attestation_timeout_is_bounded_and_never_retries_create() -> None:
+    create_fixture = json.loads(
+        (FIXTURES / "runpod_create_201_machine_no_gpu.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    pod_present = False
+    post_calls = 0
+    detail_calls = 0
+    deleted: list[str] = []
+    clock = _FakeClock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present, post_calls, detail_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        path = request.url.path
+        if request.method == "POST":
+            post_calls += 1
+            pod_present = True
+            return httpx.Response(201, json=create_fixture)
+        if request.method == "DELETE":
+            deleted.append(path)
+            pod_present = False
+            return httpx.Response(204)
+        if path.endswith("/pods/created-pod"):
+            detail_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "id": "created-pod",
+                    "name": "phase3f-run-001",
+                    "desiredStatus": None,
+                    "machine": None,
+                    "publicIp": None,
+                    "endpointId": None,
+                    "networkVolume": None,
+                    "templateId": None,
+                },
+            )
+        if path.endswith("/pods"):
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        return httpx.Response(200, json=[])
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        attestation_timeout_seconds=10,
+        attestation_poll_seconds=5,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(RunPodCreateError, match="POD_GPU_ATTESTATION_TIMEOUT"):
+            session.execute(_request(), lambda _lease: None)
+        progress = client.last_gpu_attestation_progress
+
+    assert post_calls == 1
+    assert detail_calls == 2
+    assert deleted == ["/v1/pods/created-pod"]
+    assert progress is not None
+    assert progress.outcome == "failed"
+    assert progress.poll_elapsed_seconds == 10
+
+
+def test_pod_disappearing_during_authenticated_poll_fails_closed() -> None:
+    create_fixture = json.loads(
+        (FIXTURES / "runpod_create_201_machine_no_gpu.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    post_calls = 0
+    delete_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls, delete_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            post_calls += 1
+            return httpx.Response(201, json=create_fixture)
+        if request.method == "DELETE":
+            delete_calls += 1
+            return httpx.Response(404, json={"code": "NOT_FOUND"})
+        if request.url.path.endswith("/pods/created-pod"):
+            return httpx.Response(404, json={"code": "NOT_FOUND"})
+        return httpx.Response(200, json=[])
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(
+            RunPodCreateError,
+            match="POD_GPU_ATTESTATION_POD_MISSING",
+        ):
+            session.execute(_request(), lambda _lease: None)
+
+    assert post_calls == 1
+    assert delete_calls == 1
+    assert session.last_audit is not None
+    assert session.last_audit.termination_verified is True
 
 
 def test_offline_create_contract_accepts_twenty_gib_pod_volume() -> None:
@@ -823,11 +1226,14 @@ def test_indeterminate_create_interruptible_uses_authenticated_get_verification(
             return _graphql_response(request)
         if request.method == "GET":
             get_calls += 1
-            assert request.url.path.endswith("/pods/created-pod")
-            return httpx.Response(
-                200,
-                json={"id": "created-pod", "interruptible": False},
-            )
+            if request.url.path.endswith("/pods/created-pod"):
+                return httpx.Response(200, json=_attested_pod_payload())
+            if request.url.path.endswith("/pods"):
+                return httpx.Response(
+                    200,
+                    json=[{"id": "created-pod", "name": "phase3f-run-001"}],
+                )
+            return httpx.Response(200, json=[])
         assert request.method == "POST"
         return httpx.Response(
             201,
@@ -846,7 +1252,7 @@ def test_indeterminate_create_interruptible_uses_authenticated_get_verification(
 
     assert pod == PodRecord("created-pod", "phase3f-run-001")
     assert bound == [pod]
-    assert get_calls == 1
+    assert get_calls == 5
     assert diagnostic is not None
     assert diagnostic.http_status == 201
     assert diagnostic.id_present is True
@@ -906,7 +1312,10 @@ def test_indeterminate_fields_attest_on_demand_price_within_tolerance_and_cleanu
             pod_present = False
             return httpx.Response(204)
         if path.endswith("/pods/created-pod"):
-            payload: dict[str, object] = {"id": "created-pod"}
+            payload = _attested_pod_payload(
+                interruptible=interruptible_value,
+                cost_per_hr=cost_per_hr,
+            )
             if interruptible_value is not _MISSING_FIELD:
                 payload["interruptible"] = interruptible_value
             return httpx.Response(200, json=payload)
@@ -961,7 +1370,7 @@ def test_indeterminate_fields_attest_on_demand_price_within_tolerance_and_cleanu
 @pytest.mark.parametrize(
     ("payload_overrides", "expected_code"),
     [
-        ({"cost_per_hr": "0.46"}, "create_response_on_demand_price_mismatch"),
+        ({"cost_per_hr": "0.46"}, "pod_gpu_attestation_price_mismatch"),
         ({"gpu_type_id": "NVIDIA L4"}, "create_response_gpu_mismatch"),
         ({"desired_status": "EXITED"}, "create_response_desired_status_invalid"),
     ],

@@ -11,8 +11,10 @@ import hashlib
 import ipaddress
 import json
 import re
+import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Final, cast
 
@@ -30,6 +32,8 @@ GRAPHQL_URL: Final = "https://api.runpod.io/graphql"
 MAX_CONTAINER_DISK_GB: Final = 40
 POD_VOLUME_GB: Final = 20
 ON_DEMAND_PRICE_TOLERANCE_USD: Final = Decimal("0.005")
+POD_GPU_ATTESTATION_TIMEOUT_SECONDS: Final = 180.0
+POD_GPU_ATTESTATION_POLL_SECONDS: Final = 5.0
 MIN_GPU_MEMORY_GB: Final = 16
 MAX_RESPONSE_BYTES: Final = 2 * 1024 * 1024
 _RESOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,190}$")
@@ -606,6 +610,13 @@ class PodRentalAttestationDiagnostic:
     get_interruptible_json_type: str | None
     pod_inventory_count: int | None
     explicit_false_source: str | None
+    create_http_class: str
+    normalized_gpu_path: str
+    gpu_poll_count: int
+    gpu_poll_elapsed_seconds: float
+    observed_gpu_id: str
+    gpu_count: int
+    cost_attestation: str
     secret_free: bool = True
 
     def to_public_dict(self) -> dict[str, object]:
@@ -628,6 +639,47 @@ class PodRentalAttestationDiagnostic:
             "get_interruptible_json_type": self.get_interruptible_json_type,
             "pod_inventory_count": self.pod_inventory_count,
             "explicit_false_source": self.explicit_false_source,
+            "create_http_class": self.create_http_class,
+            "normalized_gpu_path": self.normalized_gpu_path,
+            "gpu_poll_count": self.gpu_poll_count,
+            "gpu_poll_elapsed_seconds": self.gpu_poll_elapsed_seconds,
+            "observed_gpu_id": self.observed_gpu_id,
+            "gpu_count": self.gpu_count,
+            "cost_attestation": self.cost_attestation,
+            "secret_free": self.secret_free,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PodGPUAttestationProgressDiagnostic:
+    outcome: str
+    failure_code: str | None
+    normalized_gpu_path: str | None
+    poll_count: int
+    poll_elapsed_seconds: float
+    final_desired_status: str | None
+    expected_gpu_id: str
+    observed_gpu_id: str | None
+    gpu_count: int | None
+    cost_attestation: str | None
+    observed_gpu_id_sha256: str | None = None
+    create_http_class: str = "success_201"
+    secret_free: bool = True
+
+    def to_public_dict(self) -> dict[str, object]:
+        return {
+            "gpu_attestation_outcome": self.outcome,
+            "gpu_attestation_failure_code": self.failure_code,
+            "normalized_gpu_path": self.normalized_gpu_path,
+            "gpu_poll_count": self.poll_count,
+            "gpu_poll_elapsed_seconds": self.poll_elapsed_seconds,
+            "final_desired_status": self.final_desired_status,
+            "expected_gpu_id": self.expected_gpu_id,
+            "observed_gpu_id": self.observed_gpu_id,
+            "observed_gpu_id_sha256": self.observed_gpu_id_sha256,
+            "gpu_count": self.gpu_count,
+            "cost_attestation": self.cost_attestation,
+            "create_http_class": self.create_http_class,
             "secret_free": self.secret_free,
         }
 
@@ -663,6 +715,13 @@ class RunPodV1Client:
         record_rental_attestation: (
             Callable[[PodRentalAttestationDiagnostic], None] | None
         ) = None,
+        record_gpu_attestation_progress: (
+            Callable[[PodGPUAttestationProgressDiagnostic], None] | None
+        ) = None,
+        attestation_timeout_seconds: float = POD_GPU_ATTESTATION_TIMEOUT_SECONDS,
+        attestation_poll_seconds: float = POD_GPU_ATTESTATION_POLL_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         _require(
             bool(api_token)
@@ -672,6 +731,14 @@ class RunPodV1Client:
             "api_token_invalid",
         )
         _require(0 < timeout_seconds <= 30, "timeout_invalid")
+        _require(
+            0 < attestation_timeout_seconds <= POD_GPU_ATTESTATION_TIMEOUT_SECONDS,
+            "attestation_timeout_invalid",
+        )
+        _require(
+            0 < attestation_poll_seconds <= 30,
+            "attestation_poll_invalid",
+        )
         self._api_token = api_token
         self._config = config
         self._last_offer: GPUOffer | None = None
@@ -680,8 +747,16 @@ class RunPodV1Client:
         self._last_created_hourly_price: Decimal | None = None
         self._last_create_response_diagnostic: CreateResponseDiagnostic | None = None
         self._last_rental_attestation: PodRentalAttestationDiagnostic | None = None
+        self._last_gpu_attestation_progress: (
+            PodGPUAttestationProgressDiagnostic | None
+        ) = None
         self._bind_created_pod = bind_created_pod
         self._record_rental_attestation = record_rental_attestation
+        self._record_gpu_attestation_progress = record_gpu_attestation_progress
+        self._attestation_timeout_seconds = attestation_timeout_seconds
+        self._attestation_poll_seconds = attestation_poll_seconds
+        self._monotonic = monotonic
+        self._sleep = sleep
         self._api_request_count = 0
         self._cloud_mutation_count = 0
         self._client = httpx.Client(
@@ -727,6 +802,12 @@ class RunPodV1Client:
     @property
     def last_rental_attestation(self) -> PodRentalAttestationDiagnostic | None:
         return self._last_rental_attestation
+
+    @property
+    def last_gpu_attestation_progress(
+        self,
+    ) -> PodGPUAttestationProgressDiagnostic | None:
+        return self._last_gpu_attestation_progress
 
     @property
     def api_request_count(self) -> int:
@@ -1308,6 +1389,7 @@ class RunPodV1Client:
             max_hourly_price=request.hourly_cost_usd,
         )
         self._last_offer = offer
+        self._last_gpu_attestation_progress = None
         create_payload, _contract = build_create_payload(self._config, request, offer)
         self._cloud_mutation_count += 1
         payload = self._request_json(
@@ -1342,132 +1424,502 @@ class RunPodV1Client:
             )
             returned_ports = _sequence(row.get("ports"), "create_response_ports_invalid")
             _require(set(returned_ports).issubset({"22/tcp"}), "create_response_ports_invalid")
-            gpu = _object(row.get("gpu"), "create_response_gpu_invalid")
-            _require(
-                gpu.get("count") == 1 and gpu.get("id") == offer.gpu_type_id,
-                "create_response_gpu_mismatch",
-            )
-            _require(
-                row.get("desiredStatus") == "RUNNING",
-                "create_response_desired_status_invalid",
-            )
-            actual_price = _decimal(row.get("costPerHr"), "create_response_price_invalid")
-            price_delta = abs(actual_price - offer.hourly_price)
-            _require(
-                Decimal("0") < actual_price <= request.hourly_cost_usd,
-                "create_response_price_exceeded",
-            )
-            _require(
-                price_delta <= ON_DEMAND_PRICE_TOLERANCE_USD,
-                "create_response_on_demand_price_mismatch",
-            )
-            attestation = self._validate_rental_evidence(
-                row,
+            attestation = self._poll_allocated_pod(
+                create_row=row,
                 created=created,
                 request_interruptible=create_payload.get("interruptible", _MISSING),
+                request=request,
                 offer=offer,
-                actual_price=actual_price,
-                price_delta=price_delta,
             )
             self._last_rental_attestation = attestation
             if self._record_rental_attestation is not None:
                 self._record_rental_attestation(attestation)
-            self._last_created_hourly_price = actual_price
-        except RunPodCreateError:
-            raise
+            progress = self._last_gpu_attestation_progress
+            if progress is not None:
+                self._record_gpu_progress(replace(progress, outcome="attested"))
+            self._last_created_hourly_price = attestation.create_cost_per_hr
         except RunPodAPIError as exc:
+            self._fail_gpu_attestation_progress(exc.code)
             raise RunPodCreateError(exc.code, created) from None
         except BaseException:
+            self._fail_gpu_attestation_progress("create_response_validation_failed")
             raise RunPodCreateError("create_response_validation_failed", created) from None
         return created
 
-    def _validate_rental_evidence(
+    def _poll_allocated_pod(
         self,
-        row: Mapping[str, object],
         *,
+        create_row: Mapping[str, object],
         created: PodRecord,
         request_interruptible: object,
+        request: PodRequest,
         offer: GPUOffer,
-        actual_price: Decimal,
-        price_delta: Decimal,
     ) -> PodRentalAttestationDiagnostic:
         _require(request_interruptible is False, "create_request_interruptible_invalid")
-        create_value = row.get("interruptible", _MISSING)
-        create_present = "interruptible" in row
+        create_value = create_row.get("interruptible", _MISSING)
+        create_present = "interruptible" in create_row
         create_type = _json_type(create_value)
+        self._record_gpu_progress(
+            PodGPUAttestationProgressDiagnostic(
+                outcome="pending",
+                failure_code=None,
+                normalized_gpu_path=None,
+                poll_count=0,
+                poll_elapsed_seconds=0.0,
+                final_desired_status=None,
+                expected_gpu_id=offer.gpu_type_id,
+                observed_gpu_id=None,
+                gpu_count=None,
+                cost_attestation=None,
+            )
+        )
+        _require(
+            create_type in {"boolean", "missing", "null", "string"},
+            "create_response_interruptible_invalid",
+        )
+        create_gpu_id, create_gpu_path, create_gpu_count = self._normalized_gpu(
+            create_row
+        )
+        self._record_gpu_progress(
+            PodGPUAttestationProgressDiagnostic(
+                outcome="pending",
+                failure_code=None,
+                normalized_gpu_path=create_gpu_path,
+                poll_count=0,
+                poll_elapsed_seconds=0.0,
+                final_desired_status=(
+                    cast(str, create_row.get("desiredStatus"))
+                    if create_row.get("desiredStatus")
+                    in {"RUNNING", "EXITED", "TERMINATED"}
+                    else None
+                ),
+                expected_gpu_id=offer.gpu_type_id,
+                observed_gpu_id=(
+                    create_gpu_id if create_gpu_id == offer.gpu_type_id else None
+                ),
+                gpu_count=create_gpu_count,
+                cost_attestation=None,
+                observed_gpu_id_sha256=(
+                    hashlib.sha256(create_gpu_id.encode("utf-8")).hexdigest()
+                    if create_gpu_id is not None
+                    and create_gpu_id != offer.gpu_type_id
+                    else None
+                ),
+            )
+        )
+        if create_gpu_id is not None:
+            _require(
+                create_gpu_id == offer.gpu_type_id,
+                "create_response_gpu_mismatch",
+            )
+        if create_gpu_count is not None:
+            _require(create_gpu_count == 1, "create_response_gpu_count_mismatch")
+        create_desired = create_row.get("desiredStatus", _MISSING)
+        if create_desired is not _MISSING and create_desired is not None:
+            _require(
+                create_desired == "RUNNING",
+                "create_response_desired_status_invalid",
+            )
         if create_value is True:
             raise RunPodAPIError("create_response_interruptible_true")
-        if create_value is False:
-            return self._rental_attestation(
-                evidence="explicit_interruptible_false",
-                request_interruptible=False,
-                offer=offer,
-                actual_price=actual_price,
-                price_delta=price_delta,
-                create_present=create_present,
-                create_type=create_type,
-                get_status=None,
-                get_present=None,
-                get_type=None,
-                pod_inventory_count=None,
-                explicit_false_source="create_response",
-            )
-        payload = self._request_json(
-            "GET",
-            f"pods/{created.pod_id}",
-            expected_status=200,
-            params={"includeMachine": "true", "includeNetworkVolume": "true"},
-        )
-        verified = _object(payload, "pod_interruptible_verification_failed")
-        _require(
-            verified.get("id") == created.pod_id,
-            "pod_interruptible_verification_failed",
-        )
-        get_value = verified.get("interruptible", _MISSING)
-        get_present = "interruptible" in verified
-        get_type = _json_type(get_value)
-        if get_value is True:
-            raise RunPodAPIError("pod_interruptible_true")
-        if get_value is False:
-            return self._rental_attestation(
-                evidence="explicit_interruptible_false",
-                request_interruptible=False,
-                offer=offer,
-                actual_price=actual_price,
-                price_delta=price_delta,
-                create_present=create_present,
-                create_type=create_type,
-                get_status=200,
-                get_present=get_present,
-                get_type=get_type,
-                pod_inventory_count=None,
-                explicit_false_source="authenticated_get",
-            )
-        inventory = self.inventory()
-        _require(
-            inventory.pods == (created,),
-            "pod_attestation_inventory_mismatch",
-        )
-        _require(
-            not inventory.endpoint_ids
-            and not inventory.network_volume_ids
-            and not inventory.template_ids,
-            "pod_attestation_related_resource_present",
-        )
-        return self._rental_attestation(
-            evidence="request_and_on_demand_price_attested",
-            request_interruptible=False,
+        create_price = self._optional_attested_price(
+            create_row,
             offer=offer,
-            actual_price=actual_price,
-            price_delta=price_delta,
-            create_present=create_present,
-            create_type=create_type,
-            get_status=200,
-            get_present=get_present,
-            get_type=get_type,
-            pod_inventory_count=1,
-            explicit_false_source=None,
+            maximum=request.hourly_cost_usd,
         )
+        started = self._monotonic()
+        deadline = started + self._attestation_timeout_seconds
+        poll_count = 0
+        while True:
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                current = self._last_gpu_attestation_progress
+                if current is not None:
+                    self._last_gpu_attestation_progress = replace(
+                        current,
+                        poll_elapsed_seconds=self._attestation_timeout_seconds,
+                    )
+                raise RunPodAPIError("POD_GPU_ATTESTATION_TIMEOUT")
+            poll_count += 1
+            try:
+                payload = self._request_json(
+                    "GET",
+                    f"pods/{created.pod_id}",
+                    expected_status=200,
+                    params={"includeMachine": "true", "includeNetworkVolume": "true"},
+                    timeout_seconds=min(remaining, 30.0),
+                )
+            except RunPodAPIError as exc:
+                if exc.code == "unexpected_status_404":
+                    raise RunPodAPIError("POD_GPU_ATTESTATION_POD_MISSING") from None
+                raise
+            verified = _object(payload, "pod_gpu_attestation_response_invalid")
+            _require(verified.get("id") == created.pod_id, "pod_gpu_attestation_id_mismatch")
+
+            marker = verified.get("name", _MISSING)
+            get_value = verified.get("interruptible", _MISSING)
+            get_present = "interruptible" in verified
+            get_type = _json_type(get_value)
+            desired = verified.get("desiredStatus", _MISSING)
+            gpu_id, gpu_path, gpu_count = self._normalized_gpu(verified)
+            elapsed = max(0.0, self._monotonic() - started)
+            self._record_gpu_progress(
+                PodGPUAttestationProgressDiagnostic(
+                    outcome="pending",
+                    failure_code=None,
+                    normalized_gpu_path=gpu_path,
+                    poll_count=poll_count,
+                    poll_elapsed_seconds=min(
+                        elapsed, POD_GPU_ATTESTATION_TIMEOUT_SECONDS
+                    ),
+                    final_desired_status=(
+                        cast(str, desired)
+                        if desired in {"RUNNING", "EXITED", "TERMINATED"}
+                        else None
+                    ),
+                    expected_gpu_id=offer.gpu_type_id,
+                    observed_gpu_id=(
+                        gpu_id if gpu_id == offer.gpu_type_id else None
+                    ),
+                    gpu_count=gpu_count,
+                    cost_attestation=None,
+                    observed_gpu_id_sha256=(
+                        hashlib.sha256(gpu_id.encode("utf-8")).hexdigest()
+                        if gpu_id is not None and gpu_id != offer.gpu_type_id
+                        else None
+                    ),
+                )
+            )
+            _require(
+                get_type in {"boolean", "missing", "null", "string"},
+                "pod_interruptible_type_invalid",
+            )
+            if marker is not _MISSING and marker is not None:
+                _require(marker == request.run_marker, "pod_gpu_attestation_marker_mismatch")
+            if get_value is True:
+                raise RunPodAPIError("pod_interruptible_true")
+            if desired is not _MISSING and desired is not None:
+                _require(desired == "RUNNING", "pod_gpu_attestation_status_mismatch")
+            machine_value = verified.get("machine", _MISSING)
+            if isinstance(machine_value, Mapping):
+                secure_cloud = machine_value.get("secureCloud", _MISSING)
+                if secure_cloud is not _MISSING and secure_cloud is not None:
+                    _require(
+                        isinstance(secure_cloud, bool)
+                        and secure_cloud == (offer.cloud_type == "SECURE"),
+                        "pod_gpu_attestation_cloud_type_mismatch",
+                    )
+            if gpu_id is not None:
+                _require(gpu_id == offer.gpu_type_id, "pod_gpu_attestation_gpu_mismatch")
+            if gpu_count is not None:
+                _require(gpu_count == 1, "pod_gpu_attestation_gpu_count_mismatch")
+
+            observed_price = self._optional_attested_price(
+                verified,
+                offer=offer,
+                maximum=request.hourly_cost_usd,
+            )
+            if create_price is not None and observed_price is not None:
+                _require(
+                    abs(create_price - observed_price)
+                    <= ON_DEMAND_PRICE_TOLERANCE_USD,
+                    "pod_gpu_attestation_price_mismatch",
+                )
+            actual_price = observed_price if observed_price is not None else create_price
+
+            public_ip = verified.get("publicIp", _MISSING)
+            if public_ip is not _MISSING and public_ip is not None:
+                _require(
+                    isinstance(public_ip, str) and bool(public_ip.strip()),
+                    "pod_gpu_attestation_public_ip_invalid",
+                )
+
+            _require(
+                verified.get("endpointId") is None,
+                "pod_attestation_related_resource_present",
+            )
+            _require(
+                verified.get("networkVolume") is None
+                and verified.get("networkVolumeId") is None,
+                "pod_attestation_related_resource_present",
+            )
+            _require(
+                verified.get("templateId") is None,
+                "pod_attestation_related_resource_present",
+            )
+
+            inventory = self._attestation_inventory(deadline)
+            if inventory.pods:
+                _require(
+                    len(inventory.pods) == 1
+                    and inventory.pods[0].pod_id == created.pod_id,
+                    "pod_attestation_inventory_mismatch",
+                )
+                inventory_marker = inventory.pods[0].run_marker
+                _require(
+                    inventory_marker is None or inventory_marker == request.run_marker,
+                    "pod_attestation_inventory_mismatch",
+                )
+            _require(
+                not inventory.endpoint_ids
+                and not inventory.network_volume_ids
+                and not inventory.template_ids,
+                "pod_attestation_related_resource_present",
+            )
+
+            ready = (
+                marker == request.run_marker
+                and desired == "RUNNING"
+                and gpu_id is not None
+                and gpu_path is not None
+                and gpu_count == 1
+                and actual_price is not None
+                and isinstance(public_ip, str)
+                and bool(public_ip.strip())
+                and len(inventory.pods) == 1
+                and inventory.pods[0].pod_id == created.pod_id
+            )
+            elapsed = max(0.0, self._monotonic() - started)
+            cost_attestation = (
+                "graphql_uninterruptable_price_match"
+                if actual_price is not None
+                else None
+            )
+            self._record_gpu_progress(
+                PodGPUAttestationProgressDiagnostic(
+                    outcome="pending",
+                    failure_code=None,
+                    normalized_gpu_path=gpu_path,
+                    poll_count=poll_count,
+                    poll_elapsed_seconds=min(
+                        elapsed, POD_GPU_ATTESTATION_TIMEOUT_SECONDS
+                    ),
+                    final_desired_status=(
+                        cast(str, desired)
+                        if desired in {"RUNNING", "EXITED", "TERMINATED"}
+                        else None
+                    ),
+                    expected_gpu_id=offer.gpu_type_id,
+                    observed_gpu_id=(
+                        gpu_id if gpu_id == offer.gpu_type_id else None
+                    ),
+                    gpu_count=gpu_count,
+                    cost_attestation=cost_attestation,
+                    observed_gpu_id_sha256=(
+                        hashlib.sha256(gpu_id.encode("utf-8")).hexdigest()
+                        if gpu_id is not None and gpu_id != offer.gpu_type_id
+                        else None
+                    ),
+                )
+            )
+            if elapsed >= self._attestation_timeout_seconds:
+                current = self._last_gpu_attestation_progress
+                if current is not None:
+                    self._last_gpu_attestation_progress = replace(
+                        current,
+                        poll_elapsed_seconds=self._attestation_timeout_seconds,
+                    )
+                raise RunPodAPIError("POD_GPU_ATTESTATION_TIMEOUT")
+            if ready:
+                attested_price = cast(Decimal, actual_price)
+                attested_gpu_path = cast(str, gpu_path)
+                attested_gpu_id = cast(str, gpu_id)
+                price_delta = abs(attested_price - offer.hourly_price)
+                evidence = (
+                    "explicit_interruptible_false"
+                    if create_value is False or get_value is False
+                    else "request_and_on_demand_price_attested"
+                )
+                false_source = (
+                    "create_response"
+                    if create_value is False
+                    else "authenticated_get"
+                    if get_value is False
+                    else None
+                )
+                attestation = self._rental_attestation(
+                    evidence=evidence,
+                    request_interruptible=False,
+                    offer=offer,
+                    actual_price=attested_price,
+                    price_delta=price_delta,
+                    create_present=create_present,
+                    create_type=create_type,
+                    get_status=200,
+                    get_present=get_present,
+                    get_type=get_type,
+                    pod_inventory_count=1,
+                    explicit_false_source=false_source,
+                    normalized_gpu_path=attested_gpu_path,
+                    poll_count=poll_count,
+                    poll_elapsed_seconds=elapsed,
+                    observed_gpu_id=attested_gpu_id,
+                    gpu_count=1,
+                )
+                return attestation
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                current = self._last_gpu_attestation_progress
+                if current is not None:
+                    self._last_gpu_attestation_progress = replace(
+                        current,
+                        poll_elapsed_seconds=self._attestation_timeout_seconds,
+                    )
+                raise RunPodAPIError("POD_GPU_ATTESTATION_TIMEOUT")
+            self._sleep(min(self._attestation_poll_seconds, remaining))
+
+    def _record_gpu_progress(
+        self,
+        diagnostic: PodGPUAttestationProgressDiagnostic,
+    ) -> None:
+        self._last_gpu_attestation_progress = diagnostic
+        if self._record_gpu_attestation_progress is not None:
+            self._record_gpu_attestation_progress(diagnostic)
+
+    def _fail_gpu_attestation_progress(self, failure_code: str) -> None:
+        current = self._last_gpu_attestation_progress
+        if current is None or current.outcome == "failed":
+            return
+        failed = replace(current, outcome="failed", failure_code=failure_code)
+        self._last_gpu_attestation_progress = failed
+        if self._record_gpu_attestation_progress is not None:
+            with suppress(BaseException):
+                # Failure telemetry must never mask the receipt-bound cleanup carrier.
+                self._record_gpu_attestation_progress(failed)
+
+    def _attestation_inventory(self, deadline: float) -> RunPodInventory:
+        pod_rows = self._get_collection(
+            "pods",
+            params={"includeMachine": "true", "includeNetworkVolume": "true"},
+            timeout_seconds=self._remaining_attestation_seconds(deadline),
+        )
+        pods: list[PodRecord] = []
+        for row in pod_rows:
+            pod_id = _resource_id(row.get("id"), "pod_id_invalid")
+            name = row.get("name")
+            marker = name if isinstance(name, str) and _MARKER.fullmatch(name) else None
+            pods.append(PodRecord(pod_id, marker))
+        endpoint_ids = self._attestation_ids("endpoints", "endpoint_id_invalid", deadline)
+        network_volume_ids = self._attestation_ids(
+            "networkvolumes",
+            "network_volume_id_invalid",
+            deadline,
+        )
+        template_ids = self._attestation_ids("templates", "template_id_invalid", deadline)
+        return RunPodInventory(
+            pods=tuple(sorted(pods, key=lambda item: item.pod_id)),
+            endpoint_ids=endpoint_ids,
+            network_volume_ids=network_volume_ids,
+            template_ids=template_ids,
+        )
+
+    def _attestation_ids(
+        self,
+        path: str,
+        code: str,
+        deadline: float,
+    ) -> tuple[str, ...]:
+        rows = self._get_collection(
+            path,
+            timeout_seconds=self._remaining_attestation_seconds(deadline),
+        )
+        return tuple(sorted(_resource_id(row.get("id"), code) for row in rows))
+
+    def _remaining_attestation_seconds(self, deadline: float) -> float:
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise RunPodAPIError("POD_GPU_ATTESTATION_TIMEOUT")
+        return min(remaining, 30.0)
+
+    @staticmethod
+    def _optional_attested_price(
+        row: Mapping[str, object],
+        *,
+        offer: GPUOffer,
+        maximum: Decimal,
+    ) -> Decimal | None:
+        value = row.get("costPerHr", _MISSING)
+        if value is _MISSING or value is None:
+            return None
+        price = _decimal(value, "pod_gpu_attestation_price_invalid")
+        _require(
+            Decimal("0") < price <= maximum,
+            "pod_gpu_attestation_price_exceeded",
+        )
+        _require(
+            abs(price - offer.hourly_price) <= ON_DEMAND_PRICE_TOLERANCE_USD,
+            "pod_gpu_attestation_price_mismatch",
+        )
+        return price
+
+    @staticmethod
+    def _normalized_gpu(
+        row: Mapping[str, object],
+    ) -> tuple[str | None, str | None, int | None]:
+        ids: list[tuple[str, str]] = []
+        counts: list[int] = []
+        gpu_value = row.get("gpu", _MISSING)
+        if gpu_value is not _MISSING and gpu_value is not None:
+            gpu = _object(gpu_value, "pod_gpu_attestation_gpu_invalid")
+            gpu_id = gpu.get("id", _MISSING)
+            if gpu_id is not _MISSING and gpu_id is not None:
+                _require(
+                    isinstance(gpu_id, str) and bool(_GPU_TYPE_ID.fullmatch(gpu_id)),
+                    "pod_gpu_attestation_gpu_invalid",
+                )
+                ids.append(("gpu.id", cast(str, gpu_id)))
+            gpu_count = gpu.get("count", _MISSING)
+            if gpu_count is not _MISSING and gpu_count is not None:
+                _require(
+                    isinstance(gpu_count, int) and not isinstance(gpu_count, bool),
+                    "pod_gpu_attestation_gpu_count_invalid",
+                )
+                counts.append(cast(int, gpu_count))
+        machine_value = row.get("machine", _MISSING)
+        if machine_value is not _MISSING and machine_value is not None:
+            machine = _object(machine_value, "pod_gpu_attestation_machine_invalid")
+            machine_gpu_id = machine.get("gpuTypeId", _MISSING)
+            if machine_gpu_id is not _MISSING and machine_gpu_id is not None:
+                _require(
+                    isinstance(machine_gpu_id, str)
+                    and bool(_GPU_TYPE_ID.fullmatch(machine_gpu_id)),
+                    "pod_gpu_attestation_gpu_invalid",
+                )
+                ids.append(("machine.gpuTypeId", cast(str, machine_gpu_id)))
+            gpu_type_value = machine.get("gpuType", _MISSING)
+            if gpu_type_value is not _MISSING and gpu_type_value is not None:
+                gpu_type = _object(
+                    gpu_type_value,
+                    "pod_gpu_attestation_gpu_invalid",
+                )
+                nested_id = gpu_type.get("id", _MISSING)
+                if nested_id is not _MISSING and nested_id is not None:
+                    _require(
+                        isinstance(nested_id, str)
+                        and bool(_GPU_TYPE_ID.fullmatch(nested_id)),
+                        "pod_gpu_attestation_gpu_invalid",
+                    )
+                    ids.append(("machine.gpuType.id", cast(str, nested_id)))
+                nested_count = gpu_type.get("count", _MISSING)
+                if nested_count is not _MISSING and nested_count is not None:
+                    _require(
+                        isinstance(nested_count, int)
+                        and not isinstance(nested_count, bool),
+                        "pod_gpu_attestation_gpu_count_invalid",
+                    )
+                    counts.append(cast(int, nested_count))
+        if ids:
+            _require(
+                len({gpu_id for _path, gpu_id in ids}) == 1,
+                "pod_gpu_attestation_gpu_mismatch",
+            )
+        if counts:
+            _require(
+                len(set(counts)) == 1,
+                "pod_gpu_attestation_gpu_count_mismatch",
+            )
+        path, gpu_id = ids[0] if ids else (None, None)
+        return gpu_id, path, counts[0] if counts else None
 
     def _rental_attestation(
         self,
@@ -1484,6 +1936,11 @@ class RunPodV1Client:
         get_type: str | None,
         pod_inventory_count: int | None,
         explicit_false_source: str | None,
+        normalized_gpu_path: str,
+        poll_count: int,
+        poll_elapsed_seconds: float,
+        observed_gpu_id: str,
+        gpu_count: int,
     ) -> PodRentalAttestationDiagnostic:
         return PodRentalAttestationDiagnostic(
             evidence=evidence,
@@ -1502,6 +1959,13 @@ class RunPodV1Client:
             get_interruptible_json_type=get_type,
             pod_inventory_count=pod_inventory_count,
             explicit_false_source=explicit_false_source,
+            create_http_class="success_201",
+            normalized_gpu_path=normalized_gpu_path,
+            gpu_poll_count=poll_count,
+            gpu_poll_elapsed_seconds=poll_elapsed_seconds,
+            observed_gpu_id=observed_gpu_id,
+            gpu_count=gpu_count,
+            cost_attestation="graphql_uninterruptable_price_match",
         )
 
     def terminate_pod(self, pod_id: str) -> None:
@@ -1567,8 +2031,15 @@ class RunPodV1Client:
         path: str,
         *,
         params: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[Mapping[str, object], ...]:
-        payload = self._request_json("GET", path, expected_status=200, params=params)
+        payload = self._request_json(
+            "GET",
+            path,
+            expected_status=200,
+            params=params,
+            timeout_seconds=timeout_seconds,
+        )
         rows = _sequence(payload, "collection_response_invalid")
         return tuple(_object(row, "collection_response_invalid") for row in rows)
 
@@ -1582,6 +2053,7 @@ class RunPodV1Client:
         json_body: Mapping[str, object] | None = None,
         response_observer: Callable[[int, bytearray, str | None], None] | None = None,
         status_classifier: Callable[[int], str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> object:
         self._api_request_count += 1
         headers = {
@@ -1597,6 +2069,11 @@ class RunPodV1Client:
                 headers=headers,
                 params=params,
                 json=json_body,
+                timeout=(
+                    self._client.timeout
+                    if timeout_seconds is None
+                    else httpx.Timeout(timeout_seconds)
+                ),
             ) as response:
                 body = bytearray()
                 for chunk in response.iter_bytes():
@@ -1859,8 +2336,11 @@ __all__ = [
     "MAX_CONTAINER_DISK_GB",
     "MIN_GPU_MEMORY_GB",
     "ON_DEMAND_PRICE_TOLERANCE_USD",
+    "POD_GPU_ATTESTATION_POLL_SECONDS",
+    "POD_GPU_ATTESTATION_TIMEOUT_SECONDS",
     "POD_VOLUME_GB",
     "PodConnection",
+    "PodGPUAttestationProgressDiagnostic",
     "PodRentalAttestationDiagnostic",
     "REST_BASE_URL",
     "RunPodAPIError",

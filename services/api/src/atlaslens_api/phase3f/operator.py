@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from atlaslens_api.phase3f.runpod import (
     ON_DEMAND_PRICE_TOLERANCE_USD,
+    PodGPUAttestationProgressDiagnostic,
     PodRentalAttestationDiagnostic,
     RunPodInventory,
 )
@@ -26,11 +27,19 @@ _MAX_RECEIPT_BYTES = 64 * 1024
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 _RESOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,190}$")
 _GPU_TYPE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._():+-]{0,190}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _STAGES = frozenset({"preflight", "running", "failed", "terminated"})
 _RENTAL_EVIDENCE = frozenset(
     {"explicit_interruptible_false", "request_and_on_demand_price_attested"}
 )
 _INTERRUPTIBLE_JSON_TYPES = frozenset({"missing", "null", "string", "boolean"})
+_GPU_ATTESTATION_OUTCOMES = frozenset({"pending", "attested", "failed"})
+_GPU_ATTESTATION_PATHS = frozenset(
+    {"gpu.id", "machine.gpuTypeId", "machine.gpuType.id"}
+)
+_GPU_ATTESTATION_STATUSES = frozenset({"RUNNING", "EXITED", "TERMINATED"})
+_GPU_ATTESTATION_COST = "graphql_uninterruptable_price_match"
+_FAILURE_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 
 
 class Phase3FOperatorError(RuntimeError):
@@ -93,6 +102,18 @@ class OperatorReceipt:
     get_interruptible_json_type: str | None = None
     pod_inventory_count: int | None = None
     explicit_false_source: str | None = None
+    gpu_attestation_outcome: str | None = None
+    gpu_attestation_failure_code: str | None = None
+    normalized_gpu_path: str | None = None
+    gpu_poll_count: int | None = None
+    gpu_poll_elapsed_seconds: float | None = None
+    final_desired_status: str | None = None
+    expected_gpu_id: str | None = None
+    observed_gpu_id: str | None = None
+    observed_gpu_id_sha256: str | None = None
+    gpu_count: int | None = None
+    cost_attestation: str | None = None
+    create_http_class: str | None = None
 
     def __post_init__(self) -> None:
         _require(bool(_RUN_ID.fullmatch(self.run_id)), "OPERATOR_RECEIPT_RUN_ID_INVALID")
@@ -223,7 +244,7 @@ class OperatorReceipt:
                     _require(
                         self.create_interruptible_present is True
                         and self.create_interruptible_json_type == "boolean"
-                        and self.get_verification_http_status is None,
+                        and self.get_verification_http_status in {None, 200},
                         "OPERATOR_RECEIPT_EVIDENCE_INVALID",
                     )
                 else:
@@ -259,6 +280,110 @@ class OperatorReceipt:
                     )
                 ),
                 "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+            )
+        if self.gpu_attestation_outcome is not None:
+            _require(
+                self.pod_id is not None
+                and self.pod_bound_at is not None
+                and self.gpu_attestation_outcome in _GPU_ATTESTATION_OUTCOMES
+                and self.create_http_class == "success_201",
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            _require(
+                self.gpu_attestation_failure_code is None
+                or bool(_FAILURE_CODE.fullmatch(self.gpu_attestation_failure_code)),
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            _require(
+                (self.gpu_attestation_outcome == "failed")
+                == (self.gpu_attestation_failure_code is not None),
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            _require(
+                self.normalized_gpu_path is None
+                or self.normalized_gpu_path in _GPU_ATTESTATION_PATHS,
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            _require(
+                isinstance(self.gpu_poll_count, int)
+                and not isinstance(self.gpu_poll_count, bool)
+                and 0 <= self.gpu_poll_count <= 10_000,
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            _require(
+                isinstance(self.gpu_poll_elapsed_seconds, int | float)
+                and not isinstance(self.gpu_poll_elapsed_seconds, bool)
+                and 0 <= self.gpu_poll_elapsed_seconds <= 180,
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            _require(
+                self.final_desired_status is None
+                or self.final_desired_status in _GPU_ATTESTATION_STATUSES,
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            for gpu_id in (self.expected_gpu_id, self.observed_gpu_id):
+                _require(
+                    gpu_id is None
+                    or bool(_GPU_TYPE_ID.fullmatch(gpu_id)),
+                    "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+                )
+            _require(
+                self.observed_gpu_id_sha256 is None
+                or bool(_SHA256.fullmatch(self.observed_gpu_id_sha256)),
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            _require(
+                self.observed_gpu_id is None
+                or self.observed_gpu_id_sha256 is None,
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            _require(
+                self.expected_gpu_id is not None,
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            _require(
+                self.gpu_count is None
+                or (
+                    isinstance(self.gpu_count, int)
+                    and not isinstance(self.gpu_count, bool)
+                    and 0 <= self.gpu_count <= 16
+                ),
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            _require(
+                self.cost_attestation is None
+                or self.cost_attestation == _GPU_ATTESTATION_COST,
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            if self.gpu_attestation_outcome == "attested":
+                _require(
+                    self.rental_evidence is not None
+                    and self.normalized_gpu_path is not None
+                    and self.observed_gpu_id == self.expected_gpu_id
+                    and self.gpu_count == 1
+                    and self.final_desired_status == "RUNNING"
+                    and self.cost_attestation == _GPU_ATTESTATION_COST,
+                    "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+                )
+        else:
+            _require(
+                all(
+                    value is None
+                    for value in (
+                        self.gpu_attestation_failure_code,
+                        self.normalized_gpu_path,
+                        self.gpu_poll_count,
+                        self.gpu_poll_elapsed_seconds,
+                        self.final_desired_status,
+                        self.expected_gpu_id,
+                        self.observed_gpu_id,
+                        self.observed_gpu_id_sha256,
+                        self.gpu_count,
+                        self.cost_attestation,
+                        self.create_http_class,
+                    )
+                ),
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
             )
         object.__setattr__(self, "max_spend_usd", maximum)
         object.__setattr__(self, "soft_stop_usd", soft)
@@ -311,6 +436,18 @@ class OperatorReceipt:
             "get_interruptible_json_type": self.get_interruptible_json_type,
             "pod_inventory_count": self.pod_inventory_count,
             "explicit_false_source": self.explicit_false_source,
+            "gpu_attestation_outcome": self.gpu_attestation_outcome,
+            "gpu_attestation_failure_code": self.gpu_attestation_failure_code,
+            "normalized_gpu_path": self.normalized_gpu_path,
+            "gpu_poll_count": self.gpu_poll_count,
+            "gpu_poll_elapsed_seconds": self.gpu_poll_elapsed_seconds,
+            "final_desired_status": self.final_desired_status,
+            "expected_gpu_id": self.expected_gpu_id,
+            "observed_gpu_id": self.observed_gpu_id,
+            "observed_gpu_id_sha256": self.observed_gpu_id_sha256,
+            "gpu_count": self.gpu_count,
+            "cost_attestation": self.cost_attestation,
+            "create_http_class": self.create_http_class,
             "secret_values_included": False,
         }
 
@@ -355,13 +492,33 @@ class OperatorReceipt:
             "pod_inventory_count",
             "explicit_false_source",
         }
+        gpu_attestation_fields = {
+            "gpu_attestation_outcome",
+            "gpu_attestation_failure_code",
+            "normalized_gpu_path",
+            "gpu_poll_count",
+            "gpu_poll_elapsed_seconds",
+            "final_desired_status",
+            "expected_gpu_id",
+            "observed_gpu_id",
+            "observed_gpu_id_sha256",
+            "gpu_count",
+            "cost_attestation",
+            "create_http_class",
+        }
         schema = row.get("schema")
         is_legacy = schema == _LEGACY_OPERATOR_RECEIPT_SCHEMA
         _require(
             (is_legacy and set(row) == legacy_expected)
             or (
                 schema == OPERATOR_RECEIPT_SCHEMA
-                and set(row) == legacy_expected | evidence_fields
+                and frozenset(row)
+                in {
+                    frozenset(legacy_expected | evidence_fields),
+                    frozenset(
+                        legacy_expected | evidence_fields | gpu_attestation_fields
+                    ),
+                }
             ),
             "OPERATOR_RECEIPT_INVALID",
         )
@@ -406,6 +563,29 @@ class OperatorReceipt:
         get_type = None if is_legacy else row.get("get_interruptible_json_type")
         inventory_count = None if is_legacy else row.get("pod_inventory_count")
         false_source = None if is_legacy else row.get("explicit_false_source")
+        has_gpu_attestation = "gpu_attestation_outcome" in row
+        gpu_attestation_outcome = (
+            row.get("gpu_attestation_outcome") if has_gpu_attestation else None
+        )
+        gpu_attestation_failure_code = (
+            row.get("gpu_attestation_failure_code") if has_gpu_attestation else None
+        )
+        normalized_gpu_path = row.get("normalized_gpu_path") if has_gpu_attestation else None
+        gpu_poll_count = row.get("gpu_poll_count") if has_gpu_attestation else None
+        gpu_poll_elapsed_seconds = (
+            row.get("gpu_poll_elapsed_seconds") if has_gpu_attestation else None
+        )
+        final_desired_status = (
+            row.get("final_desired_status") if has_gpu_attestation else None
+        )
+        expected_gpu_id = row.get("expected_gpu_id") if has_gpu_attestation else None
+        observed_gpu_id = row.get("observed_gpu_id") if has_gpu_attestation else None
+        observed_gpu_id_sha256 = (
+            row.get("observed_gpu_id_sha256") if has_gpu_attestation else None
+        )
+        gpu_count = row.get("gpu_count") if has_gpu_attestation else None
+        cost_attestation = row.get("cost_attestation") if has_gpu_attestation else None
+        create_http_class = row.get("create_http_class") if has_gpu_attestation else None
         for optional_string in (
             pod_bound_at,
             rental_evidence,
@@ -415,6 +595,15 @@ class OperatorReceipt:
             create_type,
             get_type,
             false_source,
+            gpu_attestation_outcome,
+            gpu_attestation_failure_code,
+            normalized_gpu_path,
+            final_desired_status,
+            expected_gpu_id,
+            observed_gpu_id,
+            observed_gpu_id_sha256,
+            cost_attestation,
+            create_http_class,
         ):
             _require(
                 optional_string is None or isinstance(optional_string, str),
@@ -431,6 +620,24 @@ class OperatorReceipt:
                 or (isinstance(optional_integer, int) and not isinstance(optional_integer, bool)),
                 "OPERATOR_RECEIPT_EVIDENCE_INVALID",
             )
+        _require(
+            gpu_poll_count is None
+            or (isinstance(gpu_poll_count, int) and not isinstance(gpu_poll_count, bool)),
+            "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+        )
+        _require(
+            gpu_poll_elapsed_seconds is None
+            or (
+                isinstance(gpu_poll_elapsed_seconds, int | float)
+                and not isinstance(gpu_poll_elapsed_seconds, bool)
+            ),
+            "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+        )
+        _require(
+            gpu_count is None
+            or (isinstance(gpu_count, int) and not isinstance(gpu_count, bool)),
+            "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+        )
         return cls(
             run_id=_string(row.get("run_id"), "OPERATOR_RECEIPT_RUN_ID_INVALID"),
             run_marker=_string(row.get("run_marker"), "OPERATOR_RECEIPT_MARKER_INVALID"),
@@ -477,6 +684,22 @@ class OperatorReceipt:
             get_interruptible_json_type=cast(str | None, get_type),
             pod_inventory_count=cast(int | None, inventory_count),
             explicit_false_source=cast(str | None, false_source),
+            gpu_attestation_outcome=cast(str | None, gpu_attestation_outcome),
+            gpu_attestation_failure_code=cast(
+                str | None, gpu_attestation_failure_code
+            ),
+            normalized_gpu_path=cast(str | None, normalized_gpu_path),
+            gpu_poll_count=cast(int | None, gpu_poll_count),
+            gpu_poll_elapsed_seconds=cast(
+                float | None, gpu_poll_elapsed_seconds
+            ),
+            final_desired_status=cast(str | None, final_desired_status),
+            expected_gpu_id=cast(str | None, expected_gpu_id),
+            observed_gpu_id=cast(str | None, observed_gpu_id),
+            observed_gpu_id_sha256=cast(str | None, observed_gpu_id_sha256),
+            gpu_count=cast(int | None, gpu_count),
+            cost_attestation=cast(str | None, cost_attestation),
+            create_http_class=cast(str | None, create_http_class),
         )
 
     def update_lifecycle(
@@ -527,6 +750,32 @@ class OperatorReceipt:
             get_interruptible_json_type=attestation.get_interruptible_json_type,
             pod_inventory_count=attestation.pod_inventory_count,
             explicit_false_source=attestation.explicit_false_source,
+        )
+
+    def record_gpu_attestation_progress(
+        self,
+        diagnostic: PodGPUAttestationProgressDiagnostic,
+    ) -> OperatorReceipt:
+        _require(
+            self.stage == "running"
+            and self.pod_id is not None
+            and self.pod_bound_at is not None,
+            "OPERATOR_RECEIPT_STAGE_INVALID",
+        )
+        return replace(
+            self,
+            gpu_attestation_outcome=diagnostic.outcome,
+            gpu_attestation_failure_code=diagnostic.failure_code,
+            normalized_gpu_path=diagnostic.normalized_gpu_path,
+            gpu_poll_count=diagnostic.poll_count,
+            gpu_poll_elapsed_seconds=diagnostic.poll_elapsed_seconds,
+            final_desired_status=diagnostic.final_desired_status,
+            expected_gpu_id=diagnostic.expected_gpu_id,
+            observed_gpu_id=diagnostic.observed_gpu_id,
+            observed_gpu_id_sha256=diagnostic.observed_gpu_id_sha256,
+            gpu_count=diagnostic.gpu_count,
+            cost_attestation=diagnostic.cost_attestation,
+            create_http_class=diagnostic.create_http_class,
         )
 
 

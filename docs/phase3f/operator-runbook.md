@@ -99,6 +99,21 @@ template. This evidence is recorded as
 and sanitized field-presence/type evidence while remaining able to read legacy
 v1 receipts. Every post-ID validation failure carries the receipt-bound Pod into
 the one-Pod `finally` termination path.
+Create-time allocation fields are provisional. A HTTP-201 response may contain
+`machine` while omitting `gpu`; that omission alone is not a failure. After the
+ID is bound, authenticated `GET /pods/{id}` calls use `includeMachine=true` and
+a monotonic deadline of at most 180 seconds with a controlled interval. This is
+GET-only allocation polling, not a create retry. Exact GPU ID evidence is accepted
+only from `gpu.id`, `machine.gpuTypeId`, or `machine.gpuType.id`; assigned count
+comes only from `gpu.count` or `machine.gpuType.count`. All simultaneously present
+paths must agree, and display names or `machine.minPodGpuCount` are not allocation
+evidence. Missing/null machine, GPU, status or public-IP values remain pending.
+Success requires the exact bound ID and run name, `RUNNING`, count one, selected
+GPU ID, valid on-demand price/rental evidence, a public allocation and only the
+bound Pod with no endpoint, network volume or template. A mismatch terminates
+immediately; expiration raises `POD_GPU_ATTESTATION_TIMEOUT`. Receipt v2 stores
+only allowlisted fields or a hash for mismatching GPU text, plus poll count/time
+and outcome, and remains able to read receipts written before these fields.
 The create request is validated offline before POST against the bounded official
 GPU Pod contract. It contains only name, digest-pinned image, cloud/compute type,
 the exact selected GPU ID with custom priority, one non-interruptible GPU, a
@@ -123,6 +138,7 @@ Stop on these operator blockers: `ACTIVE_POD_INVENTORY_NOT_ZERO`,
 `RUNPOD_CREATE_PAYLOAD_INVALID`, `RUNPOD_CREATE_BAD_REQUEST_UNKNOWN`,
 `RUNPOD_AUTH_INVALID`, `RUNPOD_PERMISSION_DENIED`, `RUNPOD_RATE_LIMITED`,
 `RUNPOD_PROVIDER_ERROR`,
+`POD_GPU_ATTESTATION_TIMEOUT`, `POD_GPU_ATTESTATION_POD_MISSING`,
 `projected_cost_exceeds_target`,
 `soft_stop_budget_reached`, `termination_budget_reached`,
 `absolute_budget_reached`, `runtime_limit_reached`,

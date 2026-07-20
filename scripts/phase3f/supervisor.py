@@ -33,6 +33,7 @@ from atlaslens_api.phase3f.operator import (  # noqa: E402
 )
 from atlaslens_api.phase3f.runpod import (  # noqa: E402
     GPUOffer,
+    PodGPUAttestationProgressDiagnostic,
     PodRentalAttestationDiagnostic,
     PodConnection,
     RunPodAPIError,
@@ -840,6 +841,23 @@ def _record_operator_rental_attestation(
     _emit("PHASE3F_POD_RENTAL_EVIDENCE", **attestation.to_public_dict())
 
 
+def _record_operator_gpu_attestation_progress(
+    receipt_path: Path,
+    *,
+    expected_run_id: str,
+    diagnostic: PodGPUAttestationProgressDiagnostic,
+) -> None:
+    receipt = read_operator_receipt(receipt_path)
+    _require(receipt.run_id == expected_run_id, "OPERATOR_RECEIPT_RUN_ID_MISMATCH")
+    _require(receipt.stage == "running", "OPERATOR_RECEIPT_STAGE_INVALID")
+    _require(receipt.pod_id is not None, "OPERATOR_RECEIPT_POD_ID_MISSING")
+    write_operator_receipt(
+        receipt_path,
+        receipt.record_gpu_attestation_progress(diagnostic),
+    )
+    _emit("PHASE3F_POD_GPU_ATTESTATION", **diagnostic.to_public_dict())
+
+
 def _run_execute(
     args: argparse.Namespace,
     *,
@@ -876,6 +894,7 @@ def _run_execute(
     owns_operator_receipt = False
     session: SinglePodSession | None = None
     capacity_race_inventory_verified = False
+    full_inventory_restored = False
     try:
         _disk_gate()
         head, tracked = _preflight_repository()
@@ -932,6 +951,13 @@ def _run_execute(
                     attestation=attestation,
                 )
             ),
+            record_gpu_attestation_progress=lambda diagnostic: (
+                _record_operator_gpu_attestation_progress(
+                    receipt_path,
+                    expected_run_id=run_id,
+                    diagnostic=diagnostic,
+                )
+            ),
         ) as client:
             before = client.inventory()
             require_empty_inventory(before)
@@ -983,9 +1009,10 @@ def _run_execute(
                         "PHASE3F_CREATE_RESPONSE_CLASSIFIED",
                         **diagnostic.to_public_dict(),
                     )
+                after_failure = _post_inventory(client, before)
+                require_inventory_restored(before, after_failure)
+                full_inventory_restored = True
                 if exc.code == "GPU_CAPACITY_RACE_NO_POD":
-                    after_capacity_race = _post_inventory(client, before)
-                    require_inventory_restored(before, after_capacity_race)
                     capacity_race_inventory_verified = True
                     _emit(
                         "PHASE3F_GPU_CAPACITY_RACE_NO_POD",
@@ -994,8 +1021,14 @@ def _run_execute(
                         cleanup_verified=True,
                     )
                 raise
+            except BaseException:
+                after_failure = _post_inventory(client, before)
+                require_inventory_restored(before, after_failure)
+                full_inventory_restored = True
+                raise
             after = _post_inventory(client, before)
             require_inventory_restored(before, after)
+            full_inventory_restored = True
             _emit("PHASE3F_CLOUD_CLEANUP_VERIFIED", resources=0)
         current_operator_receipt = read_operator_receipt(receipt_path)
         write_operator_receipt(
@@ -1080,6 +1113,7 @@ def _run_execute(
                 session is not None
                 and session.last_audit is not None
                 and session.last_audit.termination_verified
+                and full_inventory_restored
             )
             no_pod_capacity_race = bool(
                 isinstance(exc, (Phase3FSafetyError, RunPodAPIError))
@@ -1091,11 +1125,7 @@ def _run_execute(
             )
             _record_failed_operator_state(
                 receipt_path,
-                cleanup_verified=(
-                    cleanup_verified and capacity_race_inventory_verified
-                    if no_pod_capacity_race
-                    else cleanup_verified
-                ),
+                cleanup_verified=cleanup_verified,
                 no_pod_capacity_race=no_pod_capacity_race,
             )
         print(exc.code)
@@ -1106,6 +1136,7 @@ def _run_execute(
                 session is not None
                 and session.last_audit is not None
                 and session.last_audit.termination_verified
+                and full_inventory_restored
             )
             _record_failed_operator_state(
                 receipt_path,

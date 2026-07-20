@@ -1,0 +1,13 @@
+{
+  "id": "created-pod",
+  "name": "phase3f-run-001",
+  "containerDiskInGb": 40,
+  "endpointId": null,
+  "networkVolume": null,
+  "volumeInGb": 20,
+  "volumeMountPath": "/workspace",
+  "ports": ["22/tcp"],
+  "machine": {},
+  "costPerHr": "0.45",
+  "desiredStatus": "RUNNING"
+}
