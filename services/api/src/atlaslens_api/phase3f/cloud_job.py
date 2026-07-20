@@ -32,6 +32,7 @@ from atlaslens_api.mapillary_demo.client import (
     RemoteImage,
     validated_next_url,
 )
+from atlaslens_api.mapillary_demo.errors import MapillaryApiError
 from atlaslens_api.mapillary_demo.models import BoundingBox, ClientLimits, ImageMetadata
 from atlaslens_api.phase3f.acquisition import (
     MAX_IMAGES,
@@ -85,7 +86,11 @@ MAX_WALL_SECONDS: Final = 5 * 60 * 60 + 45 * 60
 ACQUISITION_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-acquisition-checkpoint-v1"
 CLIENT_COUNTER_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-client-counters-v1"
 LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-metadata-pages-v1"
-METADATA_PAGE_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-metadata-pages-v2"
+LEGACY_V2_METADATA_PAGE_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-metadata-pages-v2"
+METADATA_PAGE_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-metadata-pages-v3"
+MAX_ADAPTIVE_PARTITION_DEPTH: Final = 4
+MIN_ADAPTIVE_BBOX_AREA: Final = 1e-6
+MAX_ADAPTIVE_CELLS_PER_CITY: Final = 4_096
 
 Role = Literal["reference", "calibration", "sealed_holdout", "ood_holdout"]
 
@@ -330,10 +335,19 @@ class MetadataAudit:
 
 
 @dataclass(slots=True)
+class _PlannedCell:
+    bbox: BoundingBox
+    depth: int
+
+
+@dataclass(slots=True)
 class _MetadataPageCheckpoint:
     run_id: str
     areas_sha256: str
+    base_cell_plan_sha256: str
     cell_plan_sha256: str
+    cells_by_city: dict[str, list[_PlannedCell]]
+    subdivision_count: int
     city_index: int
     box_index: int
     next_url: str | None
@@ -371,13 +385,107 @@ def _cell_plan_sha256(areas: Sequence[CityArea]) -> str:
     )
 
 
+def _base_cells_by_city(areas: Sequence[CityArea]) -> dict[str, list[_PlannedCell]]:
+    return {
+        area.city: [_PlannedCell(box, 0) for box in area.boxes]
+        for area in areas
+    }
+
+
+def _adaptive_cell_plan_sha256(
+    areas: Sequence[CityArea],
+    cells_by_city: Mapping[str, Sequence[_PlannedCell]],
+) -> str:
+    return _sha256_bytes(
+        _canonical_bytes(
+            [
+                {
+                    "city": area.city,
+                    "ordered_cells": [
+                        {
+                            "bbox": cell.bbox.as_query_value(),
+                            "depth": cell.depth,
+                        }
+                        for cell in cells_by_city[area.city]
+                    ],
+                }
+                for area in areas
+            ]
+        )
+    )
+
+
+def _adaptive_cell_plan_is_valid(
+    areas: Sequence[CityArea],
+    cells_by_city: Mapping[str, Sequence[_PlannedCell]],
+) -> bool:
+    def consume(
+        expected: BoundingBox,
+        expected_depth: int,
+        leaves: Sequence[_PlannedCell],
+        position: int,
+    ) -> int | None:
+        if position >= len(leaves):
+            return None
+        leaf = leaves[position]
+        if (
+            leaf.depth == expected_depth
+            and leaf.bbox.as_query_value() == expected.as_query_value()
+        ):
+            return position + 1
+        if leaf.depth <= expected_depth or expected_depth >= MAX_ADAPTIVE_PARTITION_DEPTH:
+            return None
+        next_position = position
+        for child in quarter_bbox(expected):
+            consumed_child = consume(
+                child,
+                expected_depth + 1,
+                leaves,
+                next_position,
+            )
+            if consumed_child is None:
+                return None
+            next_position = consumed_child
+        return next_position
+
+    if set(cells_by_city) != {area.city for area in areas}:
+        return False
+    for area in areas:
+        leaves = cells_by_city[area.city]
+        position = 0
+        for base_cell in area.boxes:
+            consumed = consume(base_cell, 0, leaves, position)
+            if consumed is None:
+                return False
+            position = consumed
+        if position != len(leaves):
+            return False
+    return True
+
+
+def _rows_sha256(rows_by_city: Mapping[str, Sequence[RemoteImage]]) -> str:
+    return _sha256_bytes(
+        _canonical_bytes(
+            {
+                city: [row.metadata.model_dump(mode="json") for row in rows]
+                for city, rows in sorted(rows_by_city.items())
+            }
+        )
+    )
+
+
 def _new_metadata_page_checkpoint(
     areas: Sequence[CityArea], run_id: str
 ) -> _MetadataPageCheckpoint:
+    cells_by_city = _base_cells_by_city(areas)
+    base_plan_sha256 = _cell_plan_sha256(areas)
     return _MetadataPageCheckpoint(
         run_id=run_id,
         areas_sha256=_areas_sha256(areas),
-        cell_plan_sha256=_cell_plan_sha256(areas),
+        base_cell_plan_sha256=base_plan_sha256,
+        cell_plan_sha256=_adaptive_cell_plan_sha256(areas, cells_by_city),
+        cells_by_city=cells_by_city,
+        subdivision_count=0,
         city_index=0,
         box_index=0,
         next_url=None,
@@ -396,7 +504,24 @@ def _write_metadata_page_checkpoint(
             "schema": METADATA_PAGE_CHECKPOINT_SCHEMA,
             "run_id": state.run_id,
             "areas_sha256": state.areas_sha256,
+            "base_cell_plan_sha256": state.base_cell_plan_sha256,
             "cell_plan_sha256": state.cell_plan_sha256,
+            "cells_by_city": {
+                city: [
+                    {
+                        "bbox": [
+                            cell.bbox.west,
+                            cell.bbox.south,
+                            cell.bbox.east,
+                            cell.bbox.north,
+                        ],
+                        "depth": cell.depth,
+                    }
+                    for cell in cells
+                ]
+                for city, cells in sorted(state.cells_by_city.items())
+            },
+            "subdivision_count": state.subdivision_count,
             "city_index": state.city_index,
             "box_index": state.box_index,
             "next_url": state.next_url,
@@ -416,6 +541,7 @@ def _load_metadata_page_checkpoint(
     *,
     areas: Sequence[CityArea],
     run_id: str,
+    persist_migration: bool = True,
 ) -> _MetadataPageCheckpoint:
     _require(
         path.is_file() and not path.is_symlink() and path.stat().st_size <= 16 * 1024 * 1024,
@@ -439,20 +565,35 @@ def _load_metadata_page_checkpoint(
         "secrets_included",
         "signed_urls_included",
     }
-    is_legacy = document.get("schema") == LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA
-    expected_keys = common_keys if is_legacy else common_keys | {"cell_plan_sha256"}
+    schema = document.get("schema")
+    is_v1 = schema == LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA
+    is_v2 = schema == LEGACY_V2_METADATA_PAGE_CHECKPOINT_SCHEMA
+    v3_keys = {
+        "base_cell_plan_sha256",
+        "cell_plan_sha256",
+        "cells_by_city",
+        "subdivision_count",
+    }
+    expected_keys = common_keys if is_v1 else common_keys | {"cell_plan_sha256"}
+    if schema == METADATA_PAGE_CHECKPOINT_SCHEMA:
+        expected_keys = common_keys | v3_keys
     _require(
         set(document) == expected_keys,
         "METADATA_PAGE_CHECKPOINT_INVALID",
     )
     _require(
-        document.get("schema")
-        in {LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA, METADATA_PAGE_CHECKPOINT_SCHEMA}
+        schema
+        in {
+            LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA,
+            LEGACY_V2_METADATA_PAGE_CHECKPOINT_SCHEMA,
+            METADATA_PAGE_CHECKPOINT_SCHEMA,
+        }
         and document.get("run_id") == run_id
         and document.get("areas_sha256") == _areas_sha256(areas)
         and (
-            is_legacy
+            is_v1
             or document.get("cell_plan_sha256") == _cell_plan_sha256(areas)
+            or schema == METADATA_PAGE_CHECKPOINT_SCHEMA
         )
         and document.get("secrets_included") is False
         and document.get("signed_urls_included") is False,
@@ -463,9 +604,110 @@ def _load_metadata_page_checkpoint(
     next_url = document.get("next_url")
     visited = document.get("visited_page_sha256")
     raw_rows = document.get("rows_by_city")
+    base_cells = _base_cells_by_city(areas)
+    cells_by_city = base_cells
+    subdivision_count = 0
+    if schema == METADATA_PAGE_CHECKPOINT_SCHEMA:
+        raw_cells = document.get("cells_by_city")
+        raw_subdivision_count = document.get("subdivision_count")
+        _require(
+            document.get("base_cell_plan_sha256") == _cell_plan_sha256(areas)
+            and isinstance(raw_cells, dict)
+            and isinstance(raw_subdivision_count, int)
+            and not isinstance(raw_subdivision_count, bool)
+            and raw_subdivision_count >= 0,
+            "METADATA_PAGE_CHECKPOINT_INVALID",
+        )
+        typed_raw_cells = cast(dict[str, object], raw_cells)
+        _require(
+            set(typed_raw_cells) == {area.city for area in areas},
+            "METADATA_PAGE_CHECKPOINT_INVALID",
+        )
+        parsed_cells: dict[str, list[_PlannedCell]] = {}
+        try:
+            for area in areas:
+                raw_city_cells = typed_raw_cells.get(area.city)
+                _require(isinstance(raw_city_cells, list), "METADATA_PAGE_CHECKPOINT_INVALID")
+                city_cells: list[_PlannedCell] = []
+                for raw_cell in cast(list[object], raw_city_cells):
+                    _require(
+                        isinstance(raw_cell, dict)
+                        and set(raw_cell) == {"bbox", "depth"},
+                        "METADATA_PAGE_CHECKPOINT_INVALID",
+                    )
+                    typed_raw_cell = cast(dict[str, object], raw_cell)
+                    raw_bbox = typed_raw_cell.get("bbox")
+                    depth = typed_raw_cell.get("depth")
+                    _require(
+                        isinstance(raw_bbox, list)
+                        and len(raw_bbox) == 4
+                        and isinstance(depth, int)
+                        and not isinstance(depth, bool)
+                        and 0 <= depth <= MAX_ADAPTIVE_PARTITION_DEPTH,
+                        "METADATA_PAGE_CHECKPOINT_INVALID",
+                    )
+                    values = cast(list[object], raw_bbox)
+                    _require(
+                        all(
+                            isinstance(value, int | float)
+                            and not isinstance(value, bool)
+                            and math.isfinite(float(value))
+                            for value in values
+                        ),
+                        "METADATA_PAGE_CHECKPOINT_INVALID",
+                    )
+                    numeric_values = cast(list[int | float], values)
+                    bbox = BoundingBox(
+                        west=float(numeric_values[0]),
+                        south=float(numeric_values[1]),
+                        east=float(numeric_values[2]),
+                        north=float(numeric_values[3]),
+                    )
+                    city_cells.append(_PlannedCell(bbox, cast(int, depth)))
+                _require(
+                    0 < len(city_cells) <= MAX_ADAPTIVE_CELLS_PER_CITY
+                    and len({cell.bbox.as_query_value() for cell in city_cells})
+                    == len(city_cells),
+                    "METADATA_PAGE_CHECKPOINT_INVALID",
+                )
+                full_cells = area.boxes
+                west = min(cell.west for cell in full_cells)
+                south = min(cell.south for cell in full_cells)
+                east = max(cell.east for cell in full_cells)
+                north = max(cell.north for cell in full_cells)
+                _require(
+                    all(
+                        cell.bbox.west >= west
+                        and cell.bbox.south >= south
+                        and cell.bbox.east <= east
+                        and cell.bbox.north <= north
+                        and cell.bbox.area_square_degrees >= MIN_ADAPTIVE_BBOX_AREA
+                        for cell in city_cells
+                    ),
+                    "METADATA_PAGE_CHECKPOINT_INVALID",
+                )
+                parsed_cells[area.city] = city_cells
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise Phase3FCloudJobError("METADATA_PAGE_CHECKPOINT_INVALID") from exc
+        cells_by_city = parsed_cells
+        subdivision_count = cast(int, raw_subdivision_count)
+        added_cells = sum(len(cells) for cells in cells_by_city.values()) - sum(
+            len(cells) for cells in base_cells.values()
+        )
+        _require(
+            added_cells >= 0
+            and added_cells % 3 == 0
+            and subdivision_count == added_cells // 3
+            and _adaptive_cell_plan_is_valid(areas, cells_by_city)
+            and document.get("cell_plan_sha256")
+            == _adaptive_cell_plan_sha256(areas, cells_by_city),
+            "METADATA_PAGE_CHECKPOINT_INVALID",
+        )
     typed_city_index = city_index if isinstance(city_index, int) else -1
     maximum_box_index = (
-        len(areas[typed_city_index].boxes) if 0 <= typed_city_index < len(areas) else 0
+        len(cells_by_city[areas[typed_city_index].city])
+        if 0 <= typed_city_index < len(areas)
+        else 0
     )
     _require(
         isinstance(city_index, int)
@@ -531,14 +773,17 @@ def _load_metadata_page_checkpoint(
     result = _MetadataPageCheckpoint(
         run_id=run_id,
         areas_sha256=_areas_sha256(areas),
-        cell_plan_sha256=_cell_plan_sha256(areas),
+        base_cell_plan_sha256=_cell_plan_sha256(areas),
+        cell_plan_sha256=_adaptive_cell_plan_sha256(areas, cells_by_city),
+        cells_by_city=cells_by_city,
+        subdivision_count=subdivision_count,
         city_index=cast(int, city_index),
         box_index=cast(int, box_index),
         next_url=cast(str | None, next_url),
         visited_page_sha256=tuple(cast(list[str], visited_rows)),
         rows_by_city=parsed,
     )
-    if is_legacy:
+    if is_v1:
         _require(
             result.city_index == 0
             and result.box_index == 0
@@ -547,8 +792,91 @@ def _load_metadata_page_checkpoint(
             and all(not rows for rows in result.rows_by_city.values()),
             "METADATA_PAGE_CHECKPOINT_PARTITION_MIGRATION_UNSAFE",
         )
+        if persist_migration:
+            _write_metadata_page_checkpoint(path, result)
+    elif is_v2 and persist_migration:
         _write_metadata_page_checkpoint(path, result)
     return result
+
+
+def _subdivide_failed_metadata_cell(
+    state: _MetadataPageCheckpoint,
+    *,
+    areas: Sequence[CityArea],
+    checkpoint_path: Path,
+) -> None:
+    _require(state.city_index < len(areas), "MAPILLARY_PARTITION_STATE_INVALID")
+    city = areas[state.city_index].city
+    cells = state.cells_by_city[city]
+    _require(0 <= state.box_index < len(cells), "MAPILLARY_PARTITION_STATE_INVALID")
+    failed = cells[state.box_index]
+    _require(
+        failed.depth < MAX_ADAPTIVE_PARTITION_DEPTH,
+        "MAPILLARY_PARTITION_DEPTH_LIMIT_REACHED",
+    )
+    children = quarter_bbox(failed.bbox)
+    _require(
+        all(child.area_square_degrees >= MIN_ADAPTIVE_BBOX_AREA for child in children),
+        "MAPILLARY_PARTITION_MIN_AREA_REACHED",
+    )
+    _require(
+        len(cells) + 3 <= MAX_ADAPTIVE_CELLS_PER_CITY,
+        "MAPILLARY_PARTITION_CELL_LIMIT_REACHED",
+    )
+    rows_sha256 = _rows_sha256(state.rows_by_city)
+    cells[state.box_index : state.box_index + 1] = [
+        _PlannedCell(child, failed.depth + 1) for child in children
+    ]
+    state.next_url = None
+    state.visited_page_sha256 = ()
+    state.subdivision_count += 1
+    state.cell_plan_sha256 = _adaptive_cell_plan_sha256(areas, state.cells_by_city)
+    _require(
+        _rows_sha256(state.rows_by_city) == rows_sha256,
+        "METADATA_PAGE_ROWS_CHANGED_DURING_PARTITION",
+    )
+    _write_metadata_page_checkpoint(checkpoint_path, state)
+
+
+def migrate_and_subdivide_failed_pagination_checkpoint(
+    path: Path,
+    *,
+    areas: Sequence[CityArea],
+    run_id: str,
+) -> dict[str, object]:
+    """Migrate a stopped run and replace only its failed request cell."""
+
+    state = _load_metadata_page_checkpoint(
+        path,
+        areas=areas,
+        run_id=run_id,
+        persist_migration=False,
+    )
+    failed_request_kind = "cursor" if state.next_url is not None else "cell_first_page"
+    row_count = sum(len(rows) for rows in state.rows_by_city.values())
+    rows_sha256 = _rows_sha256(state.rows_by_city)
+    prior_depth = state.cells_by_city[areas[state.city_index].city][state.box_index].depth
+    _subdivide_failed_metadata_cell(state, areas=areas, checkpoint_path=path)
+    persisted = _load_metadata_page_checkpoint(path, areas=areas, run_id=run_id)
+    _require(
+        sum(len(rows) for rows in persisted.rows_by_city.values()) == row_count
+        and _rows_sha256(persisted.rows_by_city) == rows_sha256,
+        "METADATA_PAGE_ROWS_CHANGED_DURING_PARTITION",
+    )
+    return {
+        "schema": METADATA_PAGE_CHECKPOINT_SCHEMA,
+        "run_id": run_id,
+        "city_index": persisted.city_index,
+        "box_index": persisted.box_index,
+        "prior_depth": prior_depth,
+        "child_depth": prior_depth + 1,
+        "failed_request_kind": failed_request_kind,
+        "rows_preserved": row_count,
+        "rows_sha256_preserved": True,
+        "cursor_cleared": persisted.next_url is None,
+        "subdivision_count": persisted.subdivision_count,
+        "cloud_mutations": 0,
+    }
 
 
 def audit_metadata(
@@ -567,7 +895,10 @@ def audit_metadata(
         "METADATA_PAGE_CHECKPOINT_INCOMPATIBLE",
     )
     _require(
-        checkpoint.cell_plan_sha256 == _cell_plan_sha256(areas),
+        checkpoint.base_cell_plan_sha256 == _cell_plan_sha256(areas)
+        and checkpoint.cell_plan_sha256
+        == _adaptive_cell_plan_sha256(areas, checkpoint.cells_by_city)
+        and _adaptive_cell_plan_is_valid(areas, checkpoint.cells_by_city),
         "METADATA_PAGE_CHECKPOINT_CELL_PLAN_MISMATCH",
     )
     records: list[CityCoverageRecord] = []
@@ -602,21 +933,35 @@ def audit_metadata(
                 if progress is not None:
                     progress(city, client.page_count, "metadata_page_checkpointed")
 
-            tuple(
-                client.iter_images(
-                area.boxes,
-                include_thumbnail=False,
-                item_cap=MAX_METADATA_ITEMS_PER_CITY,
-                    resume_box_index=resume_box_index,
-                    resume_next_url=resume_next_url,
-                    resume_seen_image_ids=tuple(
+            try:
+                tuple(
+                    client.iter_images(
+                        tuple(cell.bbox for cell in checkpoint.cells_by_city[area.city]),
+                        include_thumbnail=False,
+                        item_cap=MAX_METADATA_ITEMS_PER_CITY,
+                        resume_box_index=resume_box_index,
+                        resume_next_url=resume_next_url,
+                        resume_seen_image_ids=tuple(
                         row.metadata.mapillary_image_id
                         for row in checkpoint.rows_by_city[area.city]
                     ),
-                    resume_visited_page_sha256=resume_visited,
-                    page_observer=observe_page,
+                        resume_visited_page_sha256=resume_visited,
+                        page_observer=observe_page,
+                    )
                 )
-            )
+            except MapillaryApiError as exc:
+                if exc.code != "mapillary_api_server_retry_exhausted":
+                    raise
+                _require(
+                    checkpoint_path is not None,
+                    "MAPILLARY_PARTITION_CHECKPOINT_REQUIRED",
+                )
+                _subdivide_failed_metadata_cell(
+                    checkpoint,
+                    areas=areas,
+                    checkpoint_path=cast(Path, checkpoint_path),
+                )
+                raise
             checkpoint.city_index = area_index + 1
             checkpoint.box_index = 0
             checkpoint.next_url = None

@@ -55,12 +55,25 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RUNPOD_SECRET_REFERENCE = re.compile(
     r"^\{\{\s*RUNPOD_SECRET_[A-Za-z0-9_.-]+\s*\}\}$"
 )
+_TERMINAL_ACQUISITION_ERRORS: Final = frozenset(
+    {
+        "MAPILLARY_PARTITION_DEPTH_LIMIT_REACHED",
+        "MAPILLARY_PARTITION_MIN_AREA_REACHED",
+        "MAPILLARY_PARTITION_CELL_LIMIT_REACHED",
+    }
+)
 
 
 class LocalFirstError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+def _acquisition_failure_stage(code: str) -> str:
+    if code in _TERMINAL_ACQUISITION_ERRORS:
+        return "ACQUISITION_FAILED_TERMINAL"
+    return "ACQUISITION_FAILED_RESUMABLE"
 
 
 def _require(condition: bool, code: str) -> None:
@@ -840,6 +853,19 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
         _require(not work_root.exists(), "ACQUISITION_WORK_EXISTS")
         work_root.mkdir(mode=0o700)
         os.chmod(work_root, 0o700)
+    prior_state = (
+        _read_json(
+            _state_path(runtime_root, run_id),
+            max_bytes=1_048_576,
+            code="LOCAL_STATE_INVALID",
+        )
+        if config.resume
+        else {}
+    )
+    resume_after_server_exhaustion = (
+        prior_state.get("stage") == "ACQUISITION_FAILED_RESUMABLE"
+        and prior_state.get("error_code") == "MAPILLARY_API_SERVER_RETRY_EXHAUSTED"
+    )
     _write_state(runtime_root, run_id, "ACQUISITION_RUNNING", resume=config.resume)
     _require(
         worker._sha256_path(config.source_policy_path) == worker.SOURCE_POLICY_SHA256,  # noqa: SLF001
@@ -852,11 +878,27 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
     media_root = work_root / "private-media"
     if config.resume:
         historical = worker._read_client_counters(counters_path, run_id)  # noqa: SLF001
+        checkpoint_schema = _read_json(
+            metadata_path,
+            max_bytes=16 * 1024 * 1024,
+            code="METADATA_PAGE_CHECKPOINT_INVALID",
+        ).get("schema")
+        migrate_failed_v2_cell = (
+            resume_after_server_exhaustion
+            and checkpoint_schema == worker.LEGACY_V2_METADATA_PAGE_CHECKPOINT_SCHEMA
+        )
         metadata = worker._load_metadata_page_checkpoint(  # noqa: SLF001
             metadata_path,
             areas=areas,
             run_id=run_id,
+            persist_migration=not migrate_failed_v2_cell,
         )
+        if migrate_failed_v2_cell:
+            worker._subdivide_failed_metadata_cell(  # noqa: SLF001
+                metadata,
+                areas=areas,
+                checkpoint_path=metadata_path,
+            )
     else:
         historical = (0, 0, 0)
         metadata = worker._new_metadata_page_checkpoint(areas, run_id)  # noqa: SLF001
@@ -980,7 +1022,7 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
         _write_state(
             runtime_root,
             run_id,
-            "ACQUISITION_FAILED_RESUMABLE",
+            _acquisition_failure_stage(safe_code),
             error_code=safe_code,
             model_loaded=False,
             gpu_used=False,

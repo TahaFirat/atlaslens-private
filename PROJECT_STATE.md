@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-20T14:42:24+03:00
+last_verified_at: 2026-07-20T15:29:26+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: local_first_bbox_partition_hotfix_complete_resume_ready
+product_phase_status: local_first_adaptive_pagination_v3_resume_ready
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -366,12 +366,17 @@ phase_3f_acquisition_diagnostic: exact_500_all_limits_fields_repeat_reduced_firs
 phase_3f_acquisition_root_cause: deterministic_bbox_partition_required
 phase_3f_acquisition_partition: each_prior_cell_quartered_stable_sw_se_nw_ne_16_cells_per_city
 phase_3f_acquisition_boundary_dedup: stable_traversal_first_seen_exact_image_id
-phase_3f_acquisition_checkpoint_schema: v2_cell_plan_hash_bound
-phase_3f_acquisition_checkpoint_migration: current_ce23_empty_v1_atomically_migrated_v2_city0_box0
+phase_3f_acquisition_checkpoint_schema: v3_base_and_dynamic_cell_plan_hash_depth_and_subdivision_bound
+phase_3f_acquisition_checkpoint_migration: current_ce23_v2_city0_box8_first_page_failure_atomically_migrated_and_subdivided_v3
 phase_3f_acquisition_unchanged: fields_limit_token_retry_policy
-phase_3f_local_focused_tests: pass_36
-phase_3f_local_full_tests: pass_170_phase3f
-phase_3f_local_static: pass_ruff_strict_mypy_3_sources
+phase_3f_adaptive_partition: failed_first_or_cursor_request_replaced_in_place_sw_se_nw_ne_next_resume
+phase_3f_adaptive_bounds: max_depth_4_min_child_area_0_000001_max_cells_per_city_4096_typed_terminal
+phase_3f_adaptive_current_rows: pass_469_rows_sha256_preserved_ca64e9668308d48d80a9a594c6e3c38e87ac50754696f814399624d3b99594dd
+phase_3f_adaptive_current_counters: pass_pages_8_requests_16_rejected_0
+phase_3f_adaptive_current_checkpoint: v3_city0_box8_child_depth1_subdivision_count1_cursor_absent
+phase_3f_local_focused_tests: pass_26_adaptive_resume
+phase_3f_local_full_tests: pass_176_phase3f
+phase_3f_local_static: pass_ruff_strict_mypy_2_changed_sources
 phase_3f_local_network_calls: diagnostic_user_executed_10_metadata_gets_fix_task_zero
 phase_3f_local_cloud_mutations: zero
 phase_3f_local_downloads: zero
@@ -430,6 +435,35 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F adaptive Mapillary pagination partition
+
+Status: **LOCAL HOTFIX COMPLETE - SAME RUN READY TO RESUME**.
+
+Run `ce23d58c42bf76e6de0b0117725e3ea7` retained eight completed pages before
+bounded server retry exhaustion. The sanitized private checkpoint facts were
+more precise than the earlier description: v2 recorded city 0, cell 8, no next
+cursor, no visited cursor hash, 469 accepted first-seen rows, and cumulative
+page/request/rejected counts of 8/16/0. Thus the failed operation was cell 8's
+first request. No accepted page or row was replayed, removed, or rewritten as a
+different semantic record.
+
+Checkpoint v3 now persists a bounded ordered adaptive plan. A server-exhausted
+first request or later pagination cursor replaces only the active cell with
+SW/SE/NW/NE children, keeps the same box position, clears only failed-cell
+cursor state, and preserves the global first-seen image-ID set. Maximum depth
+is four, minimum child area is 0.000001 square degrees, and per-city cell count
+is capped at 4,096; each bound has a typed terminal result. A historical failed
+v2 checkpoint can be parsed, subdivided, and published in one atomic replace.
+
+The named run was migrated offline to v3 at city 0/cell 8, child depth one,
+with one subdivision. Its accepted-row canonical SHA-256 remained
+`ca64e9668308d48d80a9a594c6e3c38e87ac50754696f814399624d3b99594dd`
+before and after; the 8/16/0 counters remain intact. Status remains
+`ACQUISITION_FAILED_RESUMABLE` until the operator runs Resume. The focused
+adaptive suite passed 26 tests and all 176 Phase 3F tests passed. Ruff and
+strict mypy passed. No network, image download, acquisition, GPU, RunPod,
+cloud mutation, or push occurred.
 
 ## Product Phase 3F existing-Pod secret inheritance hotfix
 

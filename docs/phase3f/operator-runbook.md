@@ -56,8 +56,18 @@ full URL, hashes allowlisted request IDs, and never downloads imagery. The
 reduced-limit requests returned 500 while baseline and two quarter cells
 returned 200. Phase 3F therefore quarters every former cell in stable
 SW/SE/NW/NE order; fields, limit, token, and retry policy are unchanged.
-Checkpoint v2 binds that ordering by hash. Only a completely empty v1
-checkpoint may be atomically migrated; progressed v1 state is refused.
+Checkpoint v3 binds both the original and adaptive ordered cell plans by hash.
+If a cell's first request or a later cursor exhausts server retries, only that
+cell is atomically replaced in-place by SW/SE/NW/NE children for the next
+Resume. Accepted metadata rows remain first-seen deduplicated and unchanged.
+Subdivision is bounded at depth four, a minimum child area of 0.000001 square
+degrees, and 4,096 cells per city; crossing a bound is a typed terminal error.
+An old failed v2 checkpoint is migrated and subdivided in one atomic replace;
+only a completely empty v1 checkpoint can be migrated, while progressed v1 is
+refused. The named `ce23d58c42bf76e6de0b0117725e3ea7` run is already v3 at
+city 0/cell 8 with its eight pages, 469 rows, and 8/16/0 page/request/rejected
+counters preserved. Resume continues that same run ID at the first depth-one
+child.
 
 ## Commands
 

@@ -1,5 +1,34 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F adaptively subdivides a failing pagination cell
+
+- Context: Local run `ce23d58c42bf76e6de0b0117725e3ea7` retained eight
+  completed metadata pages, 469 first-seen rows, and zero rejected rows before
+  bounded server retries were exhausted. The private v2 checkpoint proved
+  `city_index=0`, `box_index=8`, no saved next cursor, and no cursor-loop hash;
+  therefore the failed operation was the first request for cell 8, not a replay
+  of a saved cursor. The accepted-row canonical SHA-256 was recorded before any
+  migration and used only as a local integrity comparison.
+- Decision: Replace only a cell whose first or subsequent page request exhausts
+  server retries with four equal children in stable southwest, southeast,
+  northwest, northeast order. Checkpoint v3 stores the ordered per-city cell
+  plan, each cell depth, base and dynamic plan hashes, and subdivision count.
+  Keep all accepted rows and the global first-seen image-ID dedup set; clear only
+  the failed cell's cursor and cursor-loop hashes. Bound subdivision at depth
+  four, 0.000001 square degrees per child, and 4,096 cells per city, with typed
+  terminal failures. Migrate a stopped failed v2 checkpoint and its subdivision
+  in one atomic replace; normal v2 loads remain lossless.
+- Alternatives: Restart acquisition; discard the eight pages; retry the same
+  failed request on every resume; change token, fields, limit, or retry policy;
+  subdivide every remaining cell; allow unbounded recursive partitioning.
+- Consequences: The named run was atomically migrated to v3 at the same city and
+  cell position. Its 469-row canonical hash remained identical, page/request/
+  rejection counters remained 8/16/0, and only cell 8 became four depth-one
+  children. Resume starts at the first child without replaying the failed
+  request shape or any completed base cell. This repair made zero network,
+  image, GPU, RunPod, or other cloud calls.
+- Target phase: Product Phase 3F bounded local-first acquisition.
+
 ## 2026-07-20 - Phase 3F quarters Mapillary acquisition cells
 
 - Context: A retryless ten-request live diagnostic reproduced HTTP 500 for the
