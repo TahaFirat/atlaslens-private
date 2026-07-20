@@ -298,6 +298,146 @@ def test_token_check_uses_authorization_header_and_returns_status_only() -> None
     assert observed[0].headers["Authorization"] == f"OAuth {FAKE_TOKEN}"
 
 
+def test_direct_thumbnail_resolver_uses_exact_image_path_and_fields_only() -> None:
+    observed: list[httpx.Request] = []
+    signed_url = "https://scontent.example.test/photo?signature=ephemeral"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request)
+        assert request.url.path != "/images"
+        return httpx.Response(
+            200,
+            json={"id": "image_123", "thumb_1024_url": signed_url},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(
+            FAKE_TOKEN,
+            http_client=http_client,
+            media_host_suffixes=(".example.test",),
+        )
+        resolved = client.resolve_image_thumbnail("image_123", "thumb_1024_url")
+
+    assert resolved.get_secret_value() == signed_url
+    assert signed_url not in repr(resolved)
+    assert len(observed) == 1
+    request = observed[0]
+    assert request.url.path == "/image_123"
+    assert parse_qs(request.url.query.decode()) == {"fields": ["id,thumb_1024_url"]}
+    assert all(key not in request.url.params for key in ("bbox", "cursor", "after", "limit"))
+    assert request.headers["Authorization"] == f"OAuth {FAKE_TOKEN}"
+
+
+@pytest.mark.parametrize(
+    ("payload", "code"),
+    [
+        (
+            {"id": "different", "thumb_1024_url": "https://scontent.example.test/x"},
+            "mapillary_image_id_mismatch",
+        ),
+        ({"id": "image-1"}, "mapillary_thumbnail_url_missing"),
+        ({"id": "image-1", "thumb_1024_url": None}, "mapillary_thumbnail_url_missing"),
+        ({"id": "image-1", "thumb_1024_url": 123}, "mapillary_thumbnail_url_invalid"),
+        ({"id": "image-1", "thumb_1024_url": ""}, "mapillary_thumbnail_url_invalid"),
+    ],
+)
+def test_direct_thumbnail_resolver_rejects_invalid_contract_payloads(
+    payload: dict[str, object], code: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/image-1"
+        assert request.url.path != "/images"
+        return httpx.Response(200, json=payload)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(
+            FAKE_TOKEN,
+            http_client=http_client,
+            media_host_suffixes=(".example.test",),
+        )
+        with pytest.raises(MapillaryApiError, match=code):
+            client.resolve_image_thumbnail("image-1")
+
+
+@pytest.mark.parametrize(
+    "image_id",
+    ["", "/images", "image/1", "image?fields=id", "image 1", "a" * 129],
+)
+def test_direct_thumbnail_resolver_rejects_unsafe_image_id_without_http(
+    image_id: str,
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(FAKE_TOKEN, http_client=http_client)
+        with pytest.raises(MapillarySafetyError, match="mapillary_image_id_invalid"):
+            client.resolve_image_thumbnail(image_id)
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "exception_type", "code"),
+    [
+        (401, MapillaryTokenError, "mapillary_token_rejected"),
+        (403, MapillaryApiError, "mapillary_permission_denied"),
+        (404, MapillaryApiError, "mapillary_image_not_found"),
+        (410, MapillaryApiError, "mapillary_image_not_found"),
+        (429, MapillaryApiError, "mapillary_api_rate_limit_retry_exhausted"),
+        (500, MapillaryApiError, "mapillary_api_server_retry_exhausted"),
+        (502, MapillaryApiError, "mapillary_api_server_retry_exhausted"),
+        (503, MapillaryApiError, "mapillary_api_server_retry_exhausted"),
+        (504, MapillaryApiError, "mapillary_api_server_retry_exhausted"),
+    ],
+)
+def test_direct_thumbnail_resolver_has_typed_http_policy(
+    status: int,
+    exception_type: type[MapillaryDemoError],
+    code: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/image-1"
+        assert request.url.path != "/images"
+        headers = {"Retry-After": "19"} if status == 429 else None
+        return httpx.Response(status, headers=headers, text=f"unsafe {FAKE_TOKEN}")
+
+    limits = ClientLimits(request_cap=1, retry_cap=0)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(FAKE_TOKEN, limits=limits, http_client=http_client)
+        with pytest.raises(exception_type, match=code) as error:
+            client.resolve_image_thumbnail("image-1")
+    assert FAKE_TOKEN not in str(error.value)
+    if status == 429:
+        assert error.value.retry_after_seconds == 19
+
+
+def test_direct_thumbnail_resolver_timeout_is_typed_and_bounded() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert request.url.path == "/image-1"
+        raise httpx.ReadTimeout(f"unsafe {FAKE_TOKEN}", request=request)
+
+    limits = ClientLimits(request_cap=2, retry_cap=1, backoff_base_seconds=0)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(
+            FAKE_TOKEN,
+            limits=limits,
+            http_client=http_client,
+            sleep=lambda _seconds: None,
+        )
+        with pytest.raises(MapillaryApiError, match="mapillary_api_timeout") as error:
+            client.resolve_image_thumbnail("image-1")
+    assert calls == 2
+    assert FAKE_TOKEN not in str(error.value)
+
+
 def test_pagination_strips_embedded_token_and_rejects_nonofficial_next_host() -> None:
     observed: list[httpx.Request] = []
 

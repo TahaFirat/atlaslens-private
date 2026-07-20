@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import json
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -18,12 +18,13 @@ from atlaslens_api.mapillary_demo.errors import (
     MapillaryLimitError,
     MapillaryTokenError,
 )
-from atlaslens_api.mapillary_demo.models import BoundingBox, GeoPoint, ImageMetadata
+from atlaslens_api.mapillary_demo.models import GeoPoint, ImageMetadata
 from atlaslens_api.phase3f.acquisition import AcquisitionGuard
 from atlaslens_api.phase3f.cloud_job import (
     MEDIA_CIRCUIT_FAILURE_THRESHOLD,
     MEDIA_PROVIDER_COOLDOWN_SECONDS,
     MEDIA_RATE_LIMIT_COOLDOWN_SECONDS,
+    MEDIA_RESOLVER_CONTRACT_VERSION,
     CityArea,
     MetadataAsset,
     PlannedAsset,
@@ -70,21 +71,16 @@ class _FakeClient:
         planned: Sequence[PlannedAsset],
         *,
         events: dict[str, list[bytes | BaseException]] | None = None,
-        resolution_events: list[BaseException] | None = None,
+        resolution_events: dict[str, list[BaseException]] | None = None,
     ) -> None:
         self.request_count = 0
         self.page_count = 0
         self.rejected_item_count = 0
         self.downloaded: list[str] = []
+        self.resolved: list[tuple[str, str]] = []
         self._events = events or {}
-        self._resolution_events = resolution_events or []
-        self._remotes = tuple(
-            RemoteImage(
-                item.metadata.remote.metadata,
-                SecretStr(f"https://scontent.example/{item.metadata.image_id}"),
-            )
-            for item in planned
-        )
+        self._resolution_events = resolution_events or {}
+        self._image_ids = {item.metadata.image_id for item in planned}
 
     def add_historical_counts(
         self, *, request_count: int, page_count: int, rejected_item_count: int
@@ -93,20 +89,22 @@ class _FakeClient:
         self.page_count += page_count
         self.rejected_item_count += rejected_item_count
 
-    def iter_images(
+    def iter_images(self, *_args: object, **_kwargs: object) -> None:
+        raise AssertionError("media acquisition must not call the /images collection endpoint")
+
+    def resolve_image_thumbnail(
         self,
-        _boxes: Sequence[BoundingBox],
-        *,
-        include_thumbnail: bool,
-        item_cap: int | None = None,
-    ) -> Iterator[RemoteImage]:
-        assert include_thumbnail is True
-        assert item_cap is not None
+        image_id: str,
+        quality: str = "thumb_1024_url",
+    ) -> SecretStr:
+        assert image_id in self._image_ids
+        assert quality == "thumb_1024_url"
         self.request_count += 1
-        if self._resolution_events:
-            raise self._resolution_events.pop(0)
-        self.page_count += 1
-        yield from self._remotes
+        self.resolved.append((image_id, quality))
+        events = self._resolution_events.get(image_id)
+        if events:
+            raise events.pop(0)
+        return SecretStr(f"https://scontent.example/{image_id}")
 
     def download_thumbnail(self, signed_url: str, *, max_bytes: int) -> tuple[bytes, str]:
         assert max_bytes > 0
@@ -237,7 +235,10 @@ def test_graph_401_or_403_is_terminal_before_media_requests(
     tmp_path: Path, error: BaseException
 ) -> None:
     planned = _planned(1, 1)
-    client = _FakeClient(planned, resolution_events=[error])
+    client = _FakeClient(
+        planned,
+        resolution_events={planned[0].metadata.image_id: [error]},
+    )
 
     with pytest.raises(type(error)):
         _acquire(tmp_path, planned, 1, client)
@@ -245,26 +246,79 @@ def test_graph_401_or_403_is_terminal_before_media_requests(
     assert client.downloaded == []
 
 
-def test_graph_url_resolution_5xx_becomes_sanitized_provider_pause(
+def test_direct_image_resolution_5xx_is_item_local_and_uses_reserve(
     tmp_path: Path,
 ) -> None:
     planned = _planned(1, 1)
+    failed_id = planned[0].metadata.image_id
     client = _FakeClient(
         planned,
-        resolution_events=[MapillaryApiError("mapillary_api_server_retry_exhausted")],
+        resolution_events={failed_id: [MapillaryApiError("mapillary_api_server_retry_exhausted")]},
+    )
+
+    assets, provenance = _acquire(tmp_path, planned, 1, client)
+
+    assert len(assets) == 1
+    assert provenance["media_status"] == "MEDIA_READY"
+    assert provenance["media_task_counts"]["quarantined"] == 1
+    assert failed_id not in client.downloaded
+    assert client.resolved[0] == (failed_id, "thumb_1024_url")
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_state"),
+    [
+        (MapillaryApiError("mapillary_image_not_found"), "REJECTED"),
+        (MapillaryApiError("mapillary_thumbnail_url_missing"), "REJECTED"),
+        (MapillaryApiError("mapillary_image_id_mismatch"), "REJECTED"),
+        (MapillaryApiError("mapillary_api_timeout"), "QUARANTINED"),
+        (
+            MapillaryApiError("mapillary_api_transport_retry_exhausted"),
+            "QUARANTINED",
+        ),
+    ],
+)
+def test_direct_resolver_failures_are_typed_item_results(
+    tmp_path: Path,
+    error: BaseException,
+    expected_state: str,
+) -> None:
+    planned = _planned(1, 1)
+    failed_id = planned[0].metadata.image_id
+    client = _FakeClient(planned, resolution_events={failed_id: [error]})
+
+    assets, provenance = _acquire(tmp_path, planned, 1, client)
+
+    assert len(assets) == 1
+    assert provenance["media_status"] == "MEDIA_READY"
+    ledger = json.loads((tmp_path / "work" / "media-task-ledger.json").read_text())
+    task = next(row for row in ledger["tasks"] if row["image_id"] == failed_id)
+    assert task["state"] == expected_state
+    assert client.downloaded.count(failed_id) == 0
+
+
+def test_direct_resolver_429_pauses_with_bounded_retry_after(tmp_path: Path) -> None:
+    planned = _planned(1, 1)
+    failed_id = planned[0].metadata.image_id
+    client = _FakeClient(
+        planned,
+        resolution_events={
+            failed_id: [
+                MapillaryApiError(
+                    "mapillary_api_rate_limit_retry_exhausted",
+                    retry_after_seconds=71,
+                )
+            ]
+        },
     )
     now = datetime(2026, 1, 1, tzinfo=UTC)
 
     assets, provenance = _acquire(tmp_path, planned, 1, client, now=now)
 
     assert assets == ()
-    assert provenance["media_status"] == "PAUSED_PROVIDER_UNAVAILABLE"
-    assert (
-        provenance["retry_not_before"]
-        == (now + timedelta(seconds=MEDIA_PROVIDER_COOLDOWN_SECONDS)).isoformat()
-    )
+    assert provenance["media_status"] == "PAUSED_RATE_LIMIT"
+    assert provenance["retry_not_before"] == (now + timedelta(seconds=71)).isoformat()
     assert client.downloaded == []
-    assert "mapillary_api_server_retry_exhausted" not in json.dumps(provenance)
 
 
 def test_rate_limit_cooldown_prevents_early_network_retry(tmp_path: Path) -> None:
@@ -311,6 +365,7 @@ def test_signed_url_is_resolved_once_then_item_is_rejected(tmp_path: Path) -> No
     assert len(assets) == 1
     assert provenance["media_status"] == "MEDIA_READY"
     assert client.downloaded.count(failed_id) == 2
+    assert [image_id for image_id, _quality in client.resolved].count(failed_id) == 2
     ledger = json.loads((tmp_path / "work" / "media-task-ledger.json").read_text())
     task = next(row for row in ledger["tasks"] if row["image_id"] == failed_id)
     assert task["state"] == "REJECTED"
@@ -427,6 +482,59 @@ def test_v1_checkpoint_migration_preserves_accepted_reserve_without_overfill(
     assert resumed.downloaded == []
 
 
+def test_direct_resolver_migration_preserves_33_accepted_and_plan_hash(
+    tmp_path: Path,
+) -> None:
+    planned = _planned(33, 3)
+    first = _FakeClient(planned)
+    assets, provenance = _acquire(tmp_path, planned, 33, first)
+    assert len(assets) == 33
+    assert provenance["media_status"] == "MEDIA_READY"
+
+    ledger_path = tmp_path / "work" / "media-task-ledger.json"
+    checkpoint_path = tmp_path / "work" / "acquisition-checkpoint.json"
+    checkpoint_before = checkpoint_path.read_bytes()
+    ledger = json.loads(ledger_path.read_text())
+    plan_sha256 = ledger["planned_sha256"]
+    ledger.pop("resolver_contract_version")
+    ledger.pop("resolver_migration")
+    reserves = [row for row in ledger["tasks"] if row["priority"] == "RESERVE"]
+    reserves[0]["state"] = "RETRYABLE"
+    reserves[0]["reason_code"] = "mapillary_api_server_retry_exhausted"
+    reserves[1]["state"] = "REJECTED"
+    reserves[1]["reason_code"] = "mapillary_image_not_found"
+    reserves[2]["state"] = "QUARANTINED"
+    reserves[2]["reason_code"] = "mapillary_media_server_retry_exhausted"
+    ledger["provider_circuit"]["consecutive_failures"] = 5
+    ledger["provider_circuit"]["open_count"] = 1
+    ledger["pause_state"] = "PAUSED_PROVIDER_UNAVAILABLE"
+    ledger["retry_not_before"] = "2099-01-01T00:00:00+00:00"
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+
+    resumed = _FakeClient(planned)
+    resumed_assets, resumed_provenance = _acquire(tmp_path, planned, 33, resumed)
+    migrated = json.loads(ledger_path.read_text())
+
+    assert len(resumed_assets) == 33
+    assert resumed_provenance["media_status"] == "MEDIA_READY"
+    assert resumed.downloaded == []
+    assert checkpoint_path.read_bytes() == checkpoint_before
+    assert migrated["planned_sha256"] == plan_sha256
+    assert migrated["resolver_contract_version"] == MEDIA_RESOLVER_CONTRACT_VERSION
+    assert migrated["resolver_migration"] == {
+        "source": "collection-bbox-v1",
+        "reset_retryable_count": 1,
+    }
+    migrated_reserves = [row for row in migrated["tasks"] if row["priority"] == "RESERVE"]
+    assert migrated_reserves[0]["state"] == "PENDING"
+    assert migrated_reserves[0]["reason_code"] is None
+    assert migrated_reserves[1]["state"] == "REJECTED"
+    assert migrated_reserves[1]["reason_code"] == "mapillary_image_not_found"
+    assert migrated_reserves[2]["state"] == "QUARANTINED"
+    assert migrated_reserves[2]["reason_code"] == "mapillary_media_server_retry_exhausted"
+    assert sum(row["state"] == "ACCEPTED" for row in migrated["tasks"]) == 33
+
+
 def test_reserve_exhaustion_is_structured_not_generic(tmp_path: Path) -> None:
     planned = _planned(1, 0)
     client = _FakeClient(
@@ -447,11 +555,11 @@ def test_reserve_exhaustion_is_structured_not_generic(tmp_path: Path) -> None:
 
 def test_five_consecutive_server_failures_open_bounded_circuit(tmp_path: Path) -> None:
     planned = _planned(MEDIA_CIRCUIT_FAILURE_THRESHOLD + 1, 6)
-    events = {
-        item.metadata.image_id: [MapillaryApiError("mapillary_media_server_retry_exhausted")]
+    resolution_events = {
+        item.metadata.image_id: [MapillaryApiError("mapillary_api_server_retry_exhausted")]
         for item in planned[:MEDIA_CIRCUIT_FAILURE_THRESHOLD]
     }
-    client = _FakeClient(planned, events=events)
+    client = _FakeClient(planned, resolution_events=resolution_events)
     now = datetime(2026, 1, 1, tzinfo=UTC)
 
     assets, provenance = _acquire(

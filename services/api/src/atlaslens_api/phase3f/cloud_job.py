@@ -114,6 +114,7 @@ SUPPLEMENTAL_REQUEST_CAP: Final = 512
 SUPPLEMENTAL_METADATA_CAP: Final = 600
 SUPPLEMENTAL_WALL_SECONDS: Final = 30 * 60
 MEDIA_TASK_LEDGER_SCHEMA: Final = "atlaslens-phase3f-media-task-ledger-v2"
+MEDIA_RESOLVER_CONTRACT_VERSION: Final = "direct-image-v1"
 MEDIA_CIRCUIT_FAILURE_THRESHOLD: Final = 5
 MEDIA_PROVIDER_COOLDOWN_SECONDS: Final = 5 * 60
 MEDIA_PROVIDER_COOLDOWN_MAX_SECONDS: Final = 30 * 60
@@ -121,6 +122,15 @@ MEDIA_RATE_LIMIT_COOLDOWN_SECONDS: Final = 60
 MEDIA_RATE_LIMIT_COOLDOWN_MAX_SECONDS: Final = 15 * 60
 MEDIA_RATE_LIMIT_TASK_ATTEMPT_CAP: Final = 2
 MEDIA_SIGNED_URL_REFRESH_CAP: Final = 1
+_LEGACY_MEDIA_RESOLVER_RETRY_CODES: Final = frozenset(
+    {
+        "mapillary_api_server_retry_exhausted",
+        "mapillary_api_timeout",
+        "mapillary_api_transport_retry_exhausted",
+        "mapillary_api_transport_failed",
+        "url_resolution_failed",
+    }
+)
 
 Role = Literal["reference", "calibration", "sealed_holdout", "ood_holdout"]
 
@@ -1887,6 +1897,9 @@ class _MediaTaskLedger:
     planned_sha256: str
     primary_count: int
     tasks: dict[str, _MediaTask]
+    resolver_contract_version: str = MEDIA_RESOLVER_CONTRACT_VERSION
+    resolver_migration_source: str | None = None
+    resolver_migrated_task_count: int = 0
     consecutive_provider_failures: int = 0
     circuit_open_count: int = 0
     pause_state: str | None = None
@@ -1899,6 +1912,11 @@ def _media_task_document(ledger: _MediaTaskLedger) -> dict[str, object]:
         "run_id": ledger.run_id,
         "planned_sha256": ledger.planned_sha256,
         "primary_count": ledger.primary_count,
+        "resolver_contract_version": ledger.resolver_contract_version,
+        "resolver_migration": {
+            "source": ledger.resolver_migration_source,
+            "reset_retryable_count": ledger.resolver_migrated_task_count,
+        },
         "tasks": [
             {
                 "image_id": task.image_id,
@@ -1964,6 +1982,7 @@ def _load_media_task_ledger(
     primary_count: int,
     completed: Mapping[str, _CheckpointAsset],
 ) -> _MediaTaskLedger:
+    migrate_legacy_resolver = False
     if not path.exists():
         ledger = _new_media_task_ledger(
             run_id=run_id,
@@ -1981,6 +2000,7 @@ def _load_media_task_ledger(
             raise Phase3FCloudJobError("MEDIA_TASK_LEDGER_INVALID") from exc
         _require(isinstance(value, dict), "MEDIA_TASK_LEDGER_INVALID")
         document = cast(dict[str, object], value)
+        resolver_contract = document.get("resolver_contract_version")
         _require(
             document.get("schema") == MEDIA_TASK_LEDGER_SCHEMA
             and document.get("run_id") == run_id
@@ -1988,6 +2008,29 @@ def _load_media_task_ledger(
             and document.get("primary_count") == primary_count,
             "MEDIA_TASK_LEDGER_INCOMPATIBLE",
         )
+        _require(
+            resolver_contract is None or resolver_contract == MEDIA_RESOLVER_CONTRACT_VERSION,
+            "MEDIA_TASK_LEDGER_INCOMPATIBLE",
+        )
+        legacy_resolver_contract = resolver_contract is None
+        migrate_legacy_resolver = legacy_resolver_contract
+        migration_source: str | None = None
+        migrated_task_count = 0
+        migration = document.get("resolver_migration")
+        if not legacy_resolver_contract and migration is not None:
+            _require(isinstance(migration, dict), "MEDIA_TASK_LEDGER_INVALID")
+            migration_row = cast(dict[str, object], migration)
+            raw_source = migration_row.get("source")
+            raw_count = migration_row.get("reset_retryable_count")
+            _require(
+                raw_source in {None, "collection-bbox-v1"}
+                and isinstance(raw_count, int)
+                and not isinstance(raw_count, bool)
+                and raw_count >= 0,
+                "MEDIA_TASK_LEDGER_INVALID",
+            )
+            migration_source = cast(str | None, raw_source)
+            migrated_task_count = cast(int, raw_count)
         raw_tasks = document.get("tasks")
         _require(isinstance(raw_tasks, list), "MEDIA_TASK_LEDGER_INVALID")
         expected = _new_media_task_ledger(
@@ -2077,6 +2120,10 @@ def _load_media_task_ledger(
             planned_sha256=expected.planned_sha256,
             primary_count=primary_count,
             tasks=tasks,
+            resolver_migration_source=(
+                "collection-bbox-v1" if legacy_resolver_contract else migration_source
+            ),
+            resolver_migrated_task_count=migrated_task_count,
             consecutive_provider_failures=cast(int, consecutive),
             circuit_open_count=cast(int, open_count),
             pause_state=cast(str | None, pause_state),
@@ -2089,6 +2136,19 @@ def _load_media_task_ledger(
         elif task.state == "ACCEPTED" or task.state in _MEDIA_TRANSIENT_STATES:
             task.state = "RETRYABLE"
             task.reason_code = "crash_recovery"
+    if migrate_legacy_resolver:
+        migrated = 0
+        for task in ledger.tasks.values():
+            if task.state == "RETRYABLE" and task.reason_code in _LEGACY_MEDIA_RESOLVER_RETRY_CODES:
+                task.state = "PENDING"
+                task.reason_code = None
+                migrated += 1
+        ledger.resolver_migrated_task_count = migrated
+        if migrated:
+            ledger.consecutive_provider_failures = 0
+            ledger.circuit_open_count = 0
+            ledger.pause_state = None
+            ledger.retry_not_before = None
     return ledger
 
 
@@ -2530,9 +2590,7 @@ def _media_actionable_tasks(
         ]
         if primary:
             result.extend(
-                sorted(primary, key=lambda task: (task.attempt_count, task.ordinal))[
-                    :deficit
-                ]
+                sorted(primary, key=lambda task: (task.attempt_count, task.ordinal))[:deficit]
             )
             continue
         reserves = sorted(
@@ -2665,90 +2723,85 @@ def acquire_planned_assets(
         if not tasks:
             status = _media_status(ledger, targets)
             break
-        task_ids = {task.image_id for task in tasks}
-        target_cities = {task.city for task in tasks}
-        for task in tasks:
-            task.state = "URL_RESOLVING"
-            task.reason_code = None
-        persist_ledger()
-        remotes: dict[str, RemoteImage] = {}
-        try:
-            for area in areas:
-                if area.city not in target_cities:
-                    continue
-                for remote in client.iter_images(
-                    area.boxes,
-                    include_thumbnail=True,
-                    item_cap=MAX_METADATA_ITEMS_PER_CITY,
-                ):
-                    image_id = remote.metadata.mapillary_image_id
-                    if image_id in task_ids:
-                        remotes[image_id] = remote
-        except MapillaryTokenError:
-            raise
-        except MapillaryApiError as exc:
-            for task in tasks:
-                task.state = "RETRYABLE"
-                task.reason_code = exc.code
-            ledger.consecutive_provider_failures += 1
-            if exc.code in {
-                "mapillary_api_rate_limit_retry_exhausted",
-            }:
-                _media_pause(
-                    ledger,
-                    state="PAUSED_RATE_LIMIT",
-                    now=clock(),
-                    cooldown_seconds=_media_rate_limit_cooldown(exc),
-                )
-            elif exc.code in {
-                "mapillary_api_server_retry_exhausted",
-                "mapillary_api_timeout",
-                "mapillary_api_transport_retry_exhausted",
-                "mapillary_api_transport_failed",
-            }:
-                if ledger.consecutive_provider_failures >= MEDIA_CIRCUIT_FAILURE_THRESHOLD:
-                    ledger.circuit_open_count += 1
-                cooldown = min(
-                    MEDIA_PROVIDER_COOLDOWN_MAX_SECONDS,
-                    MEDIA_PROVIDER_COOLDOWN_SECONDS * max(1, ledger.circuit_open_count),
-                )
-                _media_pause(
-                    ledger,
-                    state="PAUSED_PROVIDER_UNAVAILABLE",
-                    now=clock(),
-                    cooldown_seconds=cooldown,
-                )
-            else:
-                raise
-            persist_ledger()
-            status = cast(str, ledger.pause_state)
-            break
-        except (MapillaryLimitError, MapillarySafetyError):
-            for task in tasks:
-                task.state = "RETRYABLE"
-                task.reason_code = "url_resolution_failed"
-            persist_ledger()
-            raise
-        ledger.consecutive_provider_failures = 0
-        ledger.pause_state = None
-        ledger.retry_not_before = None
-        persist_ledger()
-
         pause_after_task = False
         for task in tasks:
-            selected_remote = remotes.get(task.image_id)
-            if selected_remote is None or selected_remote.thumbnail_url is None:
-                task.state = "REJECTED"
-                task.reason_code = "media_unavailable"
+            selected_asset = wanted[task.image_id]
+            task.state = "URL_RESOLVING"
+            task.reason_code = None
+            task.attempt_count += 1
+            persist_ledger()
+            try:
+                thumbnail_url = client.resolve_image_thumbnail(
+                    task.image_id,
+                    "thumb_1024_url",
+                )
+            except MapillaryTokenError:
+                raise
+            except (MapillaryApiError, MapillaryLimitError, MapillarySafetyError) as exc:
+                code = exc.code
+                if code == "mapillary_permission_denied":
+                    raise
+                if code in {
+                    "mapillary_request_cap_reached",
+                    "mapillary_operation_cancelled",
+                }:
+                    task.state = "RETRYABLE"
+                    task.reason_code = code
+                    persist_ledger()
+                    raise
+                if code == "mapillary_api_rate_limit_retry_exhausted":
+                    task.state = (
+                        "QUARANTINED"
+                        if task.attempt_count >= MEDIA_RATE_LIMIT_TASK_ATTEMPT_CAP
+                        else "RETRYABLE"
+                    )
+                    task.reason_code = code
+                    _media_pause(
+                        ledger,
+                        state="PAUSED_RATE_LIMIT",
+                        now=clock(),
+                        cooldown_seconds=_media_rate_limit_cooldown(exc),
+                    )
+                    persist_ledger()
+                    status = "PAUSED_RATE_LIMIT"
+                    pause_after_task = True
+                    break
+                if code in {
+                    "mapillary_api_server_retry_exhausted",
+                    "mapillary_api_timeout",
+                    "mapillary_api_transport_retry_exhausted",
+                    "mapillary_api_transport_failed",
+                }:
+                    task.state = "QUARANTINED"
+                    task.reason_code = code
+                    ledger.consecutive_provider_failures += 1
+                    if ledger.consecutive_provider_failures >= MEDIA_CIRCUIT_FAILURE_THRESHOLD:
+                        ledger.circuit_open_count += 1
+                        _media_pause(
+                            ledger,
+                            state="PAUSED_PROVIDER_UNAVAILABLE",
+                            now=clock(),
+                            cooldown_seconds=min(
+                                MEDIA_PROVIDER_COOLDOWN_MAX_SECONDS,
+                                MEDIA_PROVIDER_COOLDOWN_SECONDS * ledger.circuit_open_count,
+                            ),
+                        )
+                        status = "PAUSED_PROVIDER_UNAVAILABLE"
+                        pause_after_task = True
+                else:
+                    task.state = "REJECTED"
+                    task.reason_code = code
+                    ledger.consecutive_provider_failures = 0
                 persist_ledger()
+                if pause_after_task:
+                    break
                 continue
             task.state = "DOWNLOADING"
-            task.attempt_count += 1
             persist_ledger()
             guard.begin_request()
             try:
                 payload, _mime = client.download_thumbnail(
-                    selected_remote.thumbnail_url.get_secret_value(),
+                    thumbnail_url.get_secret_value(),
                     max_bytes=16 * 1024 * 1024,
                 )
             except MapillaryTokenError:
@@ -2817,6 +2870,7 @@ def acquire_planned_assets(
                 else:
                     task.state = "REJECTED"
                     task.reason_code = code
+                    ledger.consecutive_provider_failures = 0
                 persist_ledger()
                 if pause_after_task:
                     break
@@ -2851,9 +2905,10 @@ def acquire_planned_assets(
                     mapillary_image_id=task.image_id,
                     source_page=source_page,
                     contributor_attribution=(
-                        selected_remote.metadata.creator_id or "Mapillary contributor"
+                        selected_asset.metadata.remote.metadata.creator_id
+                        or "Mapillary contributor"
                     ),
-                    capture_date=selected_remote.metadata.captured_at,
+                    capture_date=selected_asset.metadata.remote.metadata.captured_at,
                     source_policy_receipt_sha256=receipt_sha,
                     revoked=False,
                 )
@@ -2951,6 +3006,7 @@ def acquire_planned_assets(
             "retry_not_before": ledger.retry_not_before,
             "recovered_partial_count": recovered_partial_count,
             "task_ledger_schema": MEDIA_TASK_LEDGER_SCHEMA,
+            "resolver_contract_version": MEDIA_RESOLVER_CONTRACT_VERSION,
         },
     )
 

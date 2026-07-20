@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -47,6 +48,15 @@ _SENSITIVE_QUERY_KEYS = frozenset(
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _ALLOWED_GRAPH_PATHS = frozenset({"/images", "/images/"})
 _DEFAULT_MEDIA_HOST_SUFFIXES = (".fbcdn.net", ".fbsbx.com")
+_IMAGE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_THUMBNAIL_FIELDS = frozenset(
+    {
+        "thumb_256_url",
+        "thumb_1024_url",
+        "thumb_2048_url",
+        "thumb_original_url",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -74,6 +84,12 @@ class PaginationProgress:
 
 
 TokenCheckStatus = Literal["configured", "invalid", "unavailable"]
+ThumbnailQuality = Literal[
+    "thumb_256_url",
+    "thumb_1024_url",
+    "thumb_2048_url",
+    "thumb_original_url",
+]
 
 
 def validate_access_token(value: str | None) -> SecretStr:
@@ -144,19 +160,23 @@ def validated_next_url(value: str) -> str:
             raise MapillarySafetyError("mapillary_paging_query_duplicate")
         seen.add(normalized)
         query.append((key, item))
-    return urlunsplit(
-        ("https", "graph.mapillary.com", parsed.path, urlencode(sorted(query)), "")
-    )
+    return urlunsplit(("https", "graph.mapillary.com", parsed.path, urlencode(sorted(query)), ""))
 
 
 def _official_graph_url(path_or_url: str) -> str:
     if path_or_url.startswith("/"):
         if path_or_url not in _ALLOWED_GRAPH_PATHS and not (
-            len(path_or_url) > 1 and path_or_url[1:].replace("_", "").replace("-", "").isalnum()
+            len(path_or_url) > 1 and _IMAGE_ID_PATTERN.fullmatch(path_or_url[1:])
         ):
             raise MapillarySafetyError("mapillary_graph_path_invalid")
         return f"{MAPILLARY_API_BASE_URL}{path_or_url}"
     return validated_next_url(path_or_url)
+
+
+def _validated_image_id(value: str) -> str:
+    if not isinstance(value, str) or _IMAGE_ID_PATTERN.fullmatch(value) is None:
+        raise MapillarySafetyError("mapillary_image_id_invalid")
+    return value
 
 
 def _retry_after_seconds(value: str | None, now: datetime) -> float | None:
@@ -379,7 +399,7 @@ class MapillaryClient:
                             raise MapillaryApiError("mapillary_permission_denied")
                         if streamed.status_code == 400:
                             raise MapillaryApiError("mapillary_api_bad_request")
-                        if streamed.status_code == 404:
+                        if streamed.status_code in {404, 410}:
                             raise MapillaryApiError("mapillary_image_not_found")
                         if streamed.is_redirect:
                             raise MapillarySafetyError("mapillary_graph_redirect_refused")
@@ -423,9 +443,7 @@ class MapillaryClient:
                 continue
             except (httpx.NetworkError, httpx.RemoteProtocolError):
                 if retry_number >= self.limits.retry_cap:
-                    raise MapillaryApiError(
-                        "mapillary_api_transport_retry_exhausted"
-                    ) from None
+                    raise MapillaryApiError("mapillary_api_transport_retry_exhausted") from None
                 self._delay(httpx.Response(503), retry_number)
                 continue
             except httpx.HTTPError:
@@ -588,15 +606,38 @@ class MapillaryClient:
         return PageResult(images=tuple(images), next_url=next_url)
 
     def image_exists(self, image_id: str) -> bool:
-        if not image_id or not image_id.replace("_", "").replace("-", "").isalnum():
-            raise MapillarySafetyError("mapillary_image_id_invalid")
+        validated_image_id = _validated_image_id(image_id)
         try:
-            payload = self._json_object(f"/{image_id}", params={"fields": "id"})
+            payload = self._json_object(f"/{validated_image_id}", params={"fields": "id"})
         except MapillaryApiError as exc:
             if exc.code == "mapillary_image_not_found":
                 return False
             raise
-        return payload.get("id") == image_id
+        return payload.get("id") == validated_image_id
+
+    def resolve_image_thumbnail(
+        self,
+        image_id: str,
+        quality: ThumbnailQuality = "thumb_1024_url",
+    ) -> SecretStr:
+        """Resolve one ephemeral thumbnail URL through the direct image contract."""
+
+        validated_image_id = _validated_image_id(image_id)
+        if quality not in _THUMBNAIL_FIELDS:
+            raise MapillarySafetyError("mapillary_thumbnail_quality_invalid")
+        payload = self._json_object(
+            f"/{validated_image_id}",
+            params={"fields": f"id,{quality}"},
+        )
+        response_id = payload.get("id")
+        if not isinstance(response_id, str) or response_id != validated_image_id:
+            raise MapillaryApiError("mapillary_image_id_mismatch")
+        if quality not in payload or payload[quality] is None:
+            raise MapillaryApiError("mapillary_thumbnail_url_missing")
+        thumbnail_url = payload[quality]
+        if not isinstance(thumbnail_url, str) or not thumbnail_url:
+            raise MapillaryApiError("mapillary_thumbnail_url_invalid")
+        return SecretStr(self._validated_media_url(thumbnail_url))
 
     def download_thumbnail(self, signed_url: str, *, max_bytes: int) -> tuple[bytes, str]:
         """Download an ephemeral signed image without sending Graph authorization."""
@@ -673,9 +714,7 @@ class MapillaryClient:
                 self._delay(httpx.Response(503), retry_number)
             except (httpx.NetworkError, httpx.RemoteProtocolError):
                 if retry_number >= self.limits.retry_cap:
-                    raise MapillaryApiError(
-                        "mapillary_media_transport_retry_exhausted"
-                    ) from None
+                    raise MapillaryApiError("mapillary_media_transport_retry_exhausted") from None
                 self._delay(httpx.Response(503), retry_number)
             except httpx.HTTPError:
                 raise MapillaryApiError("mapillary_media_transport_failed") from None
@@ -778,6 +817,7 @@ __all__ = [
     "PageResult",
     "PaginationProgress",
     "RemoteImage",
+    "ThumbnailQuality",
     "TokenCheckStatus",
     "redact_headers",
     "redact_url",

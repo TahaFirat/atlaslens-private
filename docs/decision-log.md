@@ -1,5 +1,32 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F media URL resolution uses the direct image contract
+
+- Context: The earlier media state-machine repair retained the collection-based
+  resolver. Live evidence then showed two Resumes stuck at 33 accepted assets,
+  both opening the circuit in `acquire_planned_assets -> MapillaryClient.iter_images
+  -> /images`. The selected image ID was already fixed by the leakage-safe split
+  plan, so bbox collection enumeration was neither necessary nor the correct
+  Graph contract for resolving that image's thumbnail URL.
+- Decision: Add a typed `resolve_image_thumbnail` operation that validates one
+  image ID and calls only `GET /{image_id}?fields=id,thumb_1024_url`. Require an
+  exact response-ID match, validate the configured thumbnail field and CDN host,
+  and keep the signed URL memory-only. Phase 3F media acquisition processes this
+  direct call inside each atomic task boundary; only metadata acquisition may use
+  `/images`. Version the ledger as `direct-image-v1` and migrate only legacy
+  resolver-caused retryable tasks once, preserving accepted and genuine terminal
+  item results plus the plan hash and split.
+- Alternatives: Continue bbox/pagination resolution with a larger retry budget;
+  cache collection pages; lower media minima; reset every non-accepted task; or
+  treat direct item failures as a global acquisition failure.
+- Consequences: Direct 401/403 remains terminal; 404/410 uses a reserve; 429
+  pauses with bounded `Retry-After`; exhausted 5xx/timeout/transport retries
+  quarantine only the current item until the existing consecutive-failure circuit
+  opens. The current 8,805 metadata rows and 33 accepted media files require no
+  eager rewrite and remain byte-identical until an operator explicitly resumes.
+- Target phase: Product Phase 3F bounded local-first acquisition and private
+  fine-tuning only.
+
 ## 2026-07-20 - Phase 3F media acquisition is an item-ledger state machine
 
 - Context: The completed 8,805-row metadata corpus produced a feasible plan of

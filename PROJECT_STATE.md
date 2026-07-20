@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-20T21:24:29+03:00
+last_verified_at: 2026-07-20T23:36:47+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: split_readiness_repaired_live_metadata_complete_media_not_started
+product_phase_status: direct_media_resolver_repaired_live_metadata_complete_media_33_preserved
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -421,6 +421,14 @@ phase_3f_split_readiness_runtime_migration: none_counts_and_sha256_unchanged
 phase_3f_split_readiness_tests: pass_199
 phase_3f_split_readiness_static: pass_ruff_strict_mypy_259_sources_powershell_parse
 phase_3f_split_readiness_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_runtime_mutation
+phase_3f_media_resolver_contract: direct_image_v1_exact_image_id_thumb_1024_only
+phase_3f_media_resolver_legacy_path: acquire_planned_assets_iter_images_graph_images_collection
+phase_3f_media_resolver_live_inventory: metadata_8805_accepted_33_bytes_6546321_preserved
+phase_3f_media_resolver_ledger_migration: absent_contract_retryable_797_to_pending_once_accepted_and_terminal_results_preserved_on_next_resume
+phase_3f_media_resolver_error_policy: terminal_auth_item_404_410_bounded_429_item_5xx_transport_quarantine_circuit_5
+phase_3f_media_resolver_tests: pass_232_phase3f_54_mapillary_connector
+phase_3f_media_resolver_static: pass_ruff_strict_mypy_259_sources
+phase_3f_media_resolver_live_actions: zero_network_zero_mapillary_zero_cdn_zero_runpod_zero_gpu_zero_runtime_mutation
 phase_3f_next_action: run_exact_preflight_then_resume_ce23_with_explicit_cloud_consent_only_after_dataset_ready
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
@@ -476,6 +484,42 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F direct Mapillary media resolver
+
+Status: **REPAIRED AND VERIFIED OFFLINE - LIVE RESUME NOT EXECUTED**.
+
+The media URL resolver no longer scans the Graph `/images` collection. Each
+plan-bound task validates its image ID and requests exactly
+`GET /{image_id}?fields=id,thumb_1024_url`; the returned ID must match exactly
+and the signed CDN URL is validated and retained only as a `SecretStr` in
+memory. Metadata acquisition remains the only Phase 3F caller of `/images`.
+Direct 401/403 is terminal, 404/410 rejects only the item, 429 creates a bounded
+rate-limit pause, and exhausted 5xx/timeout/transport retries quarantine only
+that item. Five consecutive provider failures still open the five-minute,
+thirty-minute-capped circuit; deterministic same-bucket reserves and every
+split/leakage minimum remain unchanged.
+
+The private ledger now records `resolver_contract_version=direct-image-v1`.
+On the next explicit Resume, an old ledger without that field atomically resets
+only legacy resolver-caused `RETRYABLE` tasks to `PENDING`, clears the invalid
+collection-path pause, and records the migration once. `ACCEPTED`, genuine
+`REJECTED`/`QUARANTINED`, attempt history, plan hash, and split assignments are
+otherwise preserved. No migration was eagerly applied during this repair.
+
+The read-only live snapshot remains 8,805 metadata rows and 33 normalized JPEG
+assets totaling 6,546,321 bytes. The metadata SHA-256 is
+`5d2b98964ee4238959901baf609f00797c62f32fe20308cfcd30578025914f39` and the
+acquisition checkpoint SHA-256 is
+`5b17c943103235591ca7ba254eb128369fd712a31674f71623306f1a91ef6a3e`.
+The legacy ledger has 33 `ACCEPTED`, 797 `RETRYABLE`, and 200 `PENDING` tasks;
+neither it nor any runtime/media file was modified.
+
+All 232 Phase 3F tests and all 54 Mapillary connector tests pass. The media
+state-machine fake rejects any `iter_images` call, while the HTTP contract tests
+assert the exact direct path and sole fields query. Ruff and strict mypy over
+259 source files pass. No network, Mapillary, CDN, RunPod/GPU, Resume, or live
+runtime mutation occurred.
 
 ## Product Phase 3F resumable media acquisition
 
