@@ -1,5 +1,39 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F treats metadata capacity as balanced city quotas
+
+- Context: After adaptive partitioning, local run
+  `ce23d58c42bf76e6de0b0117725e3ea7` reached
+  `MAPILLARY_ITEM_CAP_REACHED` without another server error. The private state
+  proves 569 unique eligible rows, all for İstanbul, with cells 0-8 complete,
+  cell 9 active, and the other fifteen cities unaudited. Counters are 18
+  requests, 10 pages, and zero rejected items; no image or media byte has been
+  acquired. The 600 value was passed to the generic client as an item cap, so a
+  page containing at least 32 additional first-seen rows raised before its page
+  observer could atomically admit the 31 rows still needed by the city quota.
+- Decision: Do not seal this single-city metadata set and do not remove or
+  blindly increase the 600-per-city policy. Enforce 600 first-seen rows per
+  city and an explicit 9,600-row global policy quota. Let the generic client
+  retain its 20,000-item safety ceiling, but invoke it with the lower 9,600
+  global bound so the Phase 3F page observer can admit only the deterministic
+  prefix that fills the current city's quota, atomically clear its cursor state,
+  and advance to the next city. Treat any unexpected generic item-cap exception
+  as the typed terminal invariant failure
+  `MAPILLARY_METADATA_QUOTA_INVARIANT_FAILED`; global exhaustion before city
+  completion is `MAPILLARY_GLOBAL_METADATA_QUOTA_REACHED`.
+- Alternatives: Seal İstanbul-only metadata; restart and lose 569 accepted
+  rows; raise or remove every cap; repeatedly retry the same over-cap page;
+  allow dense early cities to consume a shared unbalanced pool.
+- Consequences: The existing v3 checkpoint, rows, counters, and run ID require
+  no migration. On the next authorized Resume, the first 31 new unique rows
+  fill İstanbul's quota and the audit advances through the remaining fifteen
+  cities under the unchanged retry/field/page-size policy. At most 9,031
+  additional metadata rows can be admitted. Selection, image acquisition, and
+  sealing still require all sixteen city audits and the existing multi-region
+  coverage gates. This repair itself makes no network, image, GPU, RunPod, or
+  cloud call.
+- Target phase: Product Phase 3F bounded local-first acquisition.
+
 ## 2026-07-20 - Phase 3F adaptively subdivides a failing pagination cell
 
 - Context: Local run `ce23d58c42bf76e6de0b0117725e3ea7` retained eight

@@ -32,7 +32,7 @@ from atlaslens_api.mapillary_demo.client import (
     RemoteImage,
     validated_next_url,
 )
-from atlaslens_api.mapillary_demo.errors import MapillaryApiError
+from atlaslens_api.mapillary_demo.errors import MapillaryApiError, MapillaryLimitError
 from atlaslens_api.mapillary_demo.models import BoundingBox, ClientLimits, ImageMetadata
 from atlaslens_api.phase3f.acquisition import (
     MAX_IMAGES,
@@ -82,6 +82,7 @@ SOURCE_POLICY_SHA256: Final = (
     "72d51363f2b63de368d34d4d7bb2fc1145f93dc0469e7026100976732dfde209"
 )
 MAX_METADATA_ITEMS_PER_CITY: Final = 600
+MAX_METADATA_ITEMS_TOTAL: Final = 9_600
 MAX_WALL_SECONDS: Final = 5 * 60 * 60 + 45 * 60
 ACQUISITION_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-acquisition-checkpoint-v1"
 CLIENT_COUNTER_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-client-counters-v1"
@@ -99,6 +100,10 @@ class Phase3FCloudJobError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class _MetadataCityQuotaReached(RuntimeError):
+    """Internal control flow after an atomic per-city quota checkpoint."""
 
 
 def _require(condition: bool, code: str) -> None:
@@ -767,6 +772,10 @@ def _load_metadata_page_checkpoint(
             )
     except (TypeError, ValueError, ValidationError) as exc:
         raise Phase3FCloudJobError("METADATA_PAGE_CHECKPOINT_INVALID") from exc
+    _require(
+        sum(len(rows) for rows in parsed.values()) <= MAX_METADATA_ITEMS_TOTAL,
+        "METADATA_PAGE_CHECKPOINT_INVALID",
+    )
     for index, city in enumerate(expected_cities):
         if index > cast(int, city_index):
             _require(not parsed[city], "METADATA_PAGE_CHECKPOINT_INVALID")
@@ -903,6 +912,11 @@ def audit_metadata(
     )
     records: list[CityCoverageRecord] = []
     assets_by_city: dict[str, tuple[MetadataAsset, ...]] = {}
+    _require(
+        sum(len(rows) for rows in checkpoint.rows_by_city.values())
+        <= MAX_METADATA_ITEMS_TOTAL,
+        "MAPILLARY_GLOBAL_METADATA_QUOTA_REACHED",
+    )
     for area_index, area in enumerate(areas):
         if area_index >= checkpoint.city_index:
             resume_box_index = checkpoint.box_index if area_index == checkpoint.city_index else 0
@@ -919,49 +933,95 @@ def audit_metadata(
             ) -> None:
                 existing = checkpoint.rows_by_city[city]
                 identifiers = {row.metadata.mapillary_image_id for row in existing}
-                for row in page.images:
+                remaining_city_quota = MAX_METADATA_ITEMS_PER_CITY - len(existing)
+                remaining_global_quota = MAX_METADATA_ITEMS_TOTAL - sum(
+                    len(rows) for rows in checkpoint.rows_by_city.values()
+                )
+                admitted = page.images[
+                    : min(remaining_city_quota, remaining_global_quota)
+                ]
+                for row in admitted:
                     identifier = row.metadata.mapillary_image_id
                     _require(identifier not in identifiers, "METADATA_PAGE_DUPLICATE")
                     identifiers.add(identifier)
                     existing.append(row)
+                city_quota_reached = len(existing) >= MAX_METADATA_ITEMS_PER_CITY
+                global_quota_reached = (
+                    sum(len(rows) for rows in checkpoint.rows_by_city.values())
+                    >= MAX_METADATA_ITEMS_TOTAL
+                )
                 checkpoint.city_index = city_position
-                checkpoint.box_index = page.box_index
-                checkpoint.next_url = page.next_url
-                checkpoint.visited_page_sha256 = page.visited_page_sha256
+                checkpoint.box_index = (
+                    len(checkpoint.cells_by_city[city])
+                    if city_quota_reached
+                    else page.box_index
+                )
+                checkpoint.next_url = None if city_quota_reached else page.next_url
+                checkpoint.visited_page_sha256 = (
+                    () if city_quota_reached else page.visited_page_sha256
+                )
                 if checkpoint_path is not None:
                     _write_metadata_page_checkpoint(checkpoint_path, checkpoint)
                 if progress is not None:
-                    progress(city, client.page_count, "metadata_page_checkpointed")
-
-            try:
-                tuple(
-                    client.iter_images(
-                        tuple(cell.bbox for cell in checkpoint.cells_by_city[area.city]),
-                        include_thumbnail=False,
-                        item_cap=MAX_METADATA_ITEMS_PER_CITY,
-                        resume_box_index=resume_box_index,
-                        resume_next_url=resume_next_url,
-                        resume_seen_image_ids=tuple(
-                        row.metadata.mapillary_image_id
-                        for row in checkpoint.rows_by_city[area.city]
-                    ),
-                        resume_visited_page_sha256=resume_visited,
-                        page_observer=observe_page,
+                    progress(
+                        city,
+                        client.page_count,
+                        (
+                            "metadata_city_quota_checkpointed"
+                            if city_quota_reached
+                            else "metadata_page_checkpointed"
+                        ),
                     )
-                )
-            except MapillaryApiError as exc:
-                if exc.code != "mapillary_api_server_retry_exhausted":
-                    raise
+                if city_quota_reached:
+                    raise _MetadataCityQuotaReached
                 _require(
-                    checkpoint_path is not None,
-                    "MAPILLARY_PARTITION_CHECKPOINT_REQUIRED",
+                    not global_quota_reached,
+                    "MAPILLARY_GLOBAL_METADATA_QUOTA_REACHED",
                 )
-                _subdivide_failed_metadata_cell(
-                    checkpoint,
-                    areas=areas,
-                    checkpoint_path=cast(Path, checkpoint_path),
+
+            if len(checkpoint.rows_by_city[area.city]) < MAX_METADATA_ITEMS_PER_CITY:
+                _require(
+                    sum(len(rows) for rows in checkpoint.rows_by_city.values())
+                    < MAX_METADATA_ITEMS_TOTAL,
+                    "MAPILLARY_GLOBAL_METADATA_QUOTA_REACHED",
                 )
-                raise
+                try:
+                    tuple(
+                        client.iter_images(
+                            tuple(cell.bbox for cell in checkpoint.cells_by_city[area.city]),
+                            include_thumbnail=False,
+                            item_cap=MAX_METADATA_ITEMS_TOTAL,
+                            resume_box_index=resume_box_index,
+                            resume_next_url=resume_next_url,
+                            resume_seen_image_ids=tuple(
+                                row.metadata.mapillary_image_id
+                                for row in checkpoint.rows_by_city[area.city]
+                            ),
+                            resume_visited_page_sha256=resume_visited,
+                            page_observer=observe_page,
+                        )
+                    )
+                except _MetadataCityQuotaReached:
+                    pass
+                except MapillaryApiError as exc:
+                    if exc.code != "mapillary_api_server_retry_exhausted":
+                        raise
+                    _require(
+                        checkpoint_path is not None,
+                        "MAPILLARY_PARTITION_CHECKPOINT_REQUIRED",
+                    )
+                    _subdivide_failed_metadata_cell(
+                        checkpoint,
+                        areas=areas,
+                        checkpoint_path=cast(Path, checkpoint_path),
+                    )
+                    raise
+                except MapillaryLimitError as exc:
+                    if exc.code == "mapillary_item_cap_reached":
+                        raise Phase3FCloudJobError(
+                            "MAPILLARY_METADATA_QUOTA_INVARIANT_FAILED"
+                        ) from exc
+                    raise
             checkpoint.city_index = area_index + 1
             checkpoint.box_index = 0
             checkpoint.next_url = None
@@ -1019,6 +1079,8 @@ def audit_metadata(
                 "candidate_cities": sorted(CANDIDATE_CITY_REGIONS),
                 "area_count": len(areas),
                 "metadata_item_cap_per_city": MAX_METADATA_ITEMS_PER_CITY,
+                "metadata_item_cap_total": MAX_METADATA_ITEMS_TOTAL,
+                "metadata_quota_semantics": "first_seen_stop_city_then_advance_v1",
                 "score": "sequence_contributor_spatial_year_eligible_integer_v1",
             }
         )

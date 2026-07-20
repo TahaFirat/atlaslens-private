@@ -69,6 +69,19 @@ city 0/cell 8 with its eight pages, 469 rows, and 8/16/0 page/request/rejected
 counters preserved. Resume continues that same run ID at the first depth-one
 child.
 
+Metadata capacity is a deterministic balance policy, not permission to seal a
+partial dense city. Each of the sixteen cities admits at most 600 first-seen
+rows, and the global metadata quota is 9,600. When a page crosses a city quota,
+only the ordered prefix needed to reach 600 is atomically checkpointed; cursor
+state for that city is cleared and acquisition advances to the next city. The
+underlying generic client retains its 20,000-item safety ceiling. Unexpected
+generic item-cap or premature global-quota exhaustion is terminal rather than a
+Resume loop. For the current run, İstanbul has 569 unique rows, cells 0-8 are
+complete and cell 9 is active; all other cities remain unaudited. No imagery has
+been downloaded. The next Resume may admit at most 9,031 further metadata rows
+before the global quota, and sealing remains unavailable until all sixteen city
+audits and multi-region selection gates pass.
+
 ## Commands
 
 Dry-run from any PowerShell working directory:

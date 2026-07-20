@@ -22,6 +22,8 @@ from atlaslens_api.phase3f.cloud_job import (
     LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA,
     LEGACY_V2_METADATA_PAGE_CHECKPOINT_SCHEMA,
     MAX_ADAPTIVE_PARTITION_DEPTH,
+    MAX_METADATA_ITEMS_PER_CITY,
+    MAX_METADATA_ITEMS_TOTAL,
     METADATA_PAGE_CHECKPOINT_SCHEMA,
     CityArea,
     Phase3FCloudJobError,
@@ -67,6 +69,23 @@ def _row(identifier: str) -> dict[str, object]:
         "width": 1024,
         "height": 768,
     }
+
+
+def _checkpoint_row(identifier: str) -> RemoteImage:
+    return RemoteImage(
+        ImageMetadata.model_validate(
+            {
+                "mapillary_image_id": identifier,
+                "computed_geometry": {
+                    "type": "Point",
+                    "coordinates": (32.85, 39.93),
+                },
+                "captured_at": "2024-01-01T00:00:00+00:00",
+                "sequence_id": f"sequence-{identifier}",
+                "creator_id": f"creator-{identifier}",
+            }
+        )
+    )
 
 
 def _manual_module() -> ModuleType:
@@ -478,9 +497,165 @@ def test_local_partition_limit_errors_are_terminal() -> None:
         == "ACQUISITION_FAILED_TERMINAL"
     )
     assert (
+        module._acquisition_failure_stage("MAPILLARY_GLOBAL_METADATA_QUOTA_REACHED")
+        == "ACQUISITION_FAILED_TERMINAL"
+    )
+    assert (
+        module._acquisition_failure_stage("MAPILLARY_METADATA_QUOTA_INVARIANT_FAILED")
+        == "ACQUISITION_FAILED_TERMINAL"
+    )
+    assert (
         module._acquisition_failure_stage("MAPILLARY_API_SERVER_RETRY_EXHAUSTED")
         == "ACQUISITION_FAILED_RESUMABLE"
     )
+
+
+def test_city_quota_preserves_existing_rows_and_advances_without_resume_loop(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "work" / "metadata-pages.json"
+    area = CityArea("Ankara", 32.85, 39.93, 0.01)
+    state = _new_metadata_page_checkpoint((area,), "5" * 32)
+    existing_ids = [f"existing-{index:03d}" for index in range(569)]
+    state.rows_by_city["Ankara"].extend(
+        _checkpoint_row(identifier) for identifier in existing_ids
+    )
+    state.box_index = 9
+    _write_metadata_page_checkpoint(checkpoint_path, state)
+    observed: list[httpx.Request] = []
+    progress_stages: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    _row("existing-000"),
+                    _row("existing-568"),
+                    *[_row(f"new-{index:03d}") for index in range(100)],
+                ]
+            },
+        )
+
+    limits = ClientLimits(request_cap=4, page_cap=4, retry_cap=0)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(FAKE_TOKEN, limits=limits, http_client=http_client)
+        with pytest.raises(CoverageInsufficient):
+            audit_metadata(
+                client,
+                (area,),
+                checkpoint=state,
+                checkpoint_path=checkpoint_path,
+                run_id="5" * 32,
+                progress=lambda _city, _pages, stage: progress_stages.append(stage),
+            )
+
+    persisted = _load_metadata_page_checkpoint(
+        checkpoint_path,
+        areas=(area,),
+        run_id="5" * 32,
+    )
+    persisted_ids = [
+        row.metadata.mapillary_image_id for row in persisted.rows_by_city["Ankara"]
+    ]
+    assert len(observed) == 1
+    assert persisted_ids[:569] == existing_ids
+    assert persisted_ids[569:] == [f"new-{index:03d}" for index in range(31)]
+    assert len(persisted_ids) == MAX_METADATA_ITEMS_PER_CITY
+    assert len(set(persisted_ids)) == MAX_METADATA_ITEMS_PER_CITY
+    assert persisted.city_index == 1
+    assert persisted.next_url is None
+    assert progress_stages == [
+        "metadata_city_quota_checkpointed",
+        "metadata_city_complete",
+    ]
+
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("completed quota city must not be requested again")
+
+    with httpx.Client(transport=httpx.MockTransport(unexpected_request)) as http_client:
+        client = MapillaryClient(FAKE_TOKEN, limits=limits, http_client=http_client)
+        with pytest.raises(CoverageInsufficient):
+            audit_metadata(
+                client,
+                (area,),
+                checkpoint=persisted,
+                checkpoint_path=checkpoint_path,
+                run_id="5" * 32,
+            )
+    assert client.request_count == 0
+
+
+def test_dense_cities_receive_equal_bounded_metadata_quotas(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "work" / "metadata-pages.json"
+    areas = (
+        CityArea("Ankara", 32.85, 39.93, 0.01),
+        CityArea("İstanbul", 28.98, 41.01, 0.01),
+    )
+    state = _new_metadata_page_checkpoint(areas, "6" * 32)
+    request_number = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal request_number
+        prefix = f"city-{request_number}"
+        request_number += 1
+        return httpx.Response(
+            200,
+            json={"data": [_row(f"{prefix}-{index:03d}") for index in range(650)]},
+        )
+
+    limits = ClientLimits(request_cap=4, page_cap=4, retry_cap=0)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(FAKE_TOKEN, limits=limits, http_client=http_client)
+        with pytest.raises(CoverageInsufficient):
+            audit_metadata(
+                client,
+                areas,
+                checkpoint=state,
+                checkpoint_path=checkpoint_path,
+                run_id="6" * 32,
+            )
+
+    persisted = _load_metadata_page_checkpoint(
+        checkpoint_path,
+        areas=areas,
+        run_id="6" * 32,
+    )
+    assert request_number == 2
+    assert [len(persisted.rows_by_city[area.city]) for area in areas] == [600, 600]
+    assert sum(len(rows) for rows in persisted.rows_by_city.values()) == 1_200
+    assert MAX_METADATA_ITEMS_TOTAL == 16 * MAX_METADATA_ITEMS_PER_CITY
+
+
+def test_unexpected_client_item_cap_is_typed_terminal_invariant() -> None:
+    area = CityArea("Ankara", 32.85, 39.93, 0.01)
+    state = _new_metadata_page_checkpoint((area,), "7" * 32)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [_row("first"), _row("second")]},
+        )
+
+    limits = ClientLimits(
+        request_cap=2,
+        page_cap=2,
+        metadata_item_cap=1,
+        retry_cap=0,
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(FAKE_TOKEN, limits=limits, http_client=http_client)
+        with pytest.raises(
+            Phase3FCloudJobError,
+            match="MAPILLARY_METADATA_QUOTA_INVARIANT_FAILED",
+        ):
+            audit_metadata(
+                client,
+                (area,),
+                checkpoint=state,
+                run_id="7" * 32,
+            )
 
 
 def test_metadata_resume_retains_cursor_loop_guard(tmp_path: Path) -> None:

@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-20T15:29:26+03:00
+last_verified_at: 2026-07-20T15:48:31+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: local_first_adaptive_pagination_v3_resume_ready
+product_phase_status: local_first_balanced_metadata_quota_resume_ready
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -374,8 +374,16 @@ phase_3f_adaptive_bounds: max_depth_4_min_child_area_0_000001_max_cells_per_city
 phase_3f_adaptive_current_rows: pass_469_rows_sha256_preserved_ca64e9668308d48d80a9a594c6e3c38e87ac50754696f814399624d3b99594dd
 phase_3f_adaptive_current_counters: pass_pages_8_requests_16_rejected_0
 phase_3f_adaptive_current_checkpoint: v3_city0_box8_child_depth1_subdivision_count1_cursor_absent
-phase_3f_local_focused_tests: pass_26_adaptive_resume
-phase_3f_local_full_tests: pass_176_phase3f
+phase_3f_capacity_current: istanbul_569_unique_eligible_cells0_8_complete_cell9_active_other15_unaudited
+phase_3f_capacity_counters: requests18_pages10_rejected0
+phase_3f_capacity_media: files0_bytes0_not_sealed
+phase_3f_capacity_policy: per_city600_global9600_first_seen_prefix_then_advance
+phase_3f_capacity_remaining: max9031_metadata_rows_then_multiregion_selection_and_bounded_media_acquisition
+phase_3f_capacity_terminal_invariants: unexpected_client_item_cap_or_premature_global_exhaustion_no_resume_loop
+phase_3f_capacity_static: pass_ruff_strict_mypy_12_sources
+phase_3f_capacity_task_network_cloud_gpu: zero
+phase_3f_local_focused_tests: pass_29_capacity_resume
+phase_3f_local_full_tests: pass_179_phase3f
 phase_3f_local_static: pass_ruff_strict_mypy_2_changed_sources
 phase_3f_local_network_calls: diagnostic_user_executed_10_metadata_gets_fix_task_zero
 phase_3f_local_cloud_mutations: zero
@@ -436,9 +444,43 @@ next_phase: phase_6c_in_progress
 
 # AtlasLens project state
 
+## Product Phase 3F bounded Mapillary metadata capacity
+
+Status: **LOCAL HOTFIX COMPLETE - MULTI-REGION ACQUISITION MUST CONTINUE**.
+
+The current run did not encounter another provider/server failure. Its exact
+local evidence is 569 unique metadata rows, all eligible and all assigned to
+İstanbul at city index 0. Cells 0-8 are complete, cell 9 is the active
+first-page request, and the remaining fifteen cities have zero rows and zero
+completed cells. Client counters are 18 requests, 10 parsed pages, and zero
+rejected rows. Image acquisition has not started: `private-media` contains zero
+files and zero bytes, and no acquisition checkpoint or seal exists.
+
+The 600 value was the Phase 3F per-city metadata policy but was incorrectly
+used as the generic iterator's exception-producing item cap. With 569 persisted
+rows, the next parsed page contained enough first-seen rows to cross 600; the
+generic iterator raised before the observer could checkpoint the 31-row prefix.
+The existing checkpoint therefore remains valid and unchanged rather than
+containing a partial over-cap page.
+
+Phase 3F now enforces a deterministic 600-row quota for each of sixteen cities
+and an explicit 9,600-row global quota. A crossing page contributes only the
+first-seen prefix needed to fill its city quota, atomically closes that city,
+and advances. The generic 20,000-item safety ceiling remains in place, and an
+unexpected generic cap or premature global exhaustion becomes a typed terminal
+invariant instead of another Resume loop. No schema migration or current-run
+mutation was required.
+
+The run is not sealed because fifteen cities, the multi-region coverage lock,
+selection, media acquisition, and checksum sealing remain incomplete. At most
+9,031 further metadata rows may be admitted; any later media phase remains
+bounded by existing role/image/request/page/7-GiB limits. The focused capacity
+suite passed 29 tests and the complete Phase 3F suite passed 179. No token-based
+request, image download, GPU, RunPod, cloud mutation, or push occurred.
+
 ## Product Phase 3F adaptive Mapillary pagination partition
 
-Status: **LOCAL HOTFIX COMPLETE - SAME RUN READY TO RESUME**.
+Status: **HISTORICAL REPAIR COMPLETE - SUPERSEDED BY CAPACITY CHECKPOINT**.
 
 Run `ce23d58c42bf76e6de0b0117725e3ea7` retained eight completed pages before
 bounded server retry exhaustion. The sanitized private checkpoint facts were
@@ -459,11 +501,12 @@ v2 checkpoint can be parsed, subdivided, and published in one atomic replace.
 The named run was migrated offline to v3 at city 0/cell 8, child depth one,
 with one subdivision. Its accepted-row canonical SHA-256 remained
 `ca64e9668308d48d80a9a594c6e3c38e87ac50754696f814399624d3b99594dd`
-before and after; the 8/16/0 counters remain intact. Status remains
-`ACQUISITION_FAILED_RESUMABLE` until the operator runs Resume. The focused
-adaptive suite passed 26 tests and all 176 Phase 3F tests passed. Ruff and
-strict mypy passed. No network, image download, acquisition, GPU, RunPod,
-cloud mutation, or push occurred.
+before and after; the 8/16/0 counters remained intact at migration time. The
+operator subsequently resumed this checkpoint successfully and reached the
+bounded metadata-capacity state recorded above. The focused adaptive suite
+passed 26 tests and all 176 Phase 3F tests passed at that repair point. No
+network, image download, acquisition, GPU, RunPod, cloud mutation, or push was
+performed by the repair itself.
 
 ## Product Phase 3F existing-Pod secret inheritance hotfix
 
