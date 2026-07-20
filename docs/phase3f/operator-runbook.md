@@ -58,6 +58,26 @@ sequence/contributor concentration gates, plus secret/private-path scans. A
 failure produces one `DATASET_NOT_READY_FOR_TRAINING` report with
 `gpu_started=false` and `cloud_mutations=0`.
 
+Metadata split feasibility is evaluated before any image download. Contributor
+and sequence connected components are assigned to one role, the one-kilometre
+reference/locked-holdout exclusion is enforced, and the locked per-city
+minimums are never lowered. A feasible plan downloads only 830 primary records
+plus at most ten reserves for each of the twenty city/role buckets (1,030
+candidates maximum), not the whole metadata corpus. Decode failures, exact
+duplicates, and perceptual duplicates within Hamming distance four are removed
+after download; deterministic reserves refill the affected bucket before the
+split can seal.
+
+`training-readiness.json` distinguishes metadata feasibility from post-media
+readiness and reports sanitized required/available/deficit values. A genuinely
+infeasible checkpoint enters `DATASET_SUPPLEMENTAL_REQUIRED` with explicit
+request (512), metadata-record (600), media-byte (zero), and wall-time
+(30-minute) supplemental caps. Only deficient buckets are targeted, completed
+cells are not queried again, existing metadata/media remain intact, provider
+failures keep the v4 quarantine behavior, and a later Resume rebuilds the split
+from the preserved checkpoint. Repeating Resume without new admissible data
+reproduces the same bounded report instead of another generic failure loop.
+
 Training freezes most of pinned MegaLoc and fine-tunes a bounded tail with a
 batch-hard cosine metric objective, AdamW, real backward/optimizer steps,
 mixed precision, deterministic seed and train-only augmentation. Batch size is

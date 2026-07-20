@@ -68,7 +68,17 @@ from atlaslens_api.phase3f.pipeline import (
     DescriptorPublication,
     Phase3FPipeline,
 )
-from atlaslens_api.phase3f.splits import SplitAsset, seal_split
+from atlaslens_api.phase3f.splits import (
+    MIN_CALIBRATION_PER_CITY,
+    MIN_HOLDOUT_PER_CITY,
+    MIN_OOD_PER_CITY,
+    MIN_REFERENCE_PER_CITY,
+    NEAR_DUPLICATE_HAMMING,
+    SPATIAL_EXCLUSION_METERS,
+    SplitAsset,
+    audit_leakage,
+    seal_split,
+)
 
 MODEL_SIZE_BYTES: Final = 914_577_436
 MEGALOC_CANONICAL_SOURCE_SHA256: Final = (
@@ -97,6 +107,12 @@ METADATA_PAGE_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-metadata-pages-v3"
 MAX_ADAPTIVE_PARTITION_DEPTH: Final = 4
 MIN_ADAPTIVE_BBOX_AREA: Final = 1e-6
 MAX_ADAPTIVE_CELLS_PER_CITY: Final = 4_096
+SPLIT_RESERVE_PER_BUCKET: Final = 10
+SPLIT_SOLVER_BEAM_WIDTH: Final = 5_000
+SPLIT_SOLVER_MAX_ORDERINGS: Final = 8
+SUPPLEMENTAL_REQUEST_CAP: Final = 512
+SUPPLEMENTAL_METADATA_CAP: Final = 600
+SUPPLEMENTAL_WALL_SECONDS: Final = 30 * 60
 
 Role = Literal["reference", "calibration", "sealed_holdout", "ood_holdout"]
 
@@ -321,6 +337,31 @@ class MetadataAsset:
 class PlannedAsset:
     metadata: MetadataAsset
     role: Role
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataSplitPlan:
+    primary: tuple[PlannedAsset, ...]
+    reserves: tuple[PlannedAsset, ...]
+    readiness: Mapping[str, object]
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.readiness.get("ready"))
+
+    @property
+    def download_assets(self) -> tuple[PlannedAsset, ...]:
+        return self.primary + self.reserves
+
+
+@dataclass(frozen=True, slots=True)
+class MediaSplitPlan:
+    assets: tuple[SplitAsset, ...]
+    readiness: Mapping[str, object]
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.readiness.get("ready"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1156,86 +1197,575 @@ def _distance_m(left: MetadataAsset, right: MetadataAsset) -> float:
     return 2 * radius * math.asin(min(1.0, math.sqrt(hav)))
 
 
-def _take_from_creator(
-    assets: Sequence[MetadataAsset],
-    *,
-    count: int,
-    forbidden_creators: set[str],
-    forbidden_sequences: set[str],
-    separated_from: Sequence[MetadataAsset] = (),
-) -> tuple[MetadataAsset, ...]:
-    creators: dict[str, list[MetadataAsset]] = defaultdict(list)
-    for asset in assets:
-        if asset.creator_id is None or asset.sequence_id is None:
-            continue
-        if asset.creator_id in forbidden_creators or asset.sequence_id in forbidden_sequences:
-            continue
-        if any(_distance_m(asset, locked) < 1_000.0 for locked in separated_from):
-            continue
-        creators[asset.creator_id].append(asset)
-    ordered_creators = sorted(
-        creators,
-        key=lambda creator: _stable_key(assets[0].city if assets else "", creator),
-    )
-    selected: list[MetadataAsset] = []
-    used_creators: set[str] = set()
-    for creator in ordered_creators:
-        candidates = sorted(
-            creators[creator],
-            key=lambda item: _stable_key(item.city, item.sequence_id or "", item.image_id),
+_ROLE_ORDER: Final[tuple[Role, ...]] = (
+    "reference",
+    "calibration",
+    "sealed_holdout",
+    "ood_holdout",
+)
+
+
+def _split_requirements(audit: MetadataAudit) -> tuple[tuple[str, Role, int], ...]:
+    requirements: list[tuple[str, Role, int]] = []
+    for record in audit.selection.in_domain:
+        requirements.extend(
+            (
+                (record.city, "reference", MIN_REFERENCE_PER_CITY),
+                (record.city, "calibration", MIN_CALIBRATION_PER_CITY),
+                (record.city, "sealed_holdout", MIN_HOLDOUT_PER_CITY),
+            )
         )
-        for candidate in candidates:
-            if candidate.sequence_id in forbidden_sequences:
-                continue
-            selected.append(candidate)
-            used_creators.add(creator)
-            if len(selected) == count:
-                forbidden_creators.update(used_creators)
-                forbidden_sequences.update(
-                    item.sequence_id for item in selected if item.sequence_id is not None
+    requirements.extend(
+        (record.city, "ood_holdout", MIN_OOD_PER_CITY)
+        for record in audit.selection.ood
+    )
+    return tuple(requirements)
+
+
+def _metadata_isolation_groups(
+    audit: MetadataAudit,
+) -> tuple[tuple[str, tuple[MetadataAsset, ...]], ...]:
+    cities = {
+        record.city for record in (*audit.selection.in_domain, *audit.selection.ood)
+    }
+    assets = tuple(
+        asset
+        for city in sorted(cities)
+        for asset in audit.assets_by_city[city]
+        if asset.creator_id is not None and asset.sequence_id is not None
+    )
+    parents = list(range(len(assets)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    first_creator: dict[str, int] = {}
+    first_sequence: dict[str, int] = {}
+    for index, asset in enumerate(assets):
+        creator = cast(str, asset.creator_id)
+        sequence = cast(str, asset.sequence_id)
+        if creator in first_creator:
+            union(index, first_creator[creator])
+        else:
+            first_creator[creator] = index
+        if sequence in first_sequence:
+            union(index, first_sequence[sequence])
+        else:
+            first_sequence[sequence] = index
+    grouped: dict[int, list[MetadataAsset]] = defaultdict(list)
+    for index, asset in enumerate(assets):
+        grouped[find(index)].append(asset)
+    result = []
+    for values in grouped.values():
+        ordered = tuple(sorted(values, key=lambda item: _stable_key(item.image_id)))
+        group_sha256 = _sha256_bytes(
+            _canonical_bytes([item.image_id for item in ordered])
+        )
+        result.append((group_sha256, ordered))
+    return tuple(sorted(result, key=lambda item: item[0]))
+
+
+def _allocation_score(state: tuple[int, ...], target: tuple[int, ...]) -> tuple[int, ...]:
+    ratios = tuple(value * 1_000 // target[index] for index, value in enumerate(state))
+    return (
+        sum(value >= target[index] for index, value in enumerate(state)),
+        min(ratios, default=0),
+        sum(state),
+        -sum((target[index] - value) ** 2 for index, value in enumerate(state)),
+    )
+
+
+def _solve_isolation_allocation(
+    groups: Sequence[tuple[str, tuple[MetadataAsset, ...]]],
+    requirements: Sequence[tuple[str, Role, int]],
+    *,
+    reserve_per_bucket: int,
+    ordering: int,
+) -> tuple[dict[str, Role] | None, tuple[int, ...]]:
+    target = tuple(required + reserve_per_bucket for _city, _role, required in requirements)
+    ordered = sorted(
+        groups,
+        key=lambda item: _stable_key("split-solver", str(ordering), item[0]),
+    )
+    vectors: list[tuple[tuple[int, ...], ...]] = []
+    choices: list[tuple[int, ...]] = []
+    for _group_sha256, assets in ordered:
+        role_vectors: list[tuple[int, ...]] = [tuple(0 for _item in requirements)]
+        role_choices = [0]
+        for role_index, role in enumerate(_ROLE_ORDER, start=1):
+            vector = tuple(
+                sum(asset.city == city for asset in assets) if item_role == role else 0
+                for city, item_role, _required in requirements
+            )
+            role_vectors.append(vector)
+            if any(vector):
+                role_choices.append(role_index)
+        vectors.append(tuple(role_vectors))
+        choices.append(tuple(role_choices))
+    states: dict[tuple[int, ...], bytes] = {
+        tuple(0 for _item in requirements): b""
+    }
+    best_state = next(iter(states))
+    for group_index, _group in enumerate(ordered):
+        next_states: dict[tuple[int, ...], bytes] = {}
+        for state, assignment in states.items():
+            for role_index in choices[group_index]:
+                vector = vectors[group_index][role_index]
+                next_state = tuple(
+                    min(target[index], state[index] + vector[index])
+                    for index in range(len(target))
                 )
-                return tuple(selected)
-    raise Phase3FCloudJobError("SPLIT_MINIMUM_UNAVAILABLE")
+                next_states.setdefault(next_state, assignment + bytes((role_index,)))
+        if len(next_states) > SPLIT_SOLVER_BEAM_WIDTH:
+            retained = sorted(
+                next_states,
+                key=lambda state: (_allocation_score(state, target), state),
+                reverse=True,
+            )[:SPLIT_SOLVER_BEAM_WIDTH]
+            next_states = {state: next_states[state] for state in retained}
+        states = next_states
+        best_state = max(states, key=lambda state: (_allocation_score(state, target), state))
+        if target in states:
+            assignment = states[target]
+            result: dict[str, Role] = {}
+            for index, (group_sha256, _assets) in enumerate(ordered):
+                role_index = assignment[index] if index < len(assignment) else 0
+                if role_index:
+                    result[group_sha256] = _ROLE_ORDER[role_index - 1]
+            return result, target
+    return None, best_state
+
+
+def _ordered_metadata(assets: Iterable[MetadataAsset]) -> tuple[MetadataAsset, ...]:
+    return tuple(
+        sorted(
+            assets,
+            key=lambda item: _stable_key(
+                item.city, item.sequence_id or "", item.image_id
+            ),
+        )
+    )
+
+
+def _spatial_candidate_pools(
+    reference_pool: Sequence[MetadataAsset],
+    holdout_pool: Sequence[MetadataAsset],
+) -> tuple[tuple[MetadataAsset, ...], tuple[MetadataAsset, ...]] | None:
+    references = _ordered_metadata(reference_pool)
+    holdouts = _ordered_metadata(holdout_pool)
+    selected_holdouts: list[MetadataAsset] = []
+    blocked_references: set[int] = set()
+    desired_holdouts = MIN_HOLDOUT_PER_CITY + SPLIT_RESERVE_PER_BUCKET
+    while len(selected_holdouts) < desired_holdouts:
+        candidates: list[tuple[int, str, MetadataAsset, set[int]]] = []
+        selected_ids = {item.image_id for item in selected_holdouts}
+        for holdout in holdouts:
+            if holdout.image_id in selected_ids:
+                continue
+            newly_blocked = {
+                index
+                for index, reference in enumerate(references)
+                if index not in blocked_references
+                and _distance_m(reference, holdout) < SPATIAL_EXCLUSION_METERS
+            }
+            candidates.append(
+                (
+                    len(newly_blocked),
+                    _stable_key(holdout.city, holdout.image_id),
+                    holdout,
+                    newly_blocked,
+                )
+            )
+        if not candidates:
+            break
+        _blocked_count, _key, candidate, newly_blocked = min(
+            candidates, key=lambda item: (item[0], item[1])
+        )
+        remaining = len(references) - len(blocked_references | newly_blocked)
+        if len(selected_holdouts) >= MIN_HOLDOUT_PER_CITY and remaining < (
+            MIN_REFERENCE_PER_CITY + SPLIT_RESERVE_PER_BUCKET
+        ):
+            break
+        selected_holdouts.append(candidate)
+        blocked_references.update(newly_blocked)
+    filtered_references = tuple(
+        item for index, item in enumerate(references) if index not in blocked_references
+    )
+    if (
+        len(selected_holdouts) < MIN_HOLDOUT_PER_CITY
+        or len(filtered_references) < MIN_REFERENCE_PER_CITY
+    ):
+        return None
+    return filtered_references, tuple(selected_holdouts)
+
+
+def _materialize_metadata_plan(
+    audit: MetadataAudit,
+    groups: Sequence[tuple[str, tuple[MetadataAsset, ...]]],
+    assignment: Mapping[str, Role],
+    requirements: Sequence[tuple[str, Role, int]],
+) -> tuple[
+    tuple[PlannedAsset, ...],
+    tuple[PlannedAsset, ...],
+    tuple[dict[str, object], ...],
+] | None:
+    pools: dict[tuple[str, Role], list[MetadataAsset]] = defaultdict(list)
+    group_counts: Counter[tuple[str, Role]] = Counter()
+    for group_sha256, assets in groups:
+        role = assignment.get(group_sha256)
+        if role is None:
+            continue
+        cities_seen: set[str] = set()
+        for asset in assets:
+            key = (asset.city, role)
+            if any(city == asset.city and item_role == role for city, item_role, _ in requirements):
+                pools[key].append(asset)
+                cities_seen.add(asset.city)
+        group_counts.update((city, role) for city in cities_seen)
+    candidate_pools: dict[tuple[str, Role], tuple[MetadataAsset, ...]] = {}
+    for record in audit.selection.in_domain:
+        spatial = _spatial_candidate_pools(
+            pools[(record.city, "reference")],
+            pools[(record.city, "sealed_holdout")],
+        )
+        if spatial is None:
+            return None
+        references, holdouts = spatial
+        candidate_pools[(record.city, "reference")] = references
+        candidate_pools[(record.city, "sealed_holdout")] = holdouts
+        candidate_pools[(record.city, "calibration")] = _ordered_metadata(
+            pools[(record.city, "calibration")]
+        )
+    for record in audit.selection.ood:
+        candidate_pools[(record.city, "ood_holdout")] = _ordered_metadata(
+            pools[(record.city, "ood_holdout")]
+        )
+    primary: list[PlannedAsset] = []
+    reserves: list[PlannedAsset] = []
+    buckets: list[dict[str, object]] = []
+    for city, role, required in requirements:
+        pool = candidate_pools[(city, role)]
+        if len(pool) < required:
+            return None
+        primary.extend(PlannedAsset(item, role) for item in pool[:required])
+        reserve_count = min(SPLIT_RESERVE_PER_BUCKET, len(pool) - required)
+        reserves.extend(
+            PlannedAsset(item, role) for item in pool[required : required + reserve_count]
+        )
+        buckets.append(
+            {
+                "city": city,
+                "role": role,
+                "required_records": required,
+                "available_records": len(pool),
+                "available_isolation_groups": group_counts[(city, role)],
+                "available_sequences": len(
+                    {item.sequence_id for item in pool if item.sequence_id is not None}
+                ),
+                "primary_records": required,
+                "reserve_records": reserve_count,
+                "deficit_records": 0,
+            }
+        )
+    return tuple(primary), tuple(reserves), tuple(buckets)
+
+
+def _metadata_readiness_document(
+    audit: MetadataAudit,
+    *,
+    primary: Sequence[PlannedAsset],
+    reserves: Sequence[PlannedAsset],
+    buckets: Sequence[Mapping[str, object]],
+    solver_ordering: int | None,
+    failed_constraints: Sequence[Mapping[str, object]] = (),
+) -> dict[str, object]:
+    ready = not failed_constraints
+    selected_cities = {
+        record.city for record in (*audit.selection.in_domain, *audit.selection.ood)
+    }
+    total_eligible = sum(len(items) for items in audit.assets_by_city.values())
+    selected_eligible = sum(len(audit.assets_by_city[city]) for city in selected_cities)
+    plan_sha256 = _planned_acquisition_sha256((*primary, *reserves)) if ready else None
+    targets = [
+        {
+            "city": item.get("city"),
+            "role": item.get("role"),
+            "missing_records": item.get("deficit_records"),
+            "minimum_new_isolation_groups": 1,
+        }
+        for item in failed_constraints
+    ]
+    return {
+        "schema": "atlaslens-phase3f-training-readiness-v2",
+        "stage": "metadata_split_feasibility",
+        "ready": ready,
+        "metadata_acquisition_complete": True,
+        "metadata_eligible_records": total_eligible,
+        "selected_scope_eligible_records": selected_eligible,
+        "media_downloaded_records": 0,
+        "primary_record_count": len(primary),
+        "reserve_record_count": len(reserves),
+        "metadata_plan_sha256": plan_sha256,
+        "solver": {
+            "name": "deterministic_constraint_aware_beam_v1",
+            "beam_width": SPLIT_SOLVER_BEAM_WIDTH,
+            "ordering": solver_ordering,
+            "minimums_lowered": False,
+        },
+        "buckets": list(buckets),
+        "failed_constraints": list(failed_constraints),
+        "isolation": {
+            "sequence_cross_split": 0 if ready else None,
+            "contributor_cross_split": 0 if ready else None,
+            "spatial_exclusion_meters": SPATIAL_EXCLUSION_METERS,
+            "spatial_violations": 0 if ready else None,
+            "exact_hash_groups": "pending_media",
+            "perceptual_hash_groups": "pending_media",
+        },
+        "next_automatic_action": (
+            "DOWNLOAD_BOUNDED_PRIMARY_AND_RESERVE_MEDIA"
+            if ready
+            else "ACQUIRE_BOUNDED_TARGETED_METADATA"
+        ),
+        "supplemental_acquisition": {
+            "required": not ready,
+            "targets": targets,
+            "request_cap": SUPPLEMENTAL_REQUEST_CAP,
+            "metadata_record_cap": SUPPLEMENTAL_METADATA_CAP,
+            "media_byte_cap": 0,
+            "wall_seconds": SUPPLEMENTAL_WALL_SECONDS,
+            "query_completed_cells": False,
+            "preserve_existing_metadata_and_media": True,
+            "scheduler_schema": "atlaslens-phase3f-acquisition-scheduler-v4",
+            "provider_failures_quarantined": True,
+            "rebuild_split_after_resume": True,
+        },
+        "gpu_started": False,
+        "cloud_mutations": 0,
+        "secrets_included": False,
+    }
+
+
+def _structural_metadata_failures(
+    audit: MetadataAudit,
+    groups: Sequence[tuple[str, tuple[MetadataAsset, ...]]],
+    requirements: Sequence[tuple[str, Role, int]],
+) -> tuple[dict[str, object], ...]:
+    failures: list[dict[str, object]] = []
+    requirements_by_city: dict[str, list[tuple[Role, int]]] = defaultdict(list)
+    for city, role, required in requirements:
+        requirements_by_city[city].append((role, required))
+    for city, city_requirements in requirements_by_city.items():
+        assets = tuple(audit.assets_by_city[city])
+        required_total = sum(required for _role, required in city_requirements)
+        if len(assets) < required_total:
+            failures.append(
+                {
+                    "constraint": "city_total_minimum",
+                    "city": city,
+                    "role": None,
+                    "required_records": required_total,
+                    "available_records": len(assets),
+                    "deficit_records": required_total - len(assets),
+                }
+            )
+            continue
+        touching_groups = sum(
+            any(asset.city == city for asset in group_assets)
+            for _group_sha256, group_assets in groups
+        )
+        if touching_groups < len(city_requirements):
+            failures.append(
+                {
+                    "constraint": "city_isolation_group_minimum",
+                    "city": city,
+                    "role": None,
+                    "required_records": len(city_requirements),
+                    "available_records": touching_groups,
+                    "deficit_records": len(city_requirements) - touching_groups,
+                }
+            )
+            continue
+        if any(role == "reference" for role, _required in city_requirements):
+            coordinates = [
+                asset.remote.metadata.computed_geometry.coordinates for asset in assets
+            ]
+            longitude_span = max(item[0] for item in coordinates) - min(
+                item[0] for item in coordinates
+            )
+            latitude_span = max(item[1] for item in coordinates) - min(
+                item[1] for item in coordinates
+            )
+            bounding_diagonal_meters = math.hypot(
+                longitude_span * 111_320.0,
+                latitude_span * 111_320.0,
+            )
+            if bounding_diagonal_meters < SPATIAL_EXCLUSION_METERS:
+                failures.append(
+                    {
+                        "constraint": "spatial_separation_allocation",
+                        "city": city,
+                        "role": "reference",
+                        "required_records": MIN_REFERENCE_PER_CITY,
+                        "available_records": 0,
+                        "deficit_records": MIN_REFERENCE_PER_CITY,
+                        "required_distance_meters": SPATIAL_EXCLUSION_METERS,
+                        "available_bounding_diagonal_meters": round(
+                            bounding_diagonal_meters, 3
+                        ),
+                    }
+                )
+    return tuple(failures)
+
+
+def plan_metadata_split(audit: MetadataAudit) -> MetadataSplitPlan:
+    requirements = _split_requirements(audit)
+    groups = _metadata_isolation_groups(audit)
+    structural_failures = _structural_metadata_failures(audit, groups, requirements)
+    if structural_failures:
+        buckets = tuple(
+            {
+                "city": city,
+                "role": role,
+                "required_records": required,
+                "available_records": min(required, len(audit.assets_by_city[city])),
+                "available_isolation_groups": sum(
+                    any(asset.city == city for asset in group_assets)
+                    for _group_sha256, group_assets in groups
+                ),
+                "available_sequences": len(
+                    {
+                        asset.sequence_id
+                        for asset in audit.assets_by_city[city]
+                        if asset.sequence_id is not None
+                    }
+                ),
+                "primary_records": 0,
+                "reserve_records": 0,
+                "deficit_records": 0,
+            }
+            for city, role, required in requirements
+        )
+        readiness = _metadata_readiness_document(
+            audit,
+            primary=(),
+            reserves=(),
+            buckets=buckets,
+            solver_ordering=None,
+            failed_constraints=structural_failures,
+        )
+        return MetadataSplitPlan((), (), readiness)
+    best_state = tuple(0 for _item in requirements)
+    required_by_city: Counter[str] = Counter()
+    role_count_by_city: Counter[str] = Counter()
+    for city, _role, required in requirements:
+        required_by_city[city] += required
+        role_count_by_city[city] += 1
+    reserve_capacity_possible = all(
+        len(audit.assets_by_city[city])
+        >= required_by_city[city]
+        + role_count_by_city[city] * SPLIT_RESERVE_PER_BUCKET
+        for city in required_by_city
+    )
+    reserve_modes = (SPLIT_RESERVE_PER_BUCKET, 0) if reserve_capacity_possible else (0,)
+    for reserve_per_bucket in reserve_modes:
+        for ordering in range(SPLIT_SOLVER_MAX_ORDERINGS):
+            assignment, state = _solve_isolation_allocation(
+                groups,
+                requirements,
+                reserve_per_bucket=reserve_per_bucket,
+                ordering=ordering,
+            )
+            if _allocation_score(state, tuple(item[2] for item in requirements)) > (
+                _allocation_score(best_state, tuple(item[2] for item in requirements))
+            ):
+                best_state = tuple(
+                    min(requirements[index][2], value)
+                    for index, value in enumerate(state)
+                )
+            if assignment is None:
+                continue
+            materialized = _materialize_metadata_plan(
+                audit, groups, assignment, requirements
+            )
+            if materialized is None:
+                continue
+            primary, reserves, buckets = materialized
+            _require(len(primary) <= MAX_IMAGES, "IMAGE_CAP_EXCEEDED")
+            _require(len(primary) + len(reserves) <= MAX_IMAGES, "IMAGE_CAP_EXCEEDED")
+            readiness = _metadata_readiness_document(
+                audit,
+                primary=primary,
+                reserves=reserves,
+                buckets=buckets,
+                solver_ordering=ordering,
+            )
+            return MetadataSplitPlan(primary, reserves, readiness)
+    failed: tuple[dict[str, object], ...] = tuple(
+        {
+            "constraint": "city_role_minimum",
+            "city": city,
+            "role": role,
+            "required_records": required,
+            "available_records": best_state[index],
+            "deficit_records": max(0, required - best_state[index]),
+        }
+        for index, (city, role, required) in enumerate(requirements)
+        if best_state[index] < required
+    )
+    if not failed:
+        failed = (
+            {
+                "constraint": "spatial_separation_allocation",
+                "city": None,
+                "role": "reference",
+                "required_records": MIN_REFERENCE_PER_CITY,
+                "available_records": 0,
+                "deficit_records": MIN_REFERENCE_PER_CITY,
+                "required_distance_meters": SPATIAL_EXCLUSION_METERS,
+            },
+        )
+    buckets = tuple(
+        {
+            "city": city,
+            "role": role,
+            "required_records": required,
+            "available_records": best_state[index],
+            "available_isolation_groups": None,
+            "available_sequences": None,
+            "primary_records": 0,
+            "reserve_records": 0,
+            "deficit_records": max(0, required - best_state[index]),
+        }
+        for index, (city, role, required) in enumerate(requirements)
+    )
+    readiness = _metadata_readiness_document(
+        audit,
+        primary=(),
+        reserves=(),
+        buckets=buckets,
+        solver_ordering=None,
+        failed_constraints=failed,
+    )
+    return MetadataSplitPlan((), (), readiness)
 
 
 def plan_locked_roles(audit: MetadataAudit) -> tuple[PlannedAsset, ...]:
-    planned: list[PlannedAsset] = []
-    forbidden_creators: set[str] = set()
-    forbidden_sequences: set[str] = set()
-    for record in audit.selection.in_domain:
-        pool = audit.assets_by_city[record.city]
-        holdout = _take_from_creator(
-            pool,
-            count=25,
-            forbidden_creators=forbidden_creators,
-            forbidden_sequences=forbidden_sequences,
-        )
-        calibration = _take_from_creator(
-            pool,
-            count=25,
-            forbidden_creators=forbidden_creators,
-            forbidden_sequences=forbidden_sequences,
-        )
-        reference = _take_from_creator(
-            pool,
-            count=75,
-            forbidden_creators=forbidden_creators,
-            forbidden_sequences=forbidden_sequences,
-            separated_from=holdout,
-        )
-        planned.extend(PlannedAsset(item, "reference") for item in reference)
-        planned.extend(PlannedAsset(item, "calibration") for item in calibration)
-        planned.extend(PlannedAsset(item, "sealed_holdout") for item in holdout)
-    for record in audit.selection.ood:
-        ood = _take_from_creator(
-            audit.assets_by_city[record.city],
-            count=40,
-            forbidden_creators=forbidden_creators,
-            forbidden_sequences=forbidden_sequences,
-        )
-        planned.extend(PlannedAsset(item, "ood_holdout") for item in ood)
-    _require(len(planned) <= MAX_IMAGES, "IMAGE_CAP_EXCEEDED")
-    return tuple(planned)
+    """Compatibility wrapper returning the locked primary records only."""
+
+    plan = plan_metadata_split(audit)
+    if not plan.ready:
+        raise Phase3FCloudJobError("SPLIT_MINIMUM_UNAVAILABLE")
+    return plan.primary
 
 
 def _verify_canonical_vendor_text(
@@ -1893,7 +2423,11 @@ def acquire_planned_assets(
         _require(len(completed) == len(planned), "PLANNED_IMAGE_UNAVAILABLE")
     _require(guard.media_bytes <= max_media_bytes, "MEDIA_CAP_EXCEEDED")
     return (
-        tuple(completed[item.metadata.image_id] for item in planned),
+        tuple(
+            completed[item.metadata.image_id]
+            for item in planned
+            if item.metadata.image_id in completed
+        ),
         {
             "schema": "atlaslens-phase3f-provenance-aggregate-v1",
             "asset_count": len(completed),
@@ -1908,6 +2442,233 @@ def acquire_planned_assets(
             "item_failure_reasons": dict(sorted(Counter(media_failures.values()).items())),
         },
     )
+
+
+def finalize_media_split(
+    plan: MetadataSplitPlan,
+    assets: Sequence[SplitAsset],
+) -> MediaSplitPlan:
+    """Deduplicate downloaded candidates and fill primary minima from reserves."""
+
+    _require(plan.ready, "METADATA_SPLIT_NOT_READY")
+    wanted = {
+        item.metadata.image_id: item for item in plan.download_assets
+    }
+    _require(len(wanted) == len(plan.download_assets), "PLANNED_IMAGE_DUPLICATE")
+    available: list[SplitAsset] = []
+    seen_parent_ids: set[str] = set()
+    for asset in assets:
+        planned = wanted.get(asset.parent_or_tile_id)
+        _require(
+            planned is not None
+            and asset.parent_or_tile_id not in seen_parent_ids
+            and asset.city == planned.metadata.city
+            and asset.role == planned.role,
+            "MEDIA_SPLIT_ASSET_UNPLANNED",
+        )
+        seen_parent_ids.add(asset.parent_or_tile_id)
+        available.append(asset)
+    parents = list(range(len(available)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    first_exact: dict[str, int] = {}
+    for index, asset in enumerate(available):
+        if asset.content_sha256 in first_exact:
+            union(index, first_exact[asset.content_sha256])
+        else:
+            first_exact[asset.content_sha256] = index
+    for left_index, left in enumerate(available):
+        for right_index in range(left_index + 1, len(available)):
+            right = available[right_index]
+            if (
+                int(left.perceptual_hash, 16) ^ int(right.perceptual_hash, 16)
+            ).bit_count() <= NEAR_DUPLICATE_HAMMING:
+                union(left_index, right_index)
+    components: dict[int, list[SplitAsset]] = defaultdict(list)
+    for index, asset in enumerate(available):
+        components[find(index)].append(asset)
+    buckets_value = plan.readiness.get("buckets")
+    _require(isinstance(buckets_value, list), "METADATA_READINESS_INVALID")
+    bucket_specs: list[tuple[str, Role, int]] = []
+    for value in cast(list[object], buckets_value):
+        _require(isinstance(value, dict), "METADATA_READINESS_INVALID")
+        row = cast(dict[str, object], value)
+        city = row.get("city")
+        role = row.get("role")
+        required = row.get("required_records")
+        _require(
+            isinstance(city, str)
+            and role in _ROLE_ORDER
+            and isinstance(required, int)
+            and not isinstance(required, bool)
+            and required > 0,
+            "METADATA_READINESS_INVALID",
+        )
+        bucket_specs.append(
+            (cast(str, city), cast(Role, role), cast(int, required))
+        )
+    primary_ids = {item.metadata.image_id for item in plan.primary}
+    component_rows = {
+        root: tuple(
+            sorted(
+                rows,
+                key=lambda item: (
+                    item.parent_or_tile_id not in primary_ids,
+                    _stable_key(item.city, item.role, item.parent_or_tile_id),
+                ),
+            )
+        )
+        for root, rows in components.items()
+    }
+    components_by_bucket = {
+        (city, role): tuple(
+            root
+            for root, rows in component_rows.items()
+            if any(item.city == city and item.role == role for item in rows)
+        )
+        for city, role, _required in bucket_specs
+    }
+    ordered_buckets = sorted(
+        bucket_specs,
+        key=lambda item: (
+            len(components_by_bucket[(item[0], item[1])]) * 1_000 // item[2],
+            _stable_key(item[0], item[1]),
+        ),
+    )
+    selected: list[SplitAsset] = []
+    used_components: set[int] = set()
+    selected_counts: Counter[tuple[str, Role]] = Counter()
+    for city, role, required in ordered_buckets:
+        candidate_components = sorted(
+            components_by_bucket[(city, role)],
+            key=lambda root: (
+                not any(
+                    item.parent_or_tile_id in primary_ids
+                    and item.city == city
+                    and item.role == role
+                    for item in component_rows[root]
+                ),
+                _stable_key(
+                    city,
+                    role,
+                    *(item.parent_or_tile_id for item in component_rows[root]),
+                ),
+            ),
+        )
+        for root in candidate_components:
+            if root in used_components:
+                continue
+            representative = next(
+                item
+                for item in component_rows[root]
+                if item.city == city and item.role == role
+            )
+            selected.append(representative)
+            used_components.add(root)
+            selected_counts[(city, role)] += 1
+            if selected_counts[(city, role)] == required:
+                break
+    failed_constraints = [
+        {
+            "constraint": "media_city_role_minimum_after_decode_and_dedup",
+            "city": city,
+            "role": role,
+            "required_records": required,
+            "available_records": selected_counts[(city, role)],
+            "deficit_records": required - selected_counts[(city, role)],
+        }
+        for city, role, required in bucket_specs
+        if selected_counts[(city, role)] < required
+    ]
+    leakage = audit_leakage(
+        selected, spatial_exclusion_meters=SPATIAL_EXCLUSION_METERS
+    )
+    if not leakage.passed:
+        failed_constraints.append(
+            {
+                "constraint": "media_leakage_audit",
+                "required_records": 0,
+                "available_records": sum(asdict(leakage).values()),
+                "deficit_records": sum(asdict(leakage).values()),
+            }
+        )
+    readiness = {
+        "schema": "atlaslens-phase3f-training-readiness-v2",
+        "stage": "media_split_readiness",
+        "ready": not failed_constraints,
+        "metadata_plan_sha256": plan.readiness.get("metadata_plan_sha256"),
+        "download_candidate_count": len(plan.download_assets),
+        "downloaded_usable_count": len(available),
+        "selected_primary_count": len(selected),
+        "exact_hash_group_count": len(first_exact),
+        "duplicate_component_count": len(component_rows),
+        "failed_constraints": failed_constraints,
+        "buckets": [
+            {
+                "city": city,
+                "role": role,
+                "required_records": required,
+                "available_records": selected_counts[(city, role)],
+                "deficit_records": max(0, required - selected_counts[(city, role)]),
+            }
+            for city, role, required in bucket_specs
+        ],
+        "isolation": leakage.document(),
+        "reserve_replacement_enabled": True,
+        "whole_corpus_downloaded": False,
+        "next_automatic_action": (
+            "SEAL_LEAKAGE_SAFE_SPLIT"
+            if not failed_constraints
+            else "ACQUIRE_BOUNDED_TARGETED_MEDIA_RESERVES"
+        ),
+        "gpu_started": False,
+        "cloud_mutations": 0,
+        "secrets_included": False,
+    }
+    return MediaSplitPlan(tuple(selected) if not failed_constraints else (), readiness)
+
+
+def finalize_provenance_aggregate(
+    provenance: Mapping[str, object],
+    assets: Sequence[SplitAsset],
+    media_root: Path,
+) -> dict[str, object]:
+    """Bind the published provenance aggregate to selected split assets only."""
+
+    prior_count = provenance.get("asset_count")
+    _require(
+        isinstance(prior_count, int)
+        and not isinstance(prior_count, bool)
+        and prior_count >= len(assets),
+        "PROVENANCE_AGGREGATE_INVALID",
+    )
+    typed_prior_count = cast(int, prior_count)
+    sidecar_hashes = [
+        _sha256_path(media_root / "private-sidecars" / f"{asset.opaque_id}.json")
+        for asset in assets
+    ]
+    return {
+        **provenance,
+        "asset_count": len(assets),
+        "download_candidate_count": typed_prior_count,
+        "discarded_or_reserve_count": typed_prior_count - len(assets),
+        "sidecar_sha256_set_sha256": _sha256_bytes(
+            _canonical_bytes(sorted(sidecar_hashes))
+        ),
+        "selected_split_only": True,
+        "secrets_included": False,
+    }
 
 
 class MegaLocRuntime:
@@ -2378,11 +3139,12 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                 return execution
             _atomic_json(config.output_root / "metadata-audit.json", audit.aggregate_document())
             pipeline.lock_selection(audit.selection)
-            try:
-                planned = plan_locked_roles(audit)
-            except Phase3FCloudJobError as exc:
-                if exc.code != "SPLIT_MINIMUM_UNAVAILABLE":
-                    raise
+            split_plan = plan_metadata_split(audit)
+            _atomic_json(
+                config.output_root / "training-readiness.json",
+                split_plan.readiness,
+            )
+            if not split_plan.ready:
                 pipeline.finalize_coverage_insufficient(
                     reason_code="SPLIT_MINIMUM_UNAVAILABLE"
                 )
@@ -2390,7 +3152,8 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                     "schema": "atlaslens-phase3f-cloud-execution-v1",
                     "run_id": config.run_id,
                     "outcome": "COVERAGE_INSUFFICIENT",
-                    "reason_code": exc.code,
+                    "reason_code": "SPLIT_MINIMUM_UNAVAILABLE",
+                    "readiness_reported": True,
                     "started_at": started.isoformat(),
                     "finished_at": datetime.now(UTC).isoformat(),
                     "mapillary_request_count": client.request_count,
@@ -2406,6 +3169,7 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                 )
                 cleanup_private_work = True
                 return execution
+            planned = split_plan.download_assets
             assets, provenance = acquire_planned_assets(
                 client,
                 areas,
@@ -2415,9 +3179,44 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                 guard,
                 acquisition_checkpoint,
                 restore_client_counts=False,
+                allow_item_failures=True,
             )
             _require(client.request_count <= MAX_REQUESTS, "REQUEST_CAP_EXCEEDED")
             pipeline.complete_acquisition(guard)
+            media_plan = finalize_media_split(split_plan, assets)
+            _atomic_json(
+                config.output_root / "training-readiness.json",
+                media_plan.readiness,
+            )
+            if not media_plan.ready:
+                pipeline.finalize_dataset_not_ready(
+                    reason_code="MEDIA_SPLIT_MINIMUM_UNAVAILABLE"
+                )
+                execution = {
+                    "schema": "atlaslens-phase3f-cloud-execution-v1",
+                    "run_id": config.run_id,
+                    "outcome": "COVERAGE_INSUFFICIENT",
+                    "reason_code": "MEDIA_SPLIT_MINIMUM_UNAVAILABLE",
+                    "readiness_reported": True,
+                    "started_at": started.isoformat(),
+                    "finished_at": datetime.now(UTC).isoformat(),
+                    "mapillary_request_count": client.request_count,
+                    "downloaded_image_count": len(assets),
+                    "downloaded_media_bytes": guard.media_bytes,
+                    "secrets_included": False,
+                    "raw_images_included": False,
+                }
+                _atomic_json(config.output_root / "execution-receipt.json", execution)
+                _atomic_json(
+                    config.output_root / "checksum-inventory.json",
+                    _inventory_output(config.output_root),
+                )
+                cleanup_private_work = True
+                return execution
+            assets = media_plan.assets
+            provenance = finalize_provenance_aggregate(
+                provenance, assets, media_root
+            )
             split = seal_split(
                 assets,
                 in_domain_cities=[item.city for item in audit.selection.in_domain],
@@ -2558,12 +3357,17 @@ __all__ = [
     "CloudJobConfig",
     "MetadataAsset",
     "MetadataAudit",
+    "MetadataSplitPlan",
+    "MediaSplitPlan",
     "Phase3FCloudJobError",
     "PlannedAsset",
     "acquire_planned_assets",
     "audit_metadata",
+    "finalize_media_split",
+    "finalize_provenance_aggregate",
     "load_city_areas",
     "plan_locked_roles",
+    "plan_metadata_split",
     "quarter_bbox",
     "run_cloud_job",
     "verify_megaloc_artifacts",

@@ -1,5 +1,35 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F allocates split isolation groups before media acquisition
+
+- Context: The completed sixteen-city metadata checkpoint contains 8,805 unique
+  eligible rows and no media. The former role planner consumed whole
+  contributor groups in hash order; after earlier city/role choices it reached
+  Ä°stanbul reference with 9 candidates for a required 75 even though that city
+  has 600 eligible rows. The failure was therefore allocator-induced rather
+  than evidence that the locked minimums were unattainable.
+- Decision: Build contributor/sequence connected components and assign each
+  component to exactly one split role with a deterministic bounded
+  constraint-aware allocator. Enforce the existing one-kilometre
+  reference/holdout separation before media selection, keep all minimums
+  unchanged, and select at most ten deterministic reserves per city/role
+  bucket. Download only the 830 primary plus at most 200 reserve candidates.
+  After decode, group exact hashes and Hamming-distance-at-most-four perceptual
+  hashes into one split, then fill losses from reserves before sealing. Persist
+  a sanitized structured readiness report; a genuinely infeasible metadata set
+  yields only a bounded deficient-city supplemental plan that preserves prior
+  rows and does not revisit completed cells.
+- Alternatives: Lower split minimums; relax holdout or spatial isolation;
+  download all 8,805 candidates; keep retrying the same greedy planner; send a
+  partially ready corpus to paid compute.
+- Consequences: The unchanged live metadata deterministically yields 830
+  primary and 200 reserve candidates with zero contributor, sequence, or
+  spatial cross-split violations. Exact/pHash readiness remains pending until
+  media exists, and GPU/RunPod remains gated behind the post-media report. The
+  live checkpoint needs no migration and was not modified by this repair.
+- Target phase: Product Phase 3F bounded local-first acquisition and private
+  fine-tuning only.
+
 ## 2026-07-20 - Phase 3F uses local sealed acquisition and bounded cloud fine-tuning
 
 - Context: The local resumable acquisition initially had 569 İstanbul metadata

@@ -1072,7 +1072,40 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
                     outcome=exc.code,
                 )
                 return {"run_id": run_id, "stage": "COVERAGE_INSUFFICIENT"}
-            planned = worker.plan_locked_roles(audit)
+            split_plan = worker.plan_metadata_split(audit)
+            readiness_path = run_root / "training-readiness.json"
+            worker._atomic_private_json(  # noqa: SLF001
+                readiness_path, split_plan.readiness
+            )
+            if not split_plan.ready:
+                sync_scheduler_checkpoint(
+                    scheduler_path,
+                    run_id=run_id,
+                    metadata_checkpoint=metadata_path,
+                    client_counters=counters_path,
+                    acquisition_checkpoint=acquisition_path,
+                    request_cap=MAX_REQUESTS,
+                    media_byte_cap=LOCAL_MEDIA_CAP_BYTES,
+                    max_wall_seconds=config.max_wall_seconds,
+                    status="SPLIT_SUPPLEMENTAL_REQUIRED",
+                    city_order=[area.city for area in areas],
+                )
+                _write_state(
+                    runtime_root,
+                    run_id,
+                    "DATASET_SUPPLEMENTAL_REQUIRED",
+                    error_code="SPLIT_MINIMUM_UNAVAILABLE",
+                    readiness_report_sha256=worker._sha256_path(readiness_path),  # noqa: SLF001
+                    model_loaded=False,
+                    gpu_used=False,
+                )
+                return {
+                    "run_id": run_id,
+                    "stage": "DATASET_SUPPLEMENTAL_REQUIRED",
+                    "readiness_report": str(readiness_path),
+                    "secrets_included": False,
+                }
+            planned = split_plan.download_assets
             guard = AcquisitionGuard()
             assets, provenance = worker.acquire_planned_assets(
                 client,
@@ -1087,25 +1120,17 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
                 checkpoint_observer=record_media_checkpoint,
                 allow_item_failures=True,
             )
-            if len(assets) != len(planned):
-                report = {
-                    "schema": "atlaslens-phase3f-training-readiness-v1",
-                    "outcome": "DATASET_NOT_READY_FOR_TRAINING",
-                    "ready": False,
-                    "planned_asset_count": len(planned),
-                    "usable_asset_count": len(assets),
-                    "item_failure_count": len(planned) - len(assets),
-                    "gpu_started": False,
-                    "cloud_mutations": 0,
-                    "secrets_included": False,
-                }
-                _atomic_private_json(run_root / "training-readiness.json", report)
+            media_plan = worker.finalize_media_split(split_plan, assets)
+            worker._atomic_private_json(  # noqa: SLF001
+                readiness_path, media_plan.readiness
+            )
+            if not media_plan.ready:
                 _write_state(
                     runtime_root,
                     run_id,
                     "DATASET_NOT_READY_FOR_TRAINING",
                     asset_count=len(assets),
-                    item_failure_count=len(planned) - len(assets),
+                    readiness_report_sha256=worker._sha256_path(readiness_path),  # noqa: SLF001
                     model_loaded=False,
                     gpu_used=False,
                 )
@@ -1115,6 +1140,10 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
                     "asset_count": len(assets),
                     "secrets_included": False,
                 }
+            assets = media_plan.assets
+            provenance = worker.finalize_provenance_aggregate(
+                provenance, assets, media_root
+            )
             split = seal_split(
                 assets,
                 in_domain_cities=[item.city for item in audit.selection.in_domain],

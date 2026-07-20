@@ -290,6 +290,22 @@ class Phase3FPipeline:
             },
         )
 
+    def finalize_dataset_not_ready(self, *, reason_code: str) -> None:
+        if self.stage is not PipelineStage.ACQUISITION_COMPLETE:
+            raise PipelineStateError("PHASE3F_DATASET_TERMINAL_STAGE_INVALID")
+        if not re.fullmatch(r"[A-Z0-9_]{3,64}", reason_code):
+            raise ValueError("dataset readiness reason code is invalid")
+        self._transition(
+            PipelineStage.ACQUISITION_COMPLETE,
+            PipelineStage.COVERAGE_INSUFFICIENT,
+            {
+                "outcome": "DATASET_NOT_READY_FOR_TRAINING",
+                "reason_code": reason_code,
+                "image_acquisition_started": True,
+                "finalized": True,
+            },
+        )
+
     def _transition(
         self,
         expected: PipelineStage,

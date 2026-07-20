@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-20T17:29:42+03:00
+last_verified_at: 2026-07-20T21:24:29+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: e2e_training_implementation_complete_live_execution_not_started
+product_phase_status: split_readiness_repaired_live_metadata_complete_media_not_started
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -399,7 +399,7 @@ phase_3f_e2e_holdout: final_only_once_after_validation_threshold_lock
 phase_3f_e2e_promotion: never_automatic_regression_keeps_production_unchanged
 phase_3f_e2e_secret_transport: secure_prompt_child_environment_only_sequential_mapillary_then_runpod_finally_cleared
 phase_3f_e2e_budget: per_run_absolute_3_soft_2_95_terminate_2_99_historical_fail_closed_10_before_runpod_client
-phase_3f_e2e_phase3f_tests: pass_192
+phase_3f_e2e_phase3f_tests: pass_199
 phase_3f_e2e_static: pass_ruff_strict_mypy_14_source_files_powershell_parse
 phase_3f_e2e_full_backend: pass_1118_skipped_7_one_unrelated_existing_private_evaluation_artifact_gate
 phase_3f_e2e_live_network_cloud_gpu: zero_requests_zero_mutations_not_executed
@@ -408,6 +408,19 @@ phase_3f_e2e_actual_checkpoint_position: city2_box3_cursor_absent_requests38_pag
 phase_3f_e2e_actual_checkpoint_stage: acquisition_failed_resumable_mapillary_api_server_retry_exhausted
 phase_3f_e2e_disk_gate: pass_c_41_659_gib_d_23_892_gib
 phase_3f_e2e_final_audit: pass_preflight_read_only_readiness_before_runpod_optimizer_resume_holdout_budget_single_pod_cleanup_secret_scope
+phase_3f_split_readiness_run: ce23d58c42bf76e6de0b0117725e3ea7
+phase_3f_split_readiness_metadata: complete_unique_eligible_8805_media_0
+phase_3f_split_readiness_runtime: paused_typed_split_failure_not_sealed
+phase_3f_split_readiness_root_cause: greedy_allocator_istanbul_reference_9_of_75_deficit_66
+phase_3f_split_readiness_solver: deterministic_contributor_sequence_component_allocation_minimums_unchanged
+phase_3f_split_readiness_plan: pass_primary_830_reserve_200_download_cap_1030
+phase_3f_split_readiness_isolation: pass_contributor_0_sequence_0_spatial_0_min_distance_m_1014_748
+phase_3f_split_readiness_media_gate: pending_exact_hash_and_phash_groups_no_media_present
+phase_3f_split_readiness_metadata_sha256: 5d2b98964ee4238959901baf609f00797c62f32fe20308cfcd30578025914f39
+phase_3f_split_readiness_runtime_migration: none_counts_and_sha256_unchanged
+phase_3f_split_readiness_tests: pass_199
+phase_3f_split_readiness_static: pass_ruff_strict_mypy_259_sources_powershell_parse
+phase_3f_split_readiness_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_runtime_mutation
 phase_3f_next_action: run_exact_preflight_then_resume_ce23_with_explicit_cloud_consent_only_after_dataset_ready
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
@@ -463,6 +476,43 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F split readiness recovery
+
+Status: **REPAIRED AND VERIFIED OFFLINE - MEDIA ACQUISITION NOT STARTED**.
+
+The current v3 metadata checkpoint is complete across all sixteen cities with
+8,805 unique eligible rows. Its SHA-256 is
+`5d2b98964ee4238959901baf609f00797c62f32fe20308cfcd30578025914f39`.
+There is no acquisition checkpoint, private media, or sealed corpus. Scheduler
+v4 is non-terminal and paused at the typed split failure; local state records
+`model_loaded=false` and `gpu_used=false`.
+
+The prior consumptive greedy allocator failed at Ä°stanbul `reference`: 75 were
+required, but only 9 remained after its earlier global contributor choices, a
+66-record deficit. The city itself has 600 eligible rows, so this was an
+allocator failure rather than a data minimum failure. The replacement assigns
+contributor/sequence connected components to one role with a deterministic
+bounded solver, preserves every existing minimum and the one-kilometre spatial
+gate, and then chooses deterministic reserves.
+
+The unchanged live metadata now yields all twenty city/role buckets: 830
+primary plus 200 reserves, bounded to 1,030 media candidates. Contributor and
+sequence cross-role counts are zero; reference/locked-holdout spatial
+violations are zero, with a minimum observed separation of 1,014.748 metres.
+Exact SHA and perceptual-hash groups remain correctly pending because zero
+media assets exist. The post-media gate deduplicates exact/near-duplicate
+components into one role and replaces decode/download losses from reserves
+before sealing. Genuinely infeasible metadata produces a deterministic
+sanitized supplemental report rather than lowering minimums or repeating the
+generic failure.
+
+All 199 Phase 3F tests pass, including greedy-feasible, true-infeasible,
+sequence/contributor/spatial conflict, duplicate groups, reserve replacement,
+supplemental repeat, and terminal post-media readiness cases. Ruff, strict mypy
+over 259 source files, PowerShell parsing, diff checks, and secret scans pass.
+No runtime migration, network request, Mapillary request, media download,
+RunPod/GPU action, or push occurred.
 
 ## Product Phase 3F bounded Mapillary metadata capacity
 
