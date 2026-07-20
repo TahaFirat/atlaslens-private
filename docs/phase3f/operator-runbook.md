@@ -156,3 +156,85 @@ Stop on these operator blockers: `ACTIVE_POD_INVENTORY_NOT_ZERO`,
 Return the complete console output plus the operator receipt, sanitized local
 supervisor receipt, cloud `execution-receipt.json`, and cloud
 `checksum-inventory.json` to the follow-up task. Do not send credentials.
+
+## Existing manually managed Pod: resumable Mapillary job
+
+This path is separate from the RunPod supervisor above. It calls no RunPod API,
+does not start, stop, terminate, or inspect a Pod, and must be used only from a
+shell inside an already-running manually managed Pod. A 4.5-hour job deadline
+does not stop the Pod or stop billing. The operator remains responsible for the
+Pod lifecycle and must copy verified outputs off the Pod before terminating it.
+
+The failed historical job predates the metadata-page checkpoint and therefore
+cannot recover its completed pages. The first repaired run starts with a new
+32-hex run ID. If that repaired run is interrupted, later `start-job` calls keep
+the same run root, create a fresh output attempt, and resume only when both its
+private metadata and cumulative-counter checkpoints are present and valid.
+
+After the repair commit exists locally, create a self-contained Git bundle and
+record both roots of trust on Windows. These commands have not been executed on
+the stopped Pod:
+
+```powershell
+git -C "D:\geoSearch" bundle create "D:\geoSearch\.local\phase3f-mapillary-resume.bundle" HEAD
+git -C "D:\geoSearch" rev-parse HEAD
+(Get-FileHash -Algorithm SHA256 -LiteralPath "D:\geoSearch\.local\phase3f-mapillary-resume.bundle").Hash.ToLowerInvariant()
+```
+
+Upload that bundle without modifying it to
+`/workspace/phase3f-transfer/phase3f-mapillary-resume.bundle`. Copy the exact
+commit and bundle SHA-256 printed in the final local handoff into the two
+variables below. After separately starting the Pod, use these commands inside
+the Pod. They are intentionally not Pod-start or RunPod commands and have not
+been executed as part of this repair:
+
+```bash
+set -euo pipefail
+expected_commit='<FINAL_COMMIT_SHA>'
+expected_bundle_sha256='<FINAL_BUNDLE_SHA256>'
+bundle=/workspace/phase3f-transfer/phase3f-mapillary-resume.bundle
+test "$(sha256sum "$bundle" | awk '{print $1}')" = "$expected_bundle_sha256"
+test ! -e /workspace/phase3f-repo-mapillary-resume
+git clone --no-checkout "$bundle" /workspace/phase3f-repo-mapillary-resume
+git -C /workspace/phase3f-repo-mapillary-resume checkout --detach "$expected_commit"
+test "$(git -C /workspace/phase3f-repo-mapillary-resume rev-parse HEAD)" = "$expected_commit"
+git -C /workspace/phase3f-repo-mapillary-resume fsck --strict
+test -z "$(git -C /workspace/phase3f-repo-mapillary-resume status --porcelain=v1 --untracked-files=all)"
+install -d -m 700 /workspace/phase3f-manual
+bash /workspace/phase3f-repo-mapillary-resume/scripts/phase3f/existing-pod-prepare-check.sh \
+  --runtime-root /workspace/phase3f-manual \
+  --repository-root /workspace/phase3f-repo-mapillary-resume \
+  --model /workspace/phase3f-transfer/model.safetensors \
+  --vendor-root /workspace/phase3f-transfer/vendor \
+  --source-commit "$expected_commit"
+bash /workspace/phase3f-repo-mapillary-resume/scripts/phase3f/existing-pod-start-job.sh \
+  --runtime-root /workspace/phase3f-manual \
+  --repository-root /workspace/phase3f-repo-mapillary-resume \
+  --model /workspace/phase3f-transfer/model.safetensors \
+  --vendor-root /workspace/phase3f-transfer/vendor \
+  --source-commit "$expected_commit"
+```
+
+Status and sanitized log projection, from the already-running Pod:
+
+```bash
+bash /workspace/phase3f-repo-mapillary-resume/scripts/phase3f/existing-pod-status-job.sh \
+  --runtime-root /workspace/phase3f-manual
+bash /workspace/phase3f-repo-mapillary-resume/scripts/phase3f/existing-pod-tail-log.sh \
+  --runtime-root /workspace/phase3f-manual --lines 80
+```
+
+If the repaired job is interrupted and the Pod remains running, rerun only the
+same `existing-pod-start-job.sh` command above; do not rerun `prepare-check`.
+That call detects the paired private checkpoints and adds `--resume` without
+creating a second job or reusing an output directory. To stop only the
+receipt/state-bound in-Pod process group (not the Pod), run:
+
+```bash
+bash /workspace/phase3f-repo-mapillary-resume/scripts/phase3f/existing-pod-stop-job.sh \
+  --runtime-root /workspace/phase3f-manual
+```
+
+Do not terminate the Pod until the selected fresh `output-*` directory and its
+checksum inventory have been copied and verified. These helpers never claim or
+attempt automatic Pod shutdown.

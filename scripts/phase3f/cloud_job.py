@@ -17,6 +17,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--deadline-epoch", type=float, required=True)
+    parser.add_argument("--resume", action="store_true")
     return parser
 
 
@@ -33,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
         Phase3FCloudJobError,
         run_cloud_job,
     )
+    from atlaslens_api.mapillary_demo.errors import MapillaryDemoError  # noqa: PLC0415
 
     try:
         result = run_cloud_job(
@@ -51,10 +53,14 @@ def main(argv: list[str] | None = None) -> int:
                 work_root=args.work_root,
                 output_root=args.output_root,
                 deadline_epoch=args.deadline_epoch,
+                resume=args.resume,
             )
         )
     except Phase3FCloudJobError as exc:
         print(exc.code)
+        return 1
+    except MapillaryDemoError as exc:
+        print(exc.code.upper())
         return 1
     print(
         json.dumps(

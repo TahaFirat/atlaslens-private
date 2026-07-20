@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-20T03:21:18+03:00
+last_verified_at: 2026-07-20T11:34:02+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: local_operator_gpu_allocation_attestation_repaired_zero_resources_no_create_authorization
+product_phase_status: local_mapillary_acquisition_resume_repaired_manual_pod_remains_stopped
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -334,7 +334,23 @@ phase_3f_billing_pods: authenticated_read_only_http_200_no_matching_record_amoun
 phase_3f_cloud_spend_usd: historical_user_report_0_billing_query_has_no_matched_record
 phase_3f_cloud_mutations_push_pr: prior_user_create_attempts_four_this_fix_task_zero_no_push
 phase_3f_asda_html: untouched_untracked_not_read
-phase_3f_next_action: no_execute_authorization_remaining_local_contract_only_pending_new_explicit_scope
+phase_3f_mapillary_failure_root_cause: exact_429_or_retryable_5xx_not_reconstructable_lossy_retry_code_and_no_completed_page_checkpoint
+phase_3f_mapillary_pagination: initial_params_already_cleared_official_relative_or_absolute_next_canonicalized_no_duplicate_query_keys
+phase_3f_mapillary_retry_policy: typed_400_401_403_terminal_bounded_retry_after_429_bounded_5xx_timeout_transport
+phase_3f_mapillary_resume: private_atomic_page_cursor_rows_loop_hash_and_cumulative_counter_checkpoint_fresh_output_attempt
+phase_3f_mapillary_historical_resume: unavailable_old_job_predates_page_checkpoint_first_repaired_run_is_fresh
+phase_3f_manual_existing_pod_package: hash_bound_exact_commit_git_bundle_in_pod_only_prepare_start_status_tail_stop_global_lock_pid_identity_4_5h_job_deadline_no_pod_lifecycle
+phase_3f_manual_child_environment: explicit_python_cuda_mapillary_allowlist_runpod_and_unrelated_credentials_excluded
+phase_3f_mapillary_focused_tests: pass_8_resume_31_connector
+phase_3f_mapillary_plus_phase3f_tests: pass_176
+phase_3f_phase3f_full_tests: pass_145
+phase_3f_mapillary_static: pass_ruff_strict_mypy_diff_check
+phase_3f_mapillary_live_diagnostic: skipped_mapillary_token_not_visible_locally_zero_requests
+phase_3f_mapillary_downloads: zero_images_datasets_models
+phase_3f_mapillary_cloud_mutations: zero
+phase_3f_manual_l4_pod_state: user_reported_stopped_compute_zero_per_hour_not_queried_or_mutated
+phase_3f_mapillary_repair_agents: implementation_pass_security_pass_validation_pass
+phase_3f_next_action: keep_manual_l4_pod_stopped_until_separate_start_decision_then_apply_unexecuted_runbook_package
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
 phase_6c_dataset_qa_ui_gate: pass
@@ -389,6 +405,54 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F resumable Mapillary acquisition checkpoint
+
+Status: **LOCAL REPAIR COMPLETE - MANUAL POD MUST REMAIN STOPPED**.
+
+The failed acquisition's exact final HTTP member cannot be reconstructed: the
+historical safe error combined final HTTP 429 and retryable 5xx exhaustion. A
+later one-item metadata-only request from the same Pod returned HTTP 200, which
+rules out a persistent token-resolution, DNS, TLS, or basic API-access failure
+but not a transient rate-limit or provider error. Static inspection confirmed
+that the old client already cleared the initial `bbox`, `fields`, and `limit`
+parameters before following `paging.next`; duplicated first-page parameters
+were not the defect. The actionable fault was lossy status classification and
+the lack of a completed-page checkpoint.
+
+The client now keeps safe typed 400/401/403/429/5xx/timeout/transport outcomes,
+uses bounded retries, restricts next cursors to the official `/images` endpoint,
+canonicalizes relative and absolute cursors, strips credential parameters, and
+rejects duplicate query keys and cursor loops. Each completed metadata page is
+atomically checkpointed with its next cursor, visited-cursor hashes, bounded
+rows, and cumulative client counters in a private work root. A restarted
+repaired run keeps that run ID and work root while creating a fresh output
+attempt, so completed pages are not fetched again. The historical failed run
+cannot gain this checkpoint retroactively; its first repaired successor is a
+fresh run.
+
+Five in-Pod-only operator wrappers prepare, start, inspect status, project a
+sanitized log, and stop only the state/PID-bound process group. They contain no
+RunPod API or Pod lifecycle operation. Source transfer uses a locally hashed Git
+bundle; the in-Pod path verifies the bundle hash, exact commit, object graph and
+clean checkout before readiness. Readiness then verifies that commit again with
+the exact model and canonical-LF vendor hashes, dependencies, CUDA, and token
+presence without printing the token. Children receive only an explicit
+Python/CUDA environment allowlist plus the Mapillary token, never ambient
+RunPod or unrelated credentials. A global lock and process start-time/command
+hash prevent a second or PID-reused job; each job is bounded to 4.5 hours. That
+deadline does not stop the Pod or billing, and outputs must be copied and
+verified before any later operator termination.
+
+The dedicated resume/manual file passed 8 cases and the connector passed 31;
+the combined connector and full Phase 3F selection passed 176, while the Phase
+3F-only suite passed 145. Ruff, strict
+mypy, and diff checks passed. No live Mapillary request ran because the safe
+local loader could not see the token (`MAPILLARY_TOKEN_NOT_VISIBLE_LOCALLY`). No
+image, dataset, or model was downloaded, and no RunPod/cloud mutation occurred.
+The L4 Pod remains in the user-reported STOPPED state and was not queried. The
+unexecuted source-update and in-Pod resume commands are recorded in
+[the Phase 3F operator runbook](docs/phase3f/operator-runbook.md).
 
 ## Product Phase 3F local operator handoff checkpoint
 

@@ -13,18 +13,26 @@ import os
 import shutil
 import sys
 import time
+import warnings
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Literal, cast
+from uuid import uuid4
 
 import numpy as np
 from PIL import Image
+from pydantic import ValidationError
 
-from atlaslens_api.mapillary_demo.client import MapillaryClient, RemoteImage
-from atlaslens_api.mapillary_demo.models import BoundingBox, ClientLimits
+from atlaslens_api.mapillary_demo.client import (
+    MapillaryClient,
+    PaginationProgress,
+    RemoteImage,
+    validated_next_url,
+)
+from atlaslens_api.mapillary_demo.models import BoundingBox, ClientLimits, ImageMetadata
 from atlaslens_api.phase3f.acquisition import (
     MAX_IMAGES,
     MAX_MEDIA_BYTES,
@@ -68,6 +76,9 @@ SOURCE_POLICY_SHA256: Final = (
 )
 MAX_METADATA_ITEMS_PER_CITY: Final = 600
 MAX_WALL_SECONDS: Final = 5 * 60 * 60 + 45 * 60
+ACQUISITION_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-acquisition-checkpoint-v1"
+CLIENT_COUNTER_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-client-counters-v1"
+METADATA_PAGE_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-metadata-pages-v1"
 
 Role = Literal["reference", "calibration", "sealed_holdout", "ood_holdout"]
 
@@ -113,6 +124,43 @@ def _atomic_json(path: Path, value: object) -> str:
     return _sha256_bytes(payload)
 
 
+def _atomic_private_json(path: Path, value: object) -> str:
+    payload = _canonical_bytes(value)
+    return _atomic_private_bytes(path, payload)
+
+
+def _atomic_private_bytes(path: Path, payload: bytes) -> str:
+    digest = _sha256_bytes(payload)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    _require(
+        not path.is_symlink() and not path.parent.is_symlink(),
+        "PRIVATE_CHECKPOINT_PATH_INVALID",
+    )
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.partial")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    descriptor = -1
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise Phase3FCloudJobError("PRIVATE_CHECKPOINT_WRITE_FAILED") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary.exists() and not temporary.is_symlink():
+            temporary.unlink()
+    return digest
+
+
 @dataclass(frozen=True, slots=True)
 class CityArea:
     city: str
@@ -135,7 +183,10 @@ class CityArea:
 
 
 def load_city_areas(path: Path) -> tuple[CityArea, ...]:
-    _require(path.is_file() and not path.is_symlink(), "CITY_AOI_CONFIG_MISSING")
+    _require(
+        path.is_file() and not path.is_symlink() and path.stat().st_size <= 1024 * 1024,
+        "CITY_AOI_CONFIG_MISSING",
+    )
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -149,7 +200,10 @@ def load_city_areas(path: Path) -> tuple[CityArea, ...]:
     half_span = document.get("tile_half_span_degrees")
     rows = document.get("cities")
     _require(
-        isinstance(half_span, int | float) and 0.0 < float(half_span) <= 0.05,
+        isinstance(half_span, int | float)
+        and not isinstance(half_span, bool)
+        and math.isfinite(float(half_span))
+        and 0.0 < float(half_span) <= 0.05,
         "CITY_AOI_CONFIG_INVALID",
     )
     _require(isinstance(rows, list), "CITY_AOI_CONFIG_INVALID")
@@ -164,7 +218,13 @@ def load_city_areas(path: Path) -> tuple[CityArea, ...]:
             isinstance(city, str)
             and city in CANDIDATE_CITY_REGIONS
             and isinstance(longitude, int | float)
-            and isinstance(latitude, int | float),
+            and not isinstance(longitude, bool)
+            and isinstance(latitude, int | float)
+            and not isinstance(latitude, bool)
+            and math.isfinite(float(longitude))
+            and math.isfinite(float(latitude))
+            and -180.0 <= float(longitude) <= 180.0
+            and -90.0 <= float(latitude) <= 90.0,
             "CITY_AOI_CONFIG_INVALID",
         )
         areas.append(
@@ -176,7 +236,8 @@ def load_city_areas(path: Path) -> tuple[CityArea, ...]:
             )
         )
     _require(
-        {area.city for area in areas} == set(CANDIDATE_CITY_REGIONS),
+        len(areas) == len(CANDIDATE_CITY_REGIONS)
+        and {area.city for area in areas} == set(CANDIDATE_CITY_REGIONS),
         "CITY_AOI_SCOPE_INVALID",
     )
     return tuple(areas)
@@ -227,20 +288,256 @@ class MetadataAudit:
         }
 
 
+@dataclass(slots=True)
+class _MetadataPageCheckpoint:
+    run_id: str
+    areas_sha256: str
+    city_index: int
+    box_index: int
+    next_url: str | None
+    visited_page_sha256: tuple[str, ...]
+    rows_by_city: dict[str, list[RemoteImage]]
+
+
+def _areas_sha256(areas: Sequence[CityArea]) -> str:
+    return _sha256_bytes(
+        _canonical_bytes(
+            [
+                {
+                    "city": area.city,
+                    "longitude": area.longitude,
+                    "latitude": area.latitude,
+                    "half_span": area.half_span,
+                }
+                for area in areas
+            ]
+        )
+    )
+
+
+def _new_metadata_page_checkpoint(
+    areas: Sequence[CityArea], run_id: str
+) -> _MetadataPageCheckpoint:
+    return _MetadataPageCheckpoint(
+        run_id=run_id,
+        areas_sha256=_areas_sha256(areas),
+        city_index=0,
+        box_index=0,
+        next_url=None,
+        visited_page_sha256=(),
+        rows_by_city={area.city: [] for area in areas},
+    )
+
+
+def _write_metadata_page_checkpoint(
+    path: Path,
+    state: _MetadataPageCheckpoint,
+) -> None:
+    _atomic_private_json(
+        path,
+        {
+            "schema": METADATA_PAGE_CHECKPOINT_SCHEMA,
+            "run_id": state.run_id,
+            "areas_sha256": state.areas_sha256,
+            "city_index": state.city_index,
+            "box_index": state.box_index,
+            "next_url": state.next_url,
+            "visited_page_sha256": list(state.visited_page_sha256),
+            "rows_by_city": {
+                city: [row.metadata.model_dump(mode="json") for row in rows]
+                for city, rows in sorted(state.rows_by_city.items())
+            },
+            "secrets_included": False,
+            "signed_urls_included": False,
+        },
+    )
+
+
+def _load_metadata_page_checkpoint(
+    path: Path,
+    *,
+    areas: Sequence[CityArea],
+    run_id: str,
+) -> _MetadataPageCheckpoint:
+    _require(
+        path.is_file() and not path.is_symlink() and path.stat().st_size <= 16 * 1024 * 1024,
+        "METADATA_PAGE_CHECKPOINT_INVALID",
+    )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Phase3FCloudJobError("METADATA_PAGE_CHECKPOINT_INVALID") from exc
+    _require(isinstance(value, dict), "METADATA_PAGE_CHECKPOINT_INVALID")
+    document = cast(dict[str, object], value)
+    _require(
+        set(document)
+        == {
+            "schema",
+            "run_id",
+            "areas_sha256",
+            "city_index",
+            "box_index",
+            "next_url",
+            "visited_page_sha256",
+            "rows_by_city",
+            "secrets_included",
+            "signed_urls_included",
+        }
+        and document.get("schema") == METADATA_PAGE_CHECKPOINT_SCHEMA
+        and document.get("run_id") == run_id
+        and document.get("areas_sha256") == _areas_sha256(areas)
+        and document.get("secrets_included") is False
+        and document.get("signed_urls_included") is False,
+        "METADATA_PAGE_CHECKPOINT_INVALID",
+    )
+    city_index = document.get("city_index")
+    box_index = document.get("box_index")
+    next_url = document.get("next_url")
+    visited = document.get("visited_page_sha256")
+    raw_rows = document.get("rows_by_city")
+    _require(
+        isinstance(city_index, int)
+        and not isinstance(city_index, bool)
+        and 0 <= city_index <= len(areas)
+        and isinstance(box_index, int)
+        and not isinstance(box_index, bool)
+        and 0 <= box_index <= 4
+        and (next_url is None or isinstance(next_url, str))
+        and isinstance(visited, list)
+        and isinstance(raw_rows, dict),
+        "METADATA_PAGE_CHECKPOINT_INVALID",
+    )
+    if isinstance(next_url, str):
+        try:
+            canonical_next_url = validated_next_url(next_url)
+        except RuntimeError as exc:
+            raise Phase3FCloudJobError("METADATA_PAGE_CHECKPOINT_INVALID") from exc
+        _require(
+            canonical_next_url == next_url and cast(int, city_index) < len(areas),
+            "METADATA_PAGE_CHECKPOINT_INVALID",
+        )
+    visited_rows = cast(list[object], visited)
+    _require(
+        all(
+            isinstance(item, str)
+            and len(item) == 64
+            and all(character in "0123456789abcdef" for character in item)
+            for item in visited_rows
+        )
+        and len(set(cast(list[str], visited_rows))) == len(visited_rows),
+        "METADATA_PAGE_CHECKPOINT_INVALID",
+    )
+    expected_cities = [area.city for area in areas]
+    raw_rows_by_city = cast(dict[str, object], raw_rows)
+    _require(
+        set(raw_rows_by_city) == set(expected_cities),
+        "METADATA_PAGE_CHECKPOINT_INVALID",
+    )
+    parsed: dict[str, list[RemoteImage]] = {}
+    try:
+        for city in expected_cities:
+            city_rows = raw_rows_by_city.get(city)
+            _require(isinstance(city_rows, list), "METADATA_PAGE_CHECKPOINT_INVALID")
+            typed_city_rows = cast(list[object], city_rows)
+            _require(
+                len(typed_city_rows) <= MAX_METADATA_ITEMS_PER_CITY,
+                "METADATA_PAGE_CHECKPOINT_INVALID",
+            )
+            parsed[city] = [
+                RemoteImage(ImageMetadata.model_validate(item)) for item in typed_city_rows
+            ]
+            identifiers = [row.metadata.mapillary_image_id for row in parsed[city]]
+            _require(
+                len(identifiers) == len(set(identifiers)),
+                "METADATA_PAGE_CHECKPOINT_INVALID",
+            )
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise Phase3FCloudJobError("METADATA_PAGE_CHECKPOINT_INVALID") from exc
+    for index, city in enumerate(expected_cities):
+        if index > cast(int, city_index):
+            _require(not parsed[city], "METADATA_PAGE_CHECKPOINT_INVALID")
+    return _MetadataPageCheckpoint(
+        run_id=run_id,
+        areas_sha256=_areas_sha256(areas),
+        city_index=cast(int, city_index),
+        box_index=cast(int, box_index),
+        next_url=cast(str | None, next_url),
+        visited_page_sha256=tuple(cast(list[str], visited_rows)),
+        rows_by_city=parsed,
+    )
+
+
 def audit_metadata(
     client: MapillaryClient,
     areas: Sequence[CityArea],
+    *,
+    checkpoint: _MetadataPageCheckpoint | None = None,
+    checkpoint_path: Path | None = None,
+    run_id: str | None = None,
+    progress: Callable[[str, int, str], None] | None = None,
 ) -> MetadataAudit:
+    if checkpoint is None:
+        checkpoint = _new_metadata_page_checkpoint(areas, run_id or "0" * 32)
+    _require(
+        checkpoint.run_id == run_id or run_id is None,
+        "METADATA_PAGE_CHECKPOINT_INCOMPATIBLE",
+    )
     records: list[CityCoverageRecord] = []
     assets_by_city: dict[str, tuple[MetadataAsset, ...]] = {}
-    for area in areas:
-        remote = tuple(
-            client.iter_images(
+    for area_index, area in enumerate(areas):
+        if area_index >= checkpoint.city_index:
+            resume_box_index = checkpoint.box_index if area_index == checkpoint.city_index else 0
+            resume_next_url = checkpoint.next_url if area_index == checkpoint.city_index else None
+            resume_visited = (
+                checkpoint.visited_page_sha256 if area_index == checkpoint.city_index else ()
+            )
+
+            def observe_page(
+                page: PaginationProgress,
+                *,
+                city: str = area.city,
+                city_position: int = area_index,
+            ) -> None:
+                existing = checkpoint.rows_by_city[city]
+                identifiers = {row.metadata.mapillary_image_id for row in existing}
+                for row in page.images:
+                    identifier = row.metadata.mapillary_image_id
+                    _require(identifier not in identifiers, "METADATA_PAGE_DUPLICATE")
+                    identifiers.add(identifier)
+                    existing.append(row)
+                checkpoint.city_index = city_position
+                checkpoint.box_index = page.box_index
+                checkpoint.next_url = page.next_url
+                checkpoint.visited_page_sha256 = page.visited_page_sha256
+                if checkpoint_path is not None:
+                    _write_metadata_page_checkpoint(checkpoint_path, checkpoint)
+                if progress is not None:
+                    progress(city, client.page_count, "metadata_page_checkpointed")
+
+            tuple(
+                client.iter_images(
                 area.boxes,
                 include_thumbnail=False,
                 item_cap=MAX_METADATA_ITEMS_PER_CITY,
+                    resume_box_index=resume_box_index,
+                    resume_next_url=resume_next_url,
+                    resume_seen_image_ids=tuple(
+                        row.metadata.mapillary_image_id
+                        for row in checkpoint.rows_by_city[area.city]
+                    ),
+                    resume_visited_page_sha256=resume_visited,
+                    page_observer=observe_page,
+                )
             )
-        )
+            checkpoint.city_index = area_index + 1
+            checkpoint.box_index = 0
+            checkpoint.next_url = None
+            checkpoint.visited_page_sha256 = ()
+            if checkpoint_path is not None:
+                _write_metadata_page_checkpoint(checkpoint_path, checkpoint)
+            if progress is not None:
+                progress(area.city, client.page_count, "metadata_city_complete")
+        remote = tuple(checkpoint.rows_by_city[area.city])
         assets = tuple(MetadataAsset(area.city, item) for item in remote)
         assets_by_city[area.city] = assets
         eligible = tuple(
@@ -421,16 +718,313 @@ def verify_megaloc_artifacts(model_path: Path, source_path: Path, license_path: 
 def _normalize_image(payload: bytes) -> tuple[bytes, int, int, str]:
     import io
 
-    with Image.open(io.BytesIO(payload)) as image:
-        normalized = image.convert("RGB")
-        _require(max(normalized.size) <= 1024, "RENDITION_EDGE_EXCEEDED")
-        output = io.BytesIO()
-        normalized.save(output, format="JPEG", quality=92, optimize=False, progressive=False)
-        perceptual = normalized.resize((9, 8)).convert("L")
-        pixels = np.asarray(perceptual, dtype=np.uint8)
-        bits = pixels[:, 1:] > pixels[:, :-1]
-        phash = f"{int(''.join('1' if bit else '0' for bit in bits.flat), 2):016x}"
-        return output.getvalue(), normalized.width, normalized.height, phash
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(payload)) as image:
+                _require(
+                    max(image.size) <= 1024
+                    and image.width * image.height <= 1024 * 1024,
+                    "RENDITION_EDGE_EXCEEDED",
+                )
+                image.load()
+                normalized = image.convert("RGB")
+                output = io.BytesIO()
+                normalized.save(
+                    output,
+                    format="JPEG",
+                    quality=92,
+                    optimize=False,
+                    progressive=False,
+                )
+                perceptual = normalized.resize((9, 8)).convert("L")
+                pixels = np.asarray(perceptual, dtype=np.uint8)
+                bits = pixels[:, 1:] > pixels[:, :-1]
+                phash = (
+                    f"{int(''.join('1' if bit else '0' for bit in bits.flat), 2):016x}"
+                )
+                return output.getvalue(), normalized.width, normalized.height, phash
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError, OSError) as exc:
+        raise Phase3FCloudJobError("RENDITION_DECODE_REFUSED") from exc
+
+
+def _planned_acquisition_sha256(planned: Sequence[PlannedAsset]) -> str:
+    return _sha256_bytes(
+        _canonical_bytes(
+            [
+                {
+                    "image_id": item.metadata.image_id,
+                    "city": item.metadata.city,
+                    "role": item.role,
+                    "creator_id": item.metadata.remote.metadata.creator_id,
+                    "sequence_id": item.metadata.remote.metadata.sequence_id,
+                    "captured_at": item.metadata.remote.metadata.captured_at.isoformat(),
+                    "geometry": item.metadata.remote.metadata.computed_geometry.coordinates,
+                }
+                for item in planned
+            ]
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckpointAsset:
+    opaque_id: str
+    content_sha256: str
+    perceptual_hash: str
+    provenance_sha256: str
+    admitted_media_bytes: int
+
+
+def _load_acquisition_checkpoint(
+    path: Path,
+    *,
+    planned: Sequence[PlannedAsset],
+    media_root: Path,
+    run_id: str,
+) -> tuple[
+    dict[str, _CheckpointAsset], AcquisitionGuard, tuple[int, int, int]
+]:
+    if not path.exists():
+        _require(
+            not media_root.exists()
+            or not any(media_root.rglob("*")),
+            "ACQUISITION_CHECKPOINT_MISSING",
+        )
+        return {}, AcquisitionGuard(), (0, 0, 0)
+    _require(
+        path.is_file() and not path.is_symlink() and path.stat().st_size <= 16 * 1024 * 1024,
+        "ACQUISITION_CHECKPOINT_INVALID",
+    )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Phase3FCloudJobError("ACQUISITION_CHECKPOINT_INVALID") from exc
+    _require(isinstance(value, dict), "ACQUISITION_CHECKPOINT_INVALID")
+    document = cast(dict[str, object], value)
+    _require(
+        document.get("schema") == ACQUISITION_CHECKPOINT_SCHEMA
+        and document.get("run_id") == run_id
+        and document.get("planned_sha256") == _planned_acquisition_sha256(planned),
+        "ACQUISITION_CHECKPOINT_INCOMPATIBLE",
+    )
+    rows = document.get("completed")
+    _require(isinstance(rows, list), "ACQUISITION_CHECKPOINT_INVALID")
+    counters = tuple(
+        document.get(key)
+        for key in (
+            "client_request_count",
+            "client_page_count",
+            "client_rejected_item_count",
+        )
+    )
+    _require(
+        all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+            for value in counters
+        ),
+        "ACQUISITION_CHECKPOINT_INVALID",
+    )
+    wanted_by_opaque = {
+        _stable_key(run_id, item.metadata.image_id)[:32]: item.metadata.image_id
+        for item in planned
+    }
+    completed: dict[str, _CheckpointAsset] = {}
+    request_count = 0
+    media_bytes = 0
+    for raw in cast(list[object], rows):
+        _require(isinstance(raw, dict), "ACQUISITION_CHECKPOINT_INVALID")
+        row = cast(dict[str, object], raw)
+        _require(
+            set(row)
+            == {
+                "opaque_id",
+                "content_sha256",
+                "perceptual_hash",
+                "provenance_sha256",
+                "admitted_media_bytes",
+            },
+            "ACQUISITION_CHECKPOINT_INVALID",
+        )
+        opaque_id = row.get("opaque_id")
+        content_sha = row.get("content_sha256")
+        perceptual_hash = row.get("perceptual_hash")
+        provenance_sha = row.get("provenance_sha256")
+        admitted_bytes = row.get("admitted_media_bytes")
+        _require(
+            isinstance(opaque_id, str)
+            and opaque_id in wanted_by_opaque
+            and wanted_by_opaque[opaque_id] not in completed
+            and isinstance(content_sha, str)
+            and len(content_sha) == 64
+            and isinstance(perceptual_hash, str)
+            and len(perceptual_hash) == 16
+            and isinstance(provenance_sha, str)
+            and len(provenance_sha) == 64
+            and isinstance(admitted_bytes, int)
+            and not isinstance(admitted_bytes, bool)
+            and admitted_bytes > 0,
+            "ACQUISITION_CHECKPOINT_INVALID",
+        )
+        opaque_id = cast(str, opaque_id)
+        content_sha = cast(str, content_sha)
+        perceptual_hash = cast(str, perceptual_hash)
+        provenance_sha = cast(str, provenance_sha)
+        admitted_bytes = cast(int, admitted_bytes)
+        image_id = wanted_by_opaque[opaque_id]
+        media_path = media_root / "assets" / opaque_id[:2] / f"{opaque_id}.jpg"
+        _require(
+            media_path.is_file()
+            and not media_path.is_symlink()
+            and _sha256_path(media_path) == content_sha,
+            "ACQUISITION_CHECKPOINT_MEDIA_MISMATCH",
+        )
+        sidecar_path = media_root / "private-sidecars" / f"{opaque_id}.json"
+        _require(
+            sidecar_path.is_file()
+            and not sidecar_path.is_symlink()
+            and _sha256_path(sidecar_path) == provenance_sha,
+            "ACQUISITION_CHECKPOINT_PROVENANCE_MISMATCH",
+        )
+        completed[image_id] = _CheckpointAsset(
+            opaque_id=opaque_id,
+            content_sha256=content_sha,
+            perceptual_hash=perceptual_hash,
+            provenance_sha256=provenance_sha,
+            admitted_media_bytes=admitted_bytes,
+        )
+        request_count += 1
+        media_bytes += admitted_bytes
+    guard = AcquisitionGuard(
+        request_count=request_count,
+        image_count=len(completed),
+        media_bytes=media_bytes,
+    )
+    _require(
+        guard.request_count <= MAX_REQUESTS
+        and guard.image_count <= MAX_IMAGES
+        and guard.media_bytes <= MAX_MEDIA_BYTES,
+        "ACQUISITION_CHECKPOINT_CAP_EXCEEDED",
+    )
+    return completed, guard, cast(tuple[int, int, int], counters)
+
+
+def _acquisition_checkpoint_counters(path: Path, run_id: str) -> tuple[int, int, int]:
+    _require(
+        path.is_file() and not path.is_symlink() and path.stat().st_size <= 16 * 1024 * 1024,
+        "ACQUISITION_CHECKPOINT_INVALID",
+    )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Phase3FCloudJobError("ACQUISITION_CHECKPOINT_INVALID") from exc
+    _require(
+        isinstance(value, dict)
+        and value.get("schema") == ACQUISITION_CHECKPOINT_SCHEMA
+        and value.get("run_id") == run_id,
+        "ACQUISITION_CHECKPOINT_INCOMPATIBLE",
+    )
+    counters = tuple(
+        value.get(key)
+        for key in (
+            "client_request_count",
+            "client_page_count",
+            "client_rejected_item_count",
+        )
+    )
+    _require(
+        all(
+            isinstance(item, int) and not isinstance(item, bool) and item >= 0
+            for item in counters
+        )
+        and cast(int, counters[1]) <= cast(int, counters[0]),
+        "ACQUISITION_CHECKPOINT_INVALID",
+    )
+    return cast(tuple[int, int, int], counters)
+
+
+def _write_client_counters(
+    path: Path,
+    run_id: str,
+    request_count: int,
+    page_count: int,
+    rejected_item_count: int,
+) -> None:
+    _atomic_private_json(
+        path,
+        {
+            "schema": CLIENT_COUNTER_CHECKPOINT_SCHEMA,
+            "run_id": run_id,
+            "request_count": request_count,
+            "page_count": page_count,
+            "rejected_item_count": rejected_item_count,
+        },
+    )
+
+
+def _read_client_counters(path: Path, run_id: str) -> tuple[int, int, int]:
+    _require(
+        path.is_file() and not path.is_symlink() and path.stat().st_size <= 4096,
+        "CLIENT_COUNTER_CHECKPOINT_INVALID",
+    )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Phase3FCloudJobError("CLIENT_COUNTER_CHECKPOINT_INVALID") from exc
+    _require(
+        isinstance(value, dict)
+        and value.get("schema") == CLIENT_COUNTER_CHECKPOINT_SCHEMA
+        and value.get("run_id") == run_id,
+        "CLIENT_COUNTER_CHECKPOINT_INVALID",
+    )
+    counters = tuple(
+        value.get(key) for key in ("request_count", "page_count", "rejected_item_count")
+    )
+    _require(
+        all(
+            isinstance(item, int) and not isinstance(item, bool) and item >= 0
+            for item in counters
+        )
+        and cast(int, counters[1]) <= cast(int, counters[0]),
+        "CLIENT_COUNTER_CHECKPOINT_INVALID",
+    )
+    return cast(tuple[int, int, int], counters)
+
+
+def _write_acquisition_checkpoint(
+    path: Path,
+    *,
+    planned: Sequence[PlannedAsset],
+    completed: Mapping[str, _CheckpointAsset],
+    run_id: str,
+    client: MapillaryClient,
+) -> None:
+    rows = []
+    for item in planned:
+        image_id = item.metadata.image_id
+        if image_id not in completed:
+            continue
+        rows.append(
+            {
+                **asdict(completed[image_id]),
+            }
+        )
+    _atomic_private_json(
+        path,
+        {
+            "schema": ACQUISITION_CHECKPOINT_SCHEMA,
+            "run_id": run_id,
+            "planned_sha256": _planned_acquisition_sha256(planned),
+            "completed": rows,
+            "client_request_count": client.request_count,
+            "client_page_count": client.page_count,
+            "client_rejected_item_count": client.rejected_item_count,
+            "secrets_included": False,
+            "signed_urls_included": False,
+        },
+    )
 
 
 def acquire_planned_assets(
@@ -440,11 +1034,30 @@ def acquire_planned_assets(
     media_root: Path,
     run_id: str,
     guard: AcquisitionGuard,
+    checkpoint_path: Path | None = None,
+    restore_client_counts: bool = True,
 ) -> tuple[tuple[SplitAsset, ...], dict[str, object]]:
     wanted = {item.metadata.image_id: item for item in planned}
     _require(len(wanted) == len(planned), "PLANNED_IMAGE_DUPLICATE")
     completed: dict[str, SplitAsset] = {}
     provenance_hashes: list[str] = []
+    checkpoint_assets: dict[str, _CheckpointAsset] = {}
+    if checkpoint_path is not None:
+        checkpoint_assets, restored_guard, historical_counts = _load_acquisition_checkpoint(
+            checkpoint_path, planned=planned, media_root=media_root, run_id=run_id
+        )
+        if restore_client_counts:
+            client.add_historical_counts(
+                request_count=historical_counts[0],
+                page_count=historical_counts[1],
+                rejected_item_count=historical_counts[2],
+            )
+        provenance_hashes.extend(
+            item.provenance_sha256 for item in checkpoint_assets.values()
+        )
+        guard.request_count = restored_guard.request_count
+        guard.image_count = restored_guard.image_count
+        guard.media_bytes = restored_guard.media_bytes
     for area in areas:
         city_wanted = {
             image_id for image_id, item in wanted.items() if item.metadata.city == area.city
@@ -458,6 +1071,31 @@ def acquire_planned_assets(
         ):
             image_id = remote.metadata.mapillary_image_id
             if image_id not in city_wanted or image_id in completed:
+                continue
+            plan = wanted[image_id]
+            prior = checkpoint_assets.get(image_id)
+            if prior is not None:
+                lon, lat = remote.metadata.computed_geometry.coordinates
+                completed[image_id] = SplitAsset(
+                    opaque_id=prior.opaque_id,
+                    city=plan.metadata.city,
+                    role=plan.role,
+                    relative_path=(
+                        Path("assets")
+                        / prior.opaque_id[:2]
+                        / f"{prior.opaque_id}.jpg"
+                    ).as_posix(),
+                    contributor_id=remote.metadata.creator_id or "missing",
+                    sequence_id=remote.metadata.sequence_id or "missing",
+                    capture_run_id=remote.metadata.sequence_id or "missing",
+                    content_sha256=prior.content_sha256,
+                    perceptual_hash=prior.perceptual_hash,
+                    parent_or_tile_id=image_id,
+                    longitude=lon,
+                    latitude=lat,
+                )
+                if len(completed) == len(planned):
+                    break
                 continue
             _require(remote.thumbnail_url is not None, "THUMBNAIL_URL_MISSING")
             thumbnail_url = remote.thumbnail_url
@@ -508,21 +1146,20 @@ def acquire_planned_assets(
                 provenance=sidecar,
                 privacy_review=privacy_review,
             )
-            plan = wanted[image_id]
             opaque_id = _stable_key(run_id, image_id)[:32]
             relative = Path("assets") / opaque_id[:2] / f"{opaque_id}.jpg"
             destination = media_root / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(normalized)
+            _atomic_private_bytes(destination, normalized)
             sidecar_document = {
                 **asdict(sidecar),
                 "capture_date": sidecar.capture_date.astimezone(UTC).isoformat(),
             }
-            _atomic_json(
+            _atomic_private_json(
                 media_root / "private-sidecars" / f"{opaque_id}.json",
                 sidecar_document,
             )
-            provenance_hashes.append(_sha256_bytes(_canonical_bytes(sidecar_document)))
+            provenance_sha = _sha256_bytes(_canonical_bytes(sidecar_document))
+            provenance_hashes.append(provenance_sha)
             lon, lat = remote.metadata.computed_geometry.coordinates
             completed[image_id] = SplitAsset(
                 opaque_id=opaque_id,
@@ -538,6 +1175,21 @@ def acquire_planned_assets(
                 longitude=lon,
                 latitude=lat,
             )
+            checkpoint_assets[image_id] = _CheckpointAsset(
+                opaque_id=opaque_id,
+                content_sha256=_sha256_bytes(normalized),
+                perceptual_hash=phash,
+                provenance_sha256=provenance_sha,
+                admitted_media_bytes=len(payload),
+            )
+            if checkpoint_path is not None:
+                _write_acquisition_checkpoint(
+                    checkpoint_path,
+                    planned=planned,
+                    completed=checkpoint_assets,
+                    run_id=run_id,
+                    client=client,
+                )
             if len(completed) == len(planned):
                 break
     _require(len(completed) == len(planned), "PLANNED_IMAGE_UNAVAILABLE")
@@ -866,6 +1518,7 @@ class CloudJobConfig:
     work_root: Path
     output_root: Path
     deadline_epoch: float
+    resume: bool = False
 
 
 def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
@@ -890,11 +1543,39 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
         "SOURCE_POLICY_SHA256_MISMATCH",
     )
     areas = load_city_areas(config.aoi_config_path)
-    config.work_root.mkdir(parents=True, exist_ok=True)
+    if config.resume:
+        _require(
+            config.work_root.is_dir() and not config.work_root.is_symlink(),
+            "RESUME_WORK_ROOT_INVALID",
+        )
+    else:
+        _require(
+            not config.work_root.exists() and not config.work_root.is_symlink(),
+            "FRESH_WORK_ROOT_ALREADY_EXISTS",
+        )
+        config.work_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+        os.chmod(config.work_root, 0o700)
     config.output_root.mkdir(parents=True, exist_ok=False)
     media_root = config.work_root / "private-media"
     checkpoints = config.work_root / "descriptor-checkpoints"
     state_path = config.output_root / "pipeline-state.json"
+    acquisition_checkpoint = config.work_root / "acquisition-checkpoint.json"
+    client_counter_checkpoint = config.work_root / "client-counters.json"
+    metadata_page_checkpoint = config.work_root / "metadata-pages.json"
+    _require(
+        (
+            config.resume
+            and client_counter_checkpoint.is_file()
+            and metadata_page_checkpoint.is_file()
+        )
+        or (
+            not config.resume
+            and not acquisition_checkpoint.exists()
+            and not client_counter_checkpoint.exists()
+            and not metadata_page_checkpoint.exists()
+        ),
+        "RESUME_CHECKPOINT_MISSING",
+    )
     pipeline = Phase3FPipeline.create(state_path, run_id=config.run_id)
     guard = AcquisitionGuard()
     limits = ClientLimits(
@@ -912,12 +1593,66 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
         backoff_cap_seconds=8.0,
     )
     runtime: MegaLocRuntime | None = None
+    cleanup_private_work = False
+    historical_counts = (
+        _read_client_counters(client_counter_checkpoint, config.run_id)
+        if config.resume
+        else (0, 0, 0)
+    )
+    metadata_checkpoint = (
+        _load_metadata_page_checkpoint(
+            metadata_page_checkpoint,
+            areas=areas,
+            run_id=config.run_id,
+        )
+        if config.resume
+        else _new_metadata_page_checkpoint(areas, config.run_id)
+    )
+    if not config.resume:
+        _write_metadata_page_checkpoint(metadata_page_checkpoint, metadata_checkpoint)
+        _write_client_counters(client_counter_checkpoint, config.run_id, 0, 0, 0)
     started = datetime.now(UTC)
     try:
-        with MapillaryClient(cast(str, token), limits=limits) as client:
+        with MapillaryClient(
+            cast(str, token),
+            limits=limits,
+            counter_observer=lambda requests, pages, rejected: _write_client_counters(
+                client_counter_checkpoint,
+                config.run_id,
+                requests,
+                pages,
+                rejected,
+            ),
+        ) as client:
+            if config.resume:
+                client.add_historical_counts(
+                    request_count=historical_counts[0],
+                    page_count=historical_counts[1],
+                    rejected_item_count=historical_counts[2],
+                )
             _check_deadline(config.deadline_epoch)
             try:
-                audit = audit_metadata(client, areas)
+                audit = audit_metadata(
+                    client,
+                    areas,
+                    checkpoint=metadata_checkpoint,
+                    checkpoint_path=metadata_page_checkpoint,
+                    run_id=config.run_id,
+                    progress=lambda city, page_count, stage: print(
+                        json.dumps(
+                            {
+                                "event": "PHASE3F_MAPILLARY_METADATA_PROGRESS",
+                                "region": city,
+                                "page_count": page_count,
+                                "stage": stage,
+                                "secrets_included": False,
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    ),
+                )
             except CoverageInsufficient:
                 pipeline.finalize_coverage_insufficient(
                     reason_code="COVERAGE_INSUFFICIENT"
@@ -939,6 +1674,7 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                     config.output_root / "checksum-inventory.json",
                     _inventory_output(config.output_root),
                 )
+                cleanup_private_work = True
                 return execution
             _atomic_json(config.output_root / "metadata-audit.json", audit.aggregate_document())
             pipeline.lock_selection(audit.selection)
@@ -968,6 +1704,7 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                     config.output_root / "checksum-inventory.json",
                     _inventory_output(config.output_root),
                 )
+                cleanup_private_work = True
                 return execution
             assets, provenance = acquire_planned_assets(
                 client,
@@ -976,6 +1713,8 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                 media_root,
                 config.run_id,
                 guard,
+                acquisition_checkpoint,
+                restore_client_counts=False,
             )
             _require(client.request_count <= MAX_REQUESTS, "REQUEST_CAP_EXCEEDED")
             pipeline.complete_acquisition(guard)
@@ -1089,21 +1828,29 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                 "mapillary_request_count": client.request_count,
                 "downloaded_image_count": guard.image_count,
                 "downloaded_media_bytes": guard.media_bytes,
-                "raw_coordinates_included": False,
+                "private_exact_coordinates_in_derived_artifacts": True,
+                "raw_coordinates_in_execution_receipt": False,
                 "secrets_included": False,
                 "raw_images_included": False,
             }
             _atomic_json(config.output_root / "execution-receipt.json", execution)
             inventory = _inventory_output(config.output_root)
             _atomic_json(config.output_root / "checksum-inventory.json", inventory)
+            cleanup_private_work = True
             return execution
     finally:
         if runtime is not None:
             runtime.close()
-        if media_root.exists():
+        if cleanup_private_work and media_root.exists():
             shutil.rmtree(media_root)
-        if checkpoints.exists():
+        if cleanup_private_work and checkpoints.exists():
             shutil.rmtree(checkpoints)
+        if cleanup_private_work and acquisition_checkpoint.exists():
+            acquisition_checkpoint.unlink()
+        if cleanup_private_work and client_counter_checkpoint.exists():
+            client_counter_checkpoint.unlink()
+        if cleanup_private_work and metadata_page_checkpoint.exists():
+            metadata_page_checkpoint.unlink()
 
 
 __all__ = [

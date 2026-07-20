@@ -40,6 +40,7 @@ from atlaslens_api.mapillary_demo.client import (
     validated_next_url,
 )
 from atlaslens_api.mapillary_demo.errors import (
+    MapillaryDemoError,
     MapillaryLimitError,
     MapillarySafetyError,
     MapillaryTokenError,
@@ -331,6 +332,136 @@ def test_pagination_strips_embedded_token_and_rejects_nonofficial_next_host() ->
     assert observed[1].headers["Authorization"] == f"OAuth {FAKE_TOKEN}"
     with pytest.raises(MapillarySafetyError, match="mapillary_paging_url_invalid"):
         validated_next_url("https://evil.example/images?after=cursor")
+
+
+def test_relative_pagination_is_canonical_and_never_duplicates_first_page_params() -> None:
+    observed: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request)
+        if len(observed) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [_row("image-1")],
+                    "paging": {"next": "/images?limit=100&after=cursor-1"},
+                },
+            )
+        return httpx.Response(200, json={"data": [_row("image-2")]})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(FAKE_TOKEN, http_client=http_client)
+        images = list(
+            client.iter_images(
+                [load_aoi_catalog(_catalog_path()).aois[0].tiles[0]],
+                include_thumbnail=False,
+            )
+        )
+
+    assert [item.metadata.mapillary_image_id for item in images] == ["image-1", "image-2"]
+    second_query = parse_qs(observed[1].url.query.decode())
+    assert second_query == {"after": ["cursor-1"], "limit": ["100"]}
+    assert "bbox" not in second_query
+    assert "fields" not in second_query
+
+
+def test_pagination_loop_and_duplicate_query_key_fail_closed() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        next_url = (
+            "https://graph.mapillary.com/images?limit=100&after=cursor-1"
+            if calls == 1
+            else "/images?after=cursor-1&limit=100"
+        )
+        return httpx.Response(200, json={"data": [], "paging": {"next": next_url}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(FAKE_TOKEN, http_client=http_client)
+        with pytest.raises(MapillarySafetyError, match="mapillary_paging_loop_detected"):
+            list(
+                client.iter_images(
+                    [load_aoi_catalog(_catalog_path()).aois[0].tiles[0]],
+                    include_thumbnail=False,
+                )
+            )
+    assert calls == 2
+    assert validated_next_url(
+        "https://graph.mapillary.com/images?limit=100&after=cursor-1"
+    ) == validated_next_url("/images?after=cursor-1&limit=100")
+    with pytest.raises(MapillarySafetyError, match="mapillary_paging_query_duplicate"):
+        validated_next_url("/images?after=one&after=two")
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "expected_calls"),
+    [
+        (400, "mapillary_api_bad_request", 1),
+        (401, "mapillary_token_rejected", 1),
+        (403, "mapillary_permission_denied", 1),
+        (429, "mapillary_api_rate_limit_retry_exhausted", 2),
+        (503, "mapillary_api_server_retry_exhausted", 2),
+    ],
+)
+def test_graph_http_failures_have_typed_secret_free_codes(
+    status: int,
+    code: str,
+    expected_calls: int,
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status, text=f"provider body {FAKE_TOKEN}")
+
+    limits = ClientLimits(request_cap=2, retry_cap=1, backoff_base_seconds=0)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(
+            FAKE_TOKEN,
+            limits=limits,
+            http_client=http_client,
+            sleep=lambda _seconds: None,
+        )
+        with pytest.raises(MapillaryDemoError, match=code) as error:
+            list(
+                client.iter_images(
+                    [load_aoi_catalog(_catalog_path()).aois[0].tiles[0]],
+                    include_thumbnail=False,
+                )
+            )
+    assert FAKE_TOKEN not in str(error.value)
+    assert "provider body" not in str(error.value)
+    assert calls == expected_calls
+
+
+def test_graph_timeout_is_bounded_and_secret_free() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout(f"unsafe {FAKE_TOKEN}", request=request)
+
+    limits = ClientLimits(request_cap=2, retry_cap=1, backoff_base_seconds=0)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(
+            FAKE_TOKEN,
+            limits=limits,
+            http_client=http_client,
+            sleep=lambda _seconds: None,
+        )
+        with pytest.raises(MapillaryDemoError, match="mapillary_api_timeout") as error:
+            list(
+                client.iter_images(
+                    [load_aoi_catalog(_catalog_path()).aois[0].tiles[0]],
+                    include_thumbnail=False,
+                )
+            )
+    assert calls == 2
+    assert FAKE_TOKEN not in str(error.value)
 
 
 def test_retry_after_and_bounded_exponential_retry() -> None:

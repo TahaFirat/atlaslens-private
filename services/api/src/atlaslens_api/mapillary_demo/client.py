@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import email.utils
+import hashlib
 import json
 import math
 import random
@@ -62,6 +63,16 @@ class PageResult:
     next_url: str | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True)
+class PaginationProgress:
+    """Secret-free completed-page state for an external private checkpoint."""
+
+    box_index: int
+    next_url: str | None = field(default=None, repr=False)
+    images: tuple[RemoteImage, ...] = ()
+    visited_page_sha256: tuple[str, ...] = ()
+
+
 TokenCheckStatus = Literal["configured", "invalid", "unavailable"]
 
 
@@ -113,8 +124,9 @@ def validated_next_url(value: str) -> str:
     except ValueError:
         raise MapillarySafetyError("mapillary_paging_url_invalid") from None
     if (
-        parsed.scheme != "https"
-        or parsed.hostname != "graph.mapillary.com"
+        parsed.scheme not in {"", "https"}
+        or (parsed.scheme == "https" and parsed.hostname != "graph.mapillary.com")
+        or (parsed.scheme == "" and (parsed.hostname is not None or parsed.netloc))
         or port not in {None, 443}
         or parsed.username is not None
         or parsed.password is not None
@@ -122,12 +134,19 @@ def validated_next_url(value: str) -> str:
         or parsed.path not in _ALLOWED_GRAPH_PATHS
     ):
         raise MapillarySafetyError("mapillary_paging_url_invalid")
-    query = [
-        (key, item)
-        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-        if key.casefold() not in _SENSITIVE_QUERY_KEYS
-    ]
-    return urlunsplit(("https", "graph.mapillary.com", parsed.path, urlencode(query), ""))
+    query: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+        normalized = key.casefold()
+        if normalized in _SENSITIVE_QUERY_KEYS:
+            continue
+        if normalized in seen:
+            raise MapillarySafetyError("mapillary_paging_query_duplicate")
+        seen.add(normalized)
+        query.append((key, item))
+    return urlunsplit(
+        ("https", "graph.mapillary.com", parsed.path, urlencode(sorted(query)), "")
+    )
 
 
 def _official_graph_url(path_or_url: str) -> str:
@@ -172,16 +191,21 @@ class MapillaryClient:
         jitter: Callable[[float, float], float] = random.uniform,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         media_host_suffixes: Sequence[str] = _DEFAULT_MEDIA_HOST_SUFFIXES,
+        counter_observer: Callable[[int, int, int], None] | None = None,
     ) -> None:
         self._token = validate_access_token(access_token)
         self.limits = limits or ClientLimits()
-        self._http = http_client or httpx.Client(follow_redirects=False)
+        self._http = http_client or httpx.Client(
+            follow_redirects=False,
+            trust_env=False,
+        )
         self._owns_http = http_client is None
         self._cancel_event = cancel_event or threading.Event()
         self._sleep = sleep
         self._jitter = jitter
         self._now = now
         self._media_host_suffixes = tuple(suffix.casefold() for suffix in media_host_suffixes)
+        self._counter_observer = counter_observer
         if not self._media_host_suffixes or any(
             not suffix.startswith(".") for suffix in self._media_host_suffixes
         ):
@@ -216,17 +240,70 @@ class MapillaryClient:
         with self._lock:
             return self._rejected_item_count
 
+    def add_historical_counts(
+        self,
+        *,
+        request_count: int,
+        page_count: int,
+        rejected_item_count: int,
+    ) -> None:
+        """Conservatively add validated prior-process counters before resuming."""
+
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (request_count, page_count, rejected_item_count)
+        ):
+            raise MapillaryLimitError("mapillary_resume_counter_invalid")
+        with self._lock:
+            if self._request_count + request_count > self.limits.request_cap:
+                raise MapillaryLimitError("mapillary_request_cap_reached")
+            if self._page_count + page_count > self.limits.page_cap:
+                raise MapillaryLimitError("mapillary_page_cap_reached")
+            self._request_count += request_count
+            self._page_count += page_count
+            self._rejected_item_count += rejected_item_count
+
     def _reserve_request(self) -> None:
         with self._lock:
             if self._request_count >= self.limits.request_cap:
                 raise MapillaryLimitError("mapillary_request_cap_reached")
             self._request_count += 1
+            counters = (
+                self._request_count,
+                self._page_count,
+                self._rejected_item_count,
+            )
+        if self._counter_observer is not None:
+            self._counter_observer(*counters)
 
     def _reserve_page(self) -> None:
         with self._lock:
             if self._page_count >= self.limits.page_cap:
                 raise MapillaryLimitError("mapillary_page_cap_reached")
             self._page_count += 1
+            counters = (
+                self._request_count,
+                self._page_count,
+                self._rejected_item_count,
+            )
+        if self._counter_observer is not None:
+            self._counter_observer(*counters)
+
+    def _require_page_capacity(self) -> None:
+        with self._lock:
+            if self._page_count >= self.limits.page_cap:
+                raise MapillaryLimitError("mapillary_page_cap_reached")
+
+    def _record_rejected_item(self) -> None:
+        with self._lock:
+            self._rejected_item_count += 1
+            counters = (
+                self._request_count,
+                self._page_count,
+                self._rejected_item_count,
+            )
+        if self._counter_observer is not None:
+            self._counter_observer(*counters)
 
     def _check_cancelled(self) -> None:
         if self._cancel_event.is_set():
@@ -257,6 +334,8 @@ class MapillaryClient:
         *,
         params: Mapping[str, str | int] | None = None,
     ) -> httpx.Response:
+        if not path_or_url.startswith("/") and params is not None:
+            raise MapillarySafetyError("mapillary_paging_params_duplicate")
         url = _official_graph_url(path_or_url)
         for retry_number in range(self.limits.retry_cap + 1):
             self._check_cancelled()
@@ -273,14 +352,23 @@ class MapillaryClient:
                 ) as streamed:
                     if streamed.status_code in _RETRYABLE_STATUS:
                         if retry_number >= self.limits.retry_cap:
-                            raise MapillaryApiError("mapillary_api_retry_exhausted")
+                            code = (
+                                "mapillary_api_rate_limit_retry_exhausted"
+                                if streamed.status_code == 429
+                                else "mapillary_api_server_retry_exhausted"
+                            )
+                            raise MapillaryApiError(code)
                         retry_response = httpx.Response(
                             streamed.status_code,
                             headers=streamed.headers,
                         )
                     else:
-                        if streamed.status_code in {401, 403}:
+                        if streamed.status_code == 401:
                             raise MapillaryTokenError("mapillary_token_rejected")
+                        if streamed.status_code == 403:
+                            raise MapillaryApiError("mapillary_permission_denied")
+                        if streamed.status_code == 400:
+                            raise MapillaryApiError("mapillary_api_bad_request")
                         if streamed.status_code == 404:
                             raise MapillaryApiError("mapillary_image_not_found")
                         if streamed.is_redirect:
@@ -322,6 +410,13 @@ class MapillaryClient:
                     raise MapillaryApiError("mapillary_api_timeout") from None
                 synthetic = httpx.Response(503)
                 self._delay(synthetic, retry_number)
+                continue
+            except (httpx.NetworkError, httpx.RemoteProtocolError):
+                if retry_number >= self.limits.retry_cap:
+                    raise MapillaryApiError(
+                        "mapillary_api_transport_retry_exhausted"
+                    ) from None
+                self._delay(httpx.Response(503), retry_number)
                 continue
             except httpx.HTTPError:
                 raise MapillaryApiError("mapillary_api_transport_failed") from None
@@ -372,6 +467,11 @@ class MapillaryClient:
         *,
         include_thumbnail: bool,
         item_cap: int | None = None,
+        resume_box_index: int = 0,
+        resume_next_url: str | None = None,
+        resume_seen_image_ids: Sequence[str] = (),
+        resume_visited_page_sha256: Sequence[str] = (),
+        page_observer: Callable[[PaginationProgress], None] | None = None,
     ) -> Iterator[RemoteImage]:
         """Yield deduplicated images from bounded boxes and validated pagination."""
 
@@ -379,21 +479,46 @@ class MapillaryClient:
         selected_cap = min(requested_cap, self.limits.metadata_item_cap)
         if selected_cap <= 0:
             raise MapillaryLimitError("mapillary_item_cap_invalid")
-        emitted = 0
-        seen: set[str] = set()
+        if not 0 <= resume_box_index <= len(boxes):
+            raise MapillarySafetyError("mapillary_resume_box_invalid")
+        if resume_next_url is not None and resume_box_index >= len(boxes):
+            raise MapillarySafetyError("mapillary_resume_page_invalid")
+        if any(
+            len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
+            for value in resume_visited_page_sha256
+        ):
+            raise MapillarySafetyError("mapillary_resume_page_invalid")
+        emitted = len(resume_seen_image_ids)
+        if emitted > selected_cap:
+            raise MapillaryLimitError("mapillary_item_cap_reached")
+        seen = set(resume_seen_image_ids)
+        if len(seen) != emitted:
+            raise MapillarySafetyError("mapillary_resume_image_duplicate")
         fields = MAPILLARY_API_FIELDS if include_thumbnail else MAPILLARY_API_FIELDS[:-1]
-        for box in boxes:
-            next_url: str | None = None
-            params: Mapping[str, str | int] | None = {
-                "bbox": box.as_query_value(),
-                "fields": ",".join(fields),
-                "limit": self.limits.page_size,
-            }
+        for box_index, box in enumerate(boxes):
+            if box_index < resume_box_index:
+                continue
+            resumed_box = box_index == resume_box_index
+            next_url = (
+                validated_next_url(resume_next_url)
+                if resumed_box and resume_next_url is not None
+                else None
+            )
+            visited_pages = set(resume_visited_page_sha256 if resumed_box else ())
+            params: Mapping[str, str | int] | None = None
+            if next_url is None:
+                params = {
+                    "bbox": box.as_query_value(),
+                    "fields": ",".join(fields),
+                    "limit": self.limits.page_size,
+                }
             while True:
-                self._reserve_page()
+                self._require_page_capacity()
                 payload = self._json_object(next_url or "/images", params=params)
+                self._reserve_page()
                 params = None
                 page = self._parse_page(payload, include_thumbnail=include_thumbnail)
+                page_images: list[RemoteImage] = []
                 for image in page.images:
                     image_id = image.metadata.mapillary_image_id
                     if image_id in seen:
@@ -402,7 +527,26 @@ class MapillaryClient:
                         raise MapillaryLimitError("mapillary_item_cap_reached")
                     seen.add(image_id)
                     emitted += 1
-                    yield image
+                    page_images.append(image)
+                next_box_index = box_index + 1
+                next_visited: set[str] = set()
+                if page.next_url is not None:
+                    identity = hashlib.sha256(page.next_url.encode("utf-8")).hexdigest()
+                    if identity in visited_pages:
+                        raise MapillarySafetyError("mapillary_paging_loop_detected")
+                    visited_pages.add(identity)
+                    next_box_index = box_index
+                    next_visited = visited_pages
+                if page_observer is not None:
+                    page_observer(
+                        PaginationProgress(
+                            box_index=next_box_index,
+                            next_url=page.next_url,
+                            images=tuple(page_images),
+                            visited_page_sha256=tuple(sorted(next_visited)),
+                        )
+                    )
+                yield from page_images
                 if page.next_url is None:
                     break
                 next_url = page.next_url
@@ -414,14 +558,12 @@ class MapillaryClient:
         images: list[RemoteImage] = []
         for row in rows:
             if not isinstance(row, dict):
-                with self._lock:
-                    self._rejected_item_count += 1
+                self._record_rejected_item()
                 continue
             try:
                 images.append(_parse_remote_image(row, include_thumbnail=include_thumbnail))
             except (KeyError, TypeError, ValueError, ValidationError):
-                with self._lock:
-                    self._rejected_item_count += 1
+                self._record_rejected_item()
                 continue
         paging = payload.get("paging")
         next_url: str | None = None
@@ -468,7 +610,12 @@ class MapillaryClient:
                 ) as response:
                     if response.status_code in _RETRYABLE_STATUS:
                         if retry_number >= self.limits.retry_cap:
-                            raise MapillaryApiError("mapillary_media_retry_exhausted")
+                            code = (
+                                "mapillary_media_rate_limit_retry_exhausted"
+                                if response.status_code == 429
+                                else "mapillary_media_server_retry_exhausted"
+                            )
+                            raise MapillaryApiError(code)
                         self._delay(response, retry_number)
                         continue
                     if response.is_redirect:
@@ -499,6 +646,12 @@ class MapillaryClient:
             except httpx.TimeoutException:
                 if retry_number >= self.limits.retry_cap:
                     raise MapillaryApiError("mapillary_media_timeout") from None
+                self._delay(httpx.Response(503), retry_number)
+            except (httpx.NetworkError, httpx.RemoteProtocolError):
+                if retry_number >= self.limits.retry_cap:
+                    raise MapillaryApiError(
+                        "mapillary_media_transport_retry_exhausted"
+                    ) from None
                 self._delay(httpx.Response(503), retry_number)
             except httpx.HTTPError:
                 raise MapillaryApiError("mapillary_media_transport_failed") from None
@@ -599,6 +752,7 @@ def _parse_remote_image(row: Mapping[str, Any], *, include_thumbnail: bool) -> R
 __all__ = [
     "MapillaryClient",
     "PageResult",
+    "PaginationProgress",
     "RemoteImage",
     "TokenCheckStatus",
     "redact_headers",

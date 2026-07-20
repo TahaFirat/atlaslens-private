@@ -1,5 +1,40 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F checkpoints Mapillary pages for bounded manual resume
+
+- Context: The Phase 3F acquisition failed in `iter_images` after retry
+  exhaustion. A later one-item metadata request from the same Pod succeeded, so
+  persistent token resolution, DNS, TLS, and basic API access are not supported
+  as the cause. The historical safe error folded final 429 and retryable 5xx
+  responses into one code, so the exact status cannot be reconstructed. Static
+  inspection also showed that the old iterator already cleared first-request
+  parameters before following `paging.next`; duplicated `bbox`, `fields`, or
+  `limit` parameters were not the observed defect. The operational defect was
+  lossy status classification plus the absence of a completed-page checkpoint.
+- Decision: Preserve typed terminal/retry-exhaustion classes; validate and
+  canonicalize only official `/images` cursors; never reuse initial parameters
+  with a next cursor; and atomically checkpoint each completed metadata page,
+  cursor-loop hashes, rows, and cumulative counters in a private 0600 work root.
+  A repaired run may resume that exact run and creates a new output attempt.
+  Add an in-Pod-only manual controller with a global job lock, PID identity
+  binding, a 4.5-hour job deadline, canonical model/vendor gates, and sanitized
+  status/log projection. Transfer it as a locally hashed Git bundle, verify the
+  exact commit and clean checkout before readiness, and pass only an explicit
+  Python/CUDA environment allowlist plus the Mapillary token to children. It
+  contains no RunPod API or Pod lifecycle operation.
+- Alternatives: Infer a specific historical HTTP status; spend another request
+  or paid Pod session to rediscover the failure; resume from only an opaque item
+  count; reuse a partial output directory; allow the helper to start or stop the
+  Pod; expose paging URLs or provider response bodies in logs.
+- Consequences: The historical failed job cannot resume pages because it never
+  wrote the new checkpoint; the first repaired run is fresh, while subsequent
+  interruptions of that run are resumable. Exact metadata required for the job
+  remains only in the private work checkpoint and is removed on success; public
+  receipts and log projections remain secret-free. The job deadline does not
+  stop the Pod or billing, so the manual operator must preserve outputs and own
+  lifecycle actions separately.
+- Target phase: Product Phase 3F bounded multi-region pilot only.
+
 ## 2026-07-20 - Phase 3F attests GPU allocation after eventual consistency
 
 - Context: The latest bounded run was reported with HTTP 201, an atomically
