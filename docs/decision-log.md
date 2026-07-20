@@ -1,5 +1,29 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F separates checkpointed acquisition from offline compute
+
+- Context: The bounded existing-Pod job passed preparation and process start but
+  exhausted Mapillary server retries before MegaLoc/CUDA was reached. Keeping
+  network acquisition and paid GPU compute in one process made transient source
+  availability consume GPU wall time without producing descriptor work.
+- Decision: Make Windows the authoritative acquisition stage: token only from
+  inherited process environment, typed bounded Mapillary retries, atomic page
+  and asset checkpoints, and a private sealed acquisition directory with a full
+  checksum inventory. Make descriptor/index/calibration/benchmark a distinct
+  compute-only stage that first verifies the seal, removes the Mapillary token,
+  blocks INET sockets, forces offline model loading, and uses the pre-verified
+  local MegaLoc source and weights. Refuse a C-drive runtime, redirect child
+  temporary files to D, cap acquisition runtime at 8 GiB and media at 7 GiB,
+  and require exact run-ID confirmation for cleanup.
+- Alternatives: Continue acquisition inside a paid GPU Pod; load CUDA before
+  source coverage is complete; copy an unsealed directory into compute; allow a
+  model-hub fallback; place the token on argv or read it from `.env`.
+- Consequences: Source retries can resume locally without GPU cost. Compute can
+  later run on local CUDA or consume the exact sealed bundle on a separately
+  authorized worker, without Mapillary/network access. Existing RunPod wrappers
+  remain available but are not invoked or changed by this local-first path.
+- Target phase: Product Phase 3F bounded licensed corpus pilot.
+
 ## 2026-07-20 - Phase 3F attests exported Mapillary secret inheritance
 
 - Context: In one Pod shell, `test -n "${MAPILLARY_ACCESS_TOKEN:-}"` succeeded,

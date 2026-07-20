@@ -5,6 +5,48 @@ local-only dry-run unless `-Execute` is present. The API key is read only from
 the PowerShell process environment; it is not accepted as an argument or
 printed. The wrapper does not read `.env` or `asda.html`.
 
+## Preferred local-first execution
+
+Phase 3F acquisition and GPU compute are separate checkpoints. Acquisition runs
+on Windows with CPU/network only, persists every completed Mapillary page and
+asset checkpoint atomically, and seals `sealed-acquisition` with a complete
+checksum inventory. It cannot load MegaLoc or CUDA. Compute refuses to start
+until that sealed inventory, selection lock, split lock, and every media hash
+verify. It then removes `MAPILLARY_ACCESS_TOKEN`, enforces the Hugging Face and
+Transformers offline modes, blocks INET socket connections, and uses only the
+existing local model and vendor artifacts.
+
+The token must already be exported in the PowerShell process environment. It is
+never accepted on argv or written to state. Run each command from any working
+directory:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-local.ps1" -Action AcquireOnly
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-local.ps1" -Action Status
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-local.ps1" -Action Resume
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-local.ps1" -Action ComputeOnly
+```
+
+The runtime defaults to `D:\AtlasLensRuntime\phase3f-local`; C-drive runtime is
+refused and child `TEMP`/`TMP` are redirected below that D-drive root. A fresh
+acquisition also requires at least 8 GiB free on that drive and admits at most
+7 GiB of downloaded media inside an 8 GiB acquisition runtime cap. HTTP
+400/401/403 remains terminal; 429, 5xx, timeout, and transport failures use the
+existing bounded retry policy. No model or dataset download fallback exists.
+
+Cleanup is preview-first. Read the 32-hex `run_id` from `Status`, preview, then
+repeat with its exact value:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-local.ps1" -Action Cleanup
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-local.ps1" -Action Cleanup -Execute -ConfirmRunId "<RUN_ID_FROM_STATUS>"
+```
+
+The sealed acquisition is at
+`D:\AtlasLensRuntime\phase3f-local\<run-id>\sealed-acquisition`; offline
+descriptor, index, benchmark, receipt, and checksum results are at
+`D:\AtlasLensRuntime\phase3f-local\<run-id>\compute-output`.
+
 ## Commands
 
 Dry-run from any PowerShell working directory:

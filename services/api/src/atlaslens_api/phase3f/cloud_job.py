@@ -71,6 +71,12 @@ MEGALOC_CANONICAL_SOURCE_SHA256: Final = (
 MEGALOC_LICENSE_CANONICAL_SHA256: Final = (
     "0a906f9a65db6f645483f6cbf56b01e20615b9b943df3f70112f3d0fe0521e2a"
 )
+MEGALOC_WINDOWS_SOURCE_SHA256: Final = (
+    "c0848dfb287ba15b519d7b54415db824e16ec2f2b5a6899507b0476cf3379767"
+)
+MEGALOC_WINDOWS_LICENSE_SHA256: Final = (
+    "40c6c4894aecc5b676f0fb93697a6c1f82b08df71b25e485b662779b2c899667"
+)
 SOURCE_POLICY_SHA256: Final = (
     "72d51363f2b63de368d34d4d7bb2fc1145f93dc0469e7026100976732dfde209"
 )
@@ -700,18 +706,56 @@ def plan_locked_roles(audit: MetadataAudit) -> tuple[PlannedAsset, ...]:
     return tuple(planned)
 
 
+def _verify_canonical_vendor_text(
+    path: Path,
+    *,
+    canonical_lf_sha256: str,
+    windows_crlf_sha256: str,
+    max_bytes: int,
+) -> None:
+    _require(
+        path.is_file()
+        and not path.is_symlink()
+        and 0 < path.stat().st_size <= max_bytes,
+        "MEGALOC_VENDOR_FILE_INVALID",
+    )
+    payload = path.read_bytes()
+    raw_sha256 = _sha256_bytes(payload)
+    _require(not payload.startswith(b"\xef\xbb\xbf"), "MEGALOC_VENDOR_BOM_REFUSED")
+    if raw_sha256 == canonical_lf_sha256:
+        _require(b"\r" not in payload, "MEGALOC_VENDOR_LINE_ENDING_INVALID")
+        canonical = payload
+    elif raw_sha256 == windows_crlf_sha256:
+        without_crlf = payload.replace(b"\r\n", b"")
+        _require(
+            b"\r" not in without_crlf and b"\n" not in without_crlf,
+            "MEGALOC_VENDOR_LINE_ENDING_INVALID",
+        )
+        canonical = payload.replace(b"\r\n", b"\n")
+    else:
+        raise Phase3FCloudJobError("MEGALOC_VENDOR_SHA256_MISMATCH")
+    _require(
+        _sha256_bytes(canonical) == canonical_lf_sha256,
+        "MEGALOC_VENDOR_CANONICAL_SHA256_MISMATCH",
+    )
+
+
 def verify_megaloc_artifacts(model_path: Path, source_path: Path, license_path: Path) -> None:
     _require(
         _sha256_path(model_path, expected_size=MODEL_SIZE_BYTES) == MODEL_SHA256,
         "MODEL_SHA256_MISMATCH",
     )
-    _require(
-        _sha256_path(source_path) == MEGALOC_CANONICAL_SOURCE_SHA256,
-        "MEGALOC_SOURCE_SHA256_MISMATCH",
+    _verify_canonical_vendor_text(
+        source_path,
+        canonical_lf_sha256=MEGALOC_CANONICAL_SOURCE_SHA256,
+        windows_crlf_sha256=MEGALOC_WINDOWS_SOURCE_SHA256,
+        max_bytes=32 * 1024,
     )
-    _require(
-        _sha256_path(license_path) == MEGALOC_LICENSE_CANONICAL_SHA256,
-        "MEGALOC_LICENSE_SHA256_MISMATCH",
+    _verify_canonical_vendor_text(
+        license_path,
+        canonical_lf_sha256=MEGALOC_LICENSE_CANONICAL_SHA256,
+        windows_crlf_sha256=MEGALOC_WINDOWS_LICENSE_SHA256,
+        max_bytes=4 * 1024,
     )
 
 
@@ -1036,7 +1080,9 @@ def acquire_planned_assets(
     guard: AcquisitionGuard,
     checkpoint_path: Path | None = None,
     restore_client_counts: bool = True,
+    max_media_bytes: int = MAX_MEDIA_BYTES,
 ) -> tuple[tuple[SplitAsset, ...], dict[str, object]]:
+    _require(0 < max_media_bytes <= MAX_MEDIA_BYTES, "MEDIA_CAP_INVALID")
     wanted = {item.metadata.image_id: item for item in planned}
     _require(len(wanted) == len(planned), "PLANNED_IMAGE_DUPLICATE")
     completed: dict[str, SplitAsset] = {}
@@ -1106,6 +1152,10 @@ def acquire_planned_assets(
                 payload, _mime = client.download_thumbnail(
                     thumbnail_url.get_secret_value(),
                     max_bytes=16 * 1024 * 1024,
+                )
+                _require(
+                    guard.media_bytes + len(payload) <= max_media_bytes,
+                    "MEDIA_CAP_EXCEEDED",
                 )
                 normalized, _width, _height, phash = _normalize_image(payload)
                 source_page = f"https://www.mapillary.com/app/?pKey={image_id}"
@@ -1193,7 +1243,7 @@ def acquire_planned_assets(
             if len(completed) == len(planned):
                 break
     _require(len(completed) == len(planned), "PLANNED_IMAGE_UNAVAILABLE")
-    _require(guard.media_bytes <= MAX_MEDIA_BYTES, "MEDIA_CAP_EXCEEDED")
+    _require(guard.media_bytes <= max_media_bytes, "MEDIA_CAP_EXCEEDED")
     return (
         tuple(completed[item.metadata.image_id] for item in planned),
         {
