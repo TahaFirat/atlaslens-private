@@ -58,6 +58,8 @@ _RUNPOD_SECRET_REFERENCE = re.compile(
 )
 _TERMINAL_ACQUISITION_ERRORS: Final = frozenset(
     {
+        "MAPILLARY_TOKEN_REJECTED",
+        "MAPILLARY_PERMISSION_DENIED",
         "MAPILLARY_PARTITION_DEPTH_LIMIT_REACHED",
         "MAPILLARY_PARTITION_MIN_AREA_REACHED",
         "MAPILLARY_PARTITION_CELL_LIMIT_REACHED",
@@ -1119,7 +1121,53 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
                 max_media_bytes=LOCAL_MEDIA_CAP_BYTES,
                 checkpoint_observer=record_media_checkpoint,
                 allow_item_failures=True,
+                primary_count=len(split_plan.primary),
             )
+            media_status = provenance.get("media_status")
+            media_counts = provenance.get("media_task_counts")
+            _require(
+                isinstance(media_status, str) and isinstance(media_counts, dict),
+                "MEDIA_ACQUISITION_STATUS_INVALID",
+            )
+            media_status = cast(str, media_status)
+            media_counts = cast(dict[str, object], media_counts)
+            if media_status.startswith("PAUSED_"):
+                safe_counts = media_counts
+                sync_scheduler_checkpoint(
+                    scheduler_path,
+                    run_id=run_id,
+                    metadata_checkpoint=metadata_path,
+                    client_counters=counters_path,
+                    acquisition_checkpoint=acquisition_path,
+                    request_cap=MAX_REQUESTS,
+                    media_byte_cap=LOCAL_MEDIA_CAP_BYTES,
+                    max_wall_seconds=config.max_wall_seconds,
+                    status=media_status,
+                    city_order=[area.city for area in areas],
+                )
+                _write_state(
+                    runtime_root,
+                    run_id,
+                    media_status,
+                    error_code=None,
+                    accepted=safe_counts.get("accepted"),
+                    rejected=safe_counts.get("rejected"),
+                    quarantined=safe_counts.get("quarantined"),
+                    pending=safe_counts.get("pending"),
+                    reserve=safe_counts.get("reserve"),
+                    media_bytes=safe_counts.get("media_bytes"),
+                    retry_not_before=safe_counts.get("retry_not_before"),
+                    model_loaded=False,
+                    gpu_used=False,
+                )
+                return {
+                    "run_id": run_id,
+                    "stage": media_status,
+                    **safe_counts,
+                    "model_loaded": False,
+                    "gpu_used": False,
+                    "secrets_included": False,
+                }
             media_plan = worker.finalize_media_split(split_plan, assets)
             worker._atomic_private_json(  # noqa: SLF001
                 readiness_path, media_plan.readiness
@@ -1128,16 +1176,25 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
                 _write_state(
                     runtime_root,
                     run_id,
-                    "DATASET_NOT_READY_FOR_TRAINING",
+                    "MEDIA_SPLIT_MINIMUM_UNAVAILABLE",
+                    error_code="MEDIA_SPLIT_MINIMUM_UNAVAILABLE",
                     asset_count=len(assets),
+                    accepted=media_counts.get("accepted"),
+                    rejected=media_counts.get("rejected"),
+                    quarantined=media_counts.get("quarantined"),
+                    pending=media_counts.get("pending"),
+                    reserve=media_counts.get("reserve"),
+                    media_bytes=media_counts.get("media_bytes"),
+                    retry_not_before=None,
                     readiness_report_sha256=worker._sha256_path(readiness_path),  # noqa: SLF001
                     model_loaded=False,
                     gpu_used=False,
                 )
                 return {
                     "run_id": run_id,
-                    "stage": "DATASET_NOT_READY_FOR_TRAINING",
+                    "stage": "MEDIA_SPLIT_MINIMUM_UNAVAILABLE",
                     "asset_count": len(assets),
+                    "readiness_report": str(readiness_path),
                     "secrets_included": False,
                 }
             assets = media_plan.assets
@@ -1469,7 +1526,13 @@ def status(runtime_root: Path) -> dict[str, object]:
         "stage": state.get("stage"),
         "error_code": state.get("error_code"),
         "asset_count": state.get("asset_count"),
+        "accepted": state.get("accepted"),
+        "rejected": state.get("rejected"),
+        "quarantined": state.get("quarantined"),
+        "pending": state.get("pending"),
+        "reserve": state.get("reserve"),
         "media_bytes": state.get("media_bytes"),
+        "retry_not_before": state.get("retry_not_before"),
         "network_calls": state.get("network_calls"),
         "mapillary_requests": state.get("mapillary_requests"),
         "secrets_included": False,

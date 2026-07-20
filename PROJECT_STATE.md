@@ -477,6 +477,53 @@ next_phase: phase_6c_in_progress
 
 # AtlasLens project state
 
+## Product Phase 3F resumable media acquisition
+
+Status: **REPAIRED AND VERIFIED OFFLINE - LIVE RESUME NOT EXECUTED**.
+
+The current run retains the complete 8,805-row metadata checkpoint at SHA-256
+`5d2b98964ee4238959901baf609f00797c62f32fe20308cfcd30578025914f39` and
+the feasible 830-primary plus 200-reserve split plan at SHA-256
+`1577817b2a99d765144bad97c9ec344516b3723b809e399e2f3b745b705953df`.
+Its v1 acquisition checkpoint contains 33 accepted files: 31 primary and two
+reserve candidates, all in the Istanbul/reference bucket. Accepted source bytes
+are 4,439,172; normalized private JPEG bytes are 6,546,321; the sorted media
+hash/size inventory SHA-256 is
+`bc1381503f42a255297bb7d916d40d42034b06d151cce378201baa2dd3b7ce13`.
+No part file is present.
+
+The last failure occurred before a media candidate download. The exact path was
+`acquire_planned_assets -> MapillaryClient.iter_images -> _json_object -> _get`
+while resolving ephemeral thumbnail URLs from Graph `/images`. Four bounded
+attempts raised `MAPILLARY_API_SERVER_RETRY_EXHAUSTED` outside the old item
+exception boundary. The checkpoint retained 259 requests while scheduler v4
+recorded 263, zero new parsed pages, and no candidate ledger entry; therefore a
+specific candidate identity cannot be recovered, and the old Resume path could
+restart the same resolver scan.
+
+Media acquisition now uses a plan-bound private v2 task ledger with atomic
+`PENDING -> URL_RESOLVING -> DOWNLOADING -> VERIFYING -> ACCEPTED` transitions
+and typed rejected/retryable/quarantined outcomes. It preserves accepted v1
+rows without redownload, removes only owned orphan part files, uses fsync plus
+atomic rename, strips image metadata by pixel re-encoding, rejects exact/pHash
+duplicates, and fills failed primaries from same-bucket deterministic reserves.
+Graph auth remains terminal. Rate limits honor bounded `Retry-After`; provider
+outages pause with `retry_not_before`; five consecutive item server failures
+open a five-minute circuit, capped at thirty minutes. Expected pauses return a
+single sanitized JSON status and cannot reach readiness, RunPod key prompting,
+or Pod creation. Reserve exhaustion reports structured
+`MEDIA_SPLIT_MINIMUM_UNAVAILABLE` without changing minima or isolation.
+
+All 225 Phase 3F tests pass, including first/middle/last and interleaved 5xx,
+404/410/429/timeout/transport, signed URL refresh, invalid/truncated media,
+part/checkpoint crashes, reserve replacement/exhaustion, circuit cooldown,
+twenty Resumes, v1 accepted-reserve migration, and the pre-seal RunPod gate.
+The Mapillary connector suite passes 32 tests. Ruff lint and strict mypy over
+259 source files, PowerShell parsing, diff checks, and secret scans pass. No
+live runtime file, metadata row,
+media file, checkpoint, network provider, RunPod/GPU resource, or remote branch
+was changed.
+
 ## Product Phase 3F split readiness recovery
 
 Status: **REPAIRED AND VERIFIED OFFLINE - MEDIA ACQUISITION NOT STARTED**.

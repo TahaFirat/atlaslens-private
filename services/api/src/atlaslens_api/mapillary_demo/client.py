@@ -357,7 +357,17 @@ class MapillaryClient:
                                 if streamed.status_code == 429
                                 else "mapillary_api_server_retry_exhausted"
                             )
-                            raise MapillaryApiError(code)
+                            retry_after = (
+                                _retry_after_seconds(
+                                    streamed.headers.get("Retry-After"), self._now()
+                                )
+                                if streamed.status_code == 429
+                                else None
+                            )
+                            raise MapillaryApiError(
+                                code,
+                                retry_after_seconds=retry_after,
+                            )
                         retry_response = httpx.Response(
                             streamed.status_code,
                             headers=streamed.headers,
@@ -615,7 +625,17 @@ class MapillaryClient:
                                 if response.status_code == 429
                                 else "mapillary_media_server_retry_exhausted"
                             )
-                            raise MapillaryApiError(code)
+                            retry_after = (
+                                _retry_after_seconds(
+                                    response.headers.get("Retry-After"), self._now()
+                                )
+                                if response.status_code == 429
+                                else None
+                            )
+                            raise MapillaryApiError(
+                                code,
+                                retry_after_seconds=retry_after,
+                            )
                         self._delay(response, retry_number)
                         continue
                     if response.is_redirect:

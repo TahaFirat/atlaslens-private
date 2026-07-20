@@ -18,7 +18,7 @@ import warnings
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Literal, cast
 from uuid import uuid4
@@ -36,6 +36,7 @@ from atlaslens_api.mapillary_demo.client import (
 from atlaslens_api.mapillary_demo.errors import (
     MapillaryApiError,
     MapillaryLimitError,
+    MapillarySafetyError,
     MapillaryTokenError,
 )
 from atlaslens_api.mapillary_demo.models import BoundingBox, ClientLimits, ImageMetadata
@@ -44,6 +45,7 @@ from atlaslens_api.phase3f.acquisition import (
     MAX_MEDIA_BYTES,
     MAX_REQUESTS,
     AcquisitionGuard,
+    AcquisitionRefused,
     PrivacyReview,
     ProvenanceSidecar,
 )
@@ -93,9 +95,7 @@ MEGALOC_WINDOWS_SOURCE_SHA256: Final = (
 MEGALOC_WINDOWS_LICENSE_SHA256: Final = (
     "40c6c4894aecc5b676f0fb93697a6c1f82b08df71b25e485b662779b2c899667"
 )
-SOURCE_POLICY_SHA256: Final = (
-    "72d51363f2b63de368d34d4d7bb2fc1145f93dc0469e7026100976732dfde209"
-)
+SOURCE_POLICY_SHA256: Final = "72d51363f2b63de368d34d4d7bb2fc1145f93dc0469e7026100976732dfde209"
 MAX_METADATA_ITEMS_PER_CITY: Final = 600
 MAX_METADATA_ITEMS_TOTAL: Final = 9_600
 MAX_WALL_SECONDS: Final = 5 * 60 * 60 + 45 * 60
@@ -113,6 +113,14 @@ SPLIT_SOLVER_MAX_ORDERINGS: Final = 8
 SUPPLEMENTAL_REQUEST_CAP: Final = 512
 SUPPLEMENTAL_METADATA_CAP: Final = 600
 SUPPLEMENTAL_WALL_SECONDS: Final = 30 * 60
+MEDIA_TASK_LEDGER_SCHEMA: Final = "atlaslens-phase3f-media-task-ledger-v2"
+MEDIA_CIRCUIT_FAILURE_THRESHOLD: Final = 5
+MEDIA_PROVIDER_COOLDOWN_SECONDS: Final = 5 * 60
+MEDIA_PROVIDER_COOLDOWN_MAX_SECONDS: Final = 30 * 60
+MEDIA_RATE_LIMIT_COOLDOWN_SECONDS: Final = 60
+MEDIA_RATE_LIMIT_COOLDOWN_MAX_SECONDS: Final = 15 * 60
+MEDIA_RATE_LIMIT_TASK_ATTEMPT_CAP: Final = 2
+MEDIA_SIGNED_URL_REFRESH_CAP: Final = 1
 
 Role = Literal["reference", "calibration", "sealed_holdout", "ood_holdout"]
 
@@ -175,7 +183,7 @@ def _atomic_private_bytes(path: Path, payload: bytes) -> str:
         not path.is_symlink() and not path.parent.is_symlink(),
         "PRIVATE_CHECKPOINT_PATH_INVALID",
     )
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.partial")
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.part")
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
@@ -437,10 +445,7 @@ def _cell_plan_sha256(areas: Sequence[CityArea]) -> str:
 
 
 def _base_cells_by_city(areas: Sequence[CityArea]) -> dict[str, list[_PlannedCell]]:
-    return {
-        area.city: [_PlannedCell(box, 0) for box in area.boxes]
-        for area in areas
-    }
+    return {area.city: [_PlannedCell(box, 0) for box in area.boxes] for area in areas}
 
 
 def _adaptive_cell_plan_sha256(
@@ -479,10 +484,7 @@ def _adaptive_cell_plan_is_valid(
         if position >= len(leaves):
             return None
         leaf = leaves[position]
-        if (
-            leaf.depth == expected_depth
-            and leaf.bbox.as_query_value() == expected.as_query_value()
-        ):
+        if leaf.depth == expected_depth and leaf.bbox.as_query_value() == expected.as_query_value():
             return position + 1
         if leaf.depth <= expected_depth or expected_depth >= MAX_ADAPTIVE_PARTITION_DEPTH:
             return None
@@ -682,8 +684,7 @@ def _load_metadata_page_checkpoint(
                 city_cells: list[_PlannedCell] = []
                 for raw_cell in cast(list[object], raw_city_cells):
                     _require(
-                        isinstance(raw_cell, dict)
-                        and set(raw_cell) == {"bbox", "depth"},
+                        isinstance(raw_cell, dict) and set(raw_cell) == {"bbox", "depth"},
                         "METADATA_PAGE_CHECKPOINT_INVALID",
                     )
                     typed_raw_cell = cast(dict[str, object], raw_cell)
@@ -717,8 +718,7 @@ def _load_metadata_page_checkpoint(
                     city_cells.append(_PlannedCell(bbox, cast(int, depth)))
                 _require(
                     0 < len(city_cells) <= MAX_ADAPTIVE_CELLS_PER_CITY
-                    and len({cell.bbox.as_query_value() for cell in city_cells})
-                    == len(city_cells),
+                    and len({cell.bbox.as_query_value() for cell in city_cells}) == len(city_cells),
                     "METADATA_PAGE_CHECKPOINT_INVALID",
                 )
                 full_cells = area.boxes
@@ -977,8 +977,7 @@ def audit_metadata(
     records: list[CityCoverageRecord] = []
     assets_by_city: dict[str, tuple[MetadataAsset, ...]] = {}
     _require(
-        sum(len(rows) for rows in checkpoint.rows_by_city.values())
-        <= MAX_METADATA_ITEMS_TOTAL,
+        sum(len(rows) for rows in checkpoint.rows_by_city.values()) <= MAX_METADATA_ITEMS_TOTAL,
         "MAPILLARY_GLOBAL_METADATA_QUOTA_REACHED",
     )
     for area_index, area in enumerate(areas):
@@ -1001,9 +1000,7 @@ def audit_metadata(
                 remaining_global_quota = MAX_METADATA_ITEMS_TOTAL - sum(
                     len(rows) for rows in checkpoint.rows_by_city.values()
                 )
-                admitted = page.images[
-                    : min(remaining_city_quota, remaining_global_quota)
-                ]
+                admitted = page.images[: min(remaining_city_quota, remaining_global_quota)]
                 for row in admitted:
                     identifier = row.metadata.mapillary_image_id
                     _require(identifier not in identifiers, "METADATA_PAGE_DUPLICATE")
@@ -1016,9 +1013,7 @@ def audit_metadata(
                 )
                 checkpoint.city_index = city_position
                 checkpoint.box_index = (
-                    len(checkpoint.cells_by_city[city])
-                    if city_quota_reached
-                    else page.box_index
+                    len(checkpoint.cells_by_city[city]) if city_quota_reached else page.box_index
                 )
                 checkpoint.next_url = None if city_quota_reached else page.next_url
                 checkpoint.visited_page_sha256 = (
@@ -1118,9 +1113,7 @@ def audit_metadata(
         assets = tuple(MetadataAsset(area.city, item) for item in remote)
         assets_by_city[area.city] = assets
         eligible = tuple(
-            item
-            for item in assets
-            if item.creator_id is not None and item.sequence_id is not None
+            item for item in assets if item.creator_id is not None and item.sequence_id is not None
         )
         cells = {
             (
@@ -1216,8 +1209,7 @@ def _split_requirements(audit: MetadataAudit) -> tuple[tuple[str, Role, int], ..
             )
         )
     requirements.extend(
-        (record.city, "ood_holdout", MIN_OOD_PER_CITY)
-        for record in audit.selection.ood
+        (record.city, "ood_holdout", MIN_OOD_PER_CITY) for record in audit.selection.ood
     )
     return tuple(requirements)
 
@@ -1225,9 +1217,7 @@ def _split_requirements(audit: MetadataAudit) -> tuple[tuple[str, Role, int], ..
 def _metadata_isolation_groups(
     audit: MetadataAudit,
 ) -> tuple[tuple[str, tuple[MetadataAsset, ...]], ...]:
-    cities = {
-        record.city for record in (*audit.selection.in_domain, *audit.selection.ood)
-    }
+    cities = {record.city for record in (*audit.selection.in_domain, *audit.selection.ood)}
     assets = tuple(
         asset
         for city in sorted(cities)
@@ -1267,9 +1257,7 @@ def _metadata_isolation_groups(
     result = []
     for values in grouped.values():
         ordered = tuple(sorted(values, key=lambda item: _stable_key(item.image_id)))
-        group_sha256 = _sha256_bytes(
-            _canonical_bytes([item.image_id for item in ordered])
-        )
+        group_sha256 = _sha256_bytes(_canonical_bytes([item.image_id for item in ordered]))
         result.append((group_sha256, ordered))
     return tuple(sorted(result, key=lambda item: item[0]))
 
@@ -1311,9 +1299,7 @@ def _solve_isolation_allocation(
                 role_choices.append(role_index)
         vectors.append(tuple(role_vectors))
         choices.append(tuple(role_choices))
-    states: dict[tuple[int, ...], bytes] = {
-        tuple(0 for _item in requirements): b""
-    }
+    states: dict[tuple[int, ...], bytes] = {tuple(0 for _item in requirements): b""}
     best_state = next(iter(states))
     for group_index, _group in enumerate(ordered):
         next_states: dict[tuple[int, ...], bytes] = {}
@@ -1321,8 +1307,7 @@ def _solve_isolation_allocation(
             for role_index in choices[group_index]:
                 vector = vectors[group_index][role_index]
                 next_state = tuple(
-                    min(target[index], state[index] + vector[index])
-                    for index in range(len(target))
+                    min(target[index], state[index] + vector[index]) for index in range(len(target))
                 )
                 next_states.setdefault(next_state, assignment + bytes((role_index,)))
         if len(next_states) > SPLIT_SOLVER_BEAM_WIDTH:
@@ -1349,9 +1334,7 @@ def _ordered_metadata(assets: Iterable[MetadataAsset]) -> tuple[MetadataAsset, .
     return tuple(
         sorted(
             assets,
-            key=lambda item: _stable_key(
-                item.city, item.sequence_id or "", item.image_id
-            ),
+            key=lambda item: _stable_key(item.city, item.sequence_id or "", item.image_id),
         )
     )
 
@@ -1413,11 +1396,14 @@ def _materialize_metadata_plan(
     groups: Sequence[tuple[str, tuple[MetadataAsset, ...]]],
     assignment: Mapping[str, Role],
     requirements: Sequence[tuple[str, Role, int]],
-) -> tuple[
-    tuple[PlannedAsset, ...],
-    tuple[PlannedAsset, ...],
-    tuple[dict[str, object], ...],
-] | None:
+) -> (
+    tuple[
+        tuple[PlannedAsset, ...],
+        tuple[PlannedAsset, ...],
+        tuple[dict[str, object], ...],
+    ]
+    | None
+):
     pools: dict[tuple[str, Role], list[MetadataAsset]] = defaultdict(list)
     group_counts: Counter[tuple[str, Role]] = Counter()
     for group_sha256, assets in groups:
@@ -1489,9 +1475,7 @@ def _metadata_readiness_document(
     failed_constraints: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     ready = not failed_constraints
-    selected_cities = {
-        record.city for record in (*audit.selection.in_domain, *audit.selection.ood)
-    }
+    selected_cities = {record.city for record in (*audit.selection.in_domain, *audit.selection.ood)}
     total_eligible = sum(len(items) for items in audit.assets_by_city.values())
     selected_eligible = sum(len(audit.assets_by_city[city]) for city in selected_cities)
     plan_sha256 = _planned_acquisition_sha256((*primary, *reserves)) if ready else None
@@ -1596,9 +1580,7 @@ def _structural_metadata_failures(
             )
             continue
         if any(role == "reference" for role, _required in city_requirements):
-            coordinates = [
-                asset.remote.metadata.computed_geometry.coordinates for asset in assets
-            ]
+            coordinates = [asset.remote.metadata.computed_geometry.coordinates for asset in assets]
             longitude_span = max(item[0] for item in coordinates) - min(
                 item[0] for item in coordinates
             )
@@ -1619,9 +1601,7 @@ def _structural_metadata_failures(
                         "available_records": 0,
                         "deficit_records": MIN_REFERENCE_PER_CITY,
                         "required_distance_meters": SPATIAL_EXCLUSION_METERS,
-                        "available_bounding_diagonal_meters": round(
-                            bounding_diagonal_meters, 3
-                        ),
+                        "available_bounding_diagonal_meters": round(bounding_diagonal_meters, 3),
                     }
                 )
     return tuple(failures)
@@ -1672,8 +1652,7 @@ def plan_metadata_split(audit: MetadataAudit) -> MetadataSplitPlan:
         role_count_by_city[city] += 1
     reserve_capacity_possible = all(
         len(audit.assets_by_city[city])
-        >= required_by_city[city]
-        + role_count_by_city[city] * SPLIT_RESERVE_PER_BUCKET
+        >= required_by_city[city] + role_count_by_city[city] * SPLIT_RESERVE_PER_BUCKET
         for city in required_by_city
     )
     reserve_modes = (SPLIT_RESERVE_PER_BUCKET, 0) if reserve_capacity_possible else (0,)
@@ -1689,14 +1668,11 @@ def plan_metadata_split(audit: MetadataAudit) -> MetadataSplitPlan:
                 _allocation_score(best_state, tuple(item[2] for item in requirements))
             ):
                 best_state = tuple(
-                    min(requirements[index][2], value)
-                    for index, value in enumerate(state)
+                    min(requirements[index][2], value) for index, value in enumerate(state)
                 )
             if assignment is None:
                 continue
-            materialized = _materialize_metadata_plan(
-                audit, groups, assignment, requirements
-            )
+            materialized = _materialize_metadata_plan(audit, groups, assignment, requirements)
             if materialized is None:
                 continue
             primary, reserves, buckets = materialized
@@ -1776,9 +1752,7 @@ def _verify_canonical_vendor_text(
     max_bytes: int,
 ) -> None:
     _require(
-        path.is_file()
-        and not path.is_symlink()
-        and 0 < path.stat().st_size <= max_bytes,
+        path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= max_bytes,
         "MEGALOC_VENDOR_FILE_INVALID",
     )
     payload = path.read_bytes()
@@ -1829,8 +1803,7 @@ def _normalize_image(payload: bytes) -> tuple[bytes, int, int, str]:
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(payload)) as image:
                 _require(
-                    max(image.size) <= 1024
-                    and image.width * image.height <= 1024 * 1024,
+                    max(image.size) <= 1024 and image.width * image.height <= 1024 * 1024,
                     "RENDITION_EDGE_EXCEEDED",
                 )
                 image.load()
@@ -1846,9 +1819,7 @@ def _normalize_image(payload: bytes) -> tuple[bytes, int, int, str]:
                 perceptual = normalized.resize((9, 8)).convert("L")
                 pixels = np.asarray(perceptual, dtype=np.uint8)
                 bits = pixels[:, 1:] > pixels[:, :-1]
-                phash = (
-                    f"{int(''.join('1' if bit else '0' for bit in bits.flat), 2):016x}"
-                )
+                phash = f"{int(''.join('1' if bit else '0' for bit in bits.flat), 2):016x}"
                 return output.getvalue(), normalized.width, normalized.height, phash
     except (Image.DecompressionBombWarning, Image.DecompressionBombError, OSError) as exc:
         raise Phase3FCloudJobError("RENDITION_DECODE_REFUSED") from exc
@@ -1882,19 +1853,320 @@ class _CheckpointAsset:
     admitted_media_bytes: int
 
 
+_MEDIA_TASK_STATES: Final = frozenset(
+    {
+        "PENDING",
+        "URL_RESOLVING",
+        "DOWNLOADING",
+        "VERIFYING",
+        "ACCEPTED",
+        "REJECTED",
+        "RETRYABLE",
+        "QUARANTINED",
+    }
+)
+_MEDIA_TRANSIENT_STATES: Final = frozenset({"URL_RESOLVING", "DOWNLOADING", "VERIFYING"})
+
+
+@dataclass(slots=True)
+class _MediaTask:
+    image_id: str
+    ordinal: int
+    city: str
+    role: Role
+    priority: Literal["PRIMARY", "RESERVE"]
+    state: str = "PENDING"
+    attempt_count: int = 0
+    url_refresh_count: int = 0
+    reason_code: str | None = None
+
+
+@dataclass(slots=True)
+class _MediaTaskLedger:
+    run_id: str
+    planned_sha256: str
+    primary_count: int
+    tasks: dict[str, _MediaTask]
+    consecutive_provider_failures: int = 0
+    circuit_open_count: int = 0
+    pause_state: str | None = None
+    retry_not_before: str | None = None
+
+
+def _media_task_document(ledger: _MediaTaskLedger) -> dict[str, object]:
+    return {
+        "schema": MEDIA_TASK_LEDGER_SCHEMA,
+        "run_id": ledger.run_id,
+        "planned_sha256": ledger.planned_sha256,
+        "primary_count": ledger.primary_count,
+        "tasks": [
+            {
+                "image_id": task.image_id,
+                "ordinal": task.ordinal,
+                "city": task.city,
+                "role": task.role,
+                "priority": task.priority,
+                "state": task.state,
+                "attempt_count": task.attempt_count,
+                "url_refresh_count": task.url_refresh_count,
+                "reason_code": task.reason_code,
+            }
+            for task in sorted(ledger.tasks.values(), key=lambda item: item.ordinal)
+        ],
+        "provider_circuit": {
+            "failure_threshold": MEDIA_CIRCUIT_FAILURE_THRESHOLD,
+            "consecutive_failures": ledger.consecutive_provider_failures,
+            "open_count": ledger.circuit_open_count,
+            "cooldown_seconds": MEDIA_PROVIDER_COOLDOWN_SECONDS,
+            "cooldown_cap_seconds": MEDIA_PROVIDER_COOLDOWN_MAX_SECONDS,
+        },
+        "pause_state": ledger.pause_state,
+        "retry_not_before": ledger.retry_not_before,
+        "signed_urls_included": False,
+        "response_bodies_included": False,
+        "secrets_included": False,
+    }
+
+
+def _write_media_task_ledger(path: Path, ledger: _MediaTaskLedger) -> None:
+    _atomic_private_json(path, _media_task_document(ledger))
+
+
+def _new_media_task_ledger(
+    *,
+    run_id: str,
+    planned: Sequence[PlannedAsset],
+    primary_count: int,
+) -> _MediaTaskLedger:
+    _require(0 <= primary_count <= len(planned), "MEDIA_PRIMARY_COUNT_INVALID")
+    return _MediaTaskLedger(
+        run_id=run_id,
+        planned_sha256=_planned_acquisition_sha256(planned),
+        primary_count=primary_count,
+        tasks={
+            item.metadata.image_id: _MediaTask(
+                image_id=item.metadata.image_id,
+                ordinal=ordinal,
+                city=item.metadata.city,
+                role=item.role,
+                priority="PRIMARY" if ordinal < primary_count else "RESERVE",
+            )
+            for ordinal, item in enumerate(planned)
+        },
+    )
+
+
+def _load_media_task_ledger(
+    path: Path,
+    *,
+    run_id: str,
+    planned: Sequence[PlannedAsset],
+    primary_count: int,
+    completed: Mapping[str, _CheckpointAsset],
+) -> _MediaTaskLedger:
+    if not path.exists():
+        ledger = _new_media_task_ledger(
+            run_id=run_id,
+            planned=planned,
+            primary_count=primary_count,
+        )
+    else:
+        _require(
+            path.is_file() and not path.is_symlink() and path.stat().st_size <= 16 * 1024 * 1024,
+            "MEDIA_TASK_LEDGER_INVALID",
+        )
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise Phase3FCloudJobError("MEDIA_TASK_LEDGER_INVALID") from exc
+        _require(isinstance(value, dict), "MEDIA_TASK_LEDGER_INVALID")
+        document = cast(dict[str, object], value)
+        _require(
+            document.get("schema") == MEDIA_TASK_LEDGER_SCHEMA
+            and document.get("run_id") == run_id
+            and document.get("planned_sha256") == _planned_acquisition_sha256(planned)
+            and document.get("primary_count") == primary_count,
+            "MEDIA_TASK_LEDGER_INCOMPATIBLE",
+        )
+        raw_tasks = document.get("tasks")
+        _require(isinstance(raw_tasks, list), "MEDIA_TASK_LEDGER_INVALID")
+        expected = _new_media_task_ledger(
+            run_id=run_id,
+            planned=planned,
+            primary_count=primary_count,
+        )
+        tasks: dict[str, _MediaTask] = {}
+        for raw in cast(list[object], raw_tasks):
+            _require(isinstance(raw, dict), "MEDIA_TASK_LEDGER_INVALID")
+            row = cast(dict[str, object], raw)
+            image_id = row.get("image_id")
+            _require(
+                isinstance(image_id, str) and image_id in expected.tasks and image_id not in tasks,
+                "MEDIA_TASK_LEDGER_INVALID",
+            )
+            expected_task = expected.tasks[cast(str, image_id)]
+            state = row.get("state")
+            attempt_count = row.get("attempt_count")
+            refresh_count = row.get("url_refresh_count")
+            reason_code = row.get("reason_code")
+            _require(
+                row.get("ordinal") == expected_task.ordinal
+                and row.get("city") == expected_task.city
+                and row.get("role") == expected_task.role
+                and row.get("priority") == expected_task.priority
+                and isinstance(state, str)
+                and state in _MEDIA_TASK_STATES
+                and isinstance(attempt_count, int)
+                and not isinstance(attempt_count, bool)
+                and attempt_count >= 0
+                and isinstance(refresh_count, int)
+                and not isinstance(refresh_count, bool)
+                and 0 <= refresh_count <= MEDIA_SIGNED_URL_REFRESH_CAP
+                and (
+                    reason_code is None
+                    or isinstance(reason_code, str)
+                    and bool(re.fullmatch(r"[a-z0-9_]+", reason_code))
+                ),
+                "MEDIA_TASK_LEDGER_INVALID",
+            )
+            tasks[cast(str, image_id)] = _MediaTask(
+                image_id=cast(str, image_id),
+                ordinal=expected_task.ordinal,
+                city=expected_task.city,
+                role=expected_task.role,
+                priority=expected_task.priority,
+                state=cast(str, state),
+                attempt_count=cast(int, attempt_count),
+                url_refresh_count=cast(int, refresh_count),
+                reason_code=cast(str | None, reason_code),
+            )
+        _require(set(tasks) == set(expected.tasks), "MEDIA_TASK_LEDGER_INVALID")
+        circuit = document.get("provider_circuit")
+        _require(isinstance(circuit, dict), "MEDIA_TASK_LEDGER_INVALID")
+        circuit_row = cast(dict[str, object], circuit)
+        consecutive = circuit_row.get("consecutive_failures")
+        open_count = circuit_row.get("open_count")
+        pause_state = document.get("pause_state")
+        retry_not_before = document.get("retry_not_before")
+        _require(
+            circuit_row.get("failure_threshold") == MEDIA_CIRCUIT_FAILURE_THRESHOLD
+            and isinstance(consecutive, int)
+            and not isinstance(consecutive, bool)
+            and consecutive >= 0
+            and isinstance(open_count, int)
+            and not isinstance(open_count, bool)
+            and open_count >= 0
+            and (
+                pause_state is None
+                or pause_state in {"PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_RATE_LIMIT"}
+            )
+            and (retry_not_before is None or isinstance(retry_not_before, str)),
+            "MEDIA_TASK_LEDGER_INVALID",
+        )
+        if isinstance(retry_not_before, str):
+            try:
+                parsed_retry = datetime.fromisoformat(retry_not_before)
+            except ValueError as exc:
+                raise Phase3FCloudJobError("MEDIA_TASK_LEDGER_INVALID") from exc
+            _require(
+                parsed_retry.tzinfo is not None and parsed_retry.utcoffset() is not None,
+                "MEDIA_TASK_LEDGER_INVALID",
+            )
+        ledger = _MediaTaskLedger(
+            run_id=run_id,
+            planned_sha256=expected.planned_sha256,
+            primary_count=primary_count,
+            tasks=tasks,
+            consecutive_provider_failures=cast(int, consecutive),
+            circuit_open_count=cast(int, open_count),
+            pause_state=cast(str | None, pause_state),
+            retry_not_before=cast(str | None, retry_not_before),
+        )
+    for image_id, task in ledger.tasks.items():
+        if image_id in completed:
+            task.state = "ACCEPTED"
+            task.reason_code = None
+        elif task.state == "ACCEPTED" or task.state in _MEDIA_TRANSIENT_STATES:
+            task.state = "RETRYABLE"
+            task.reason_code = "crash_recovery"
+    return ledger
+
+
+def _recover_media_partials(media_root: Path) -> int:
+    if not media_root.exists():
+        return 0
+    _require(
+        media_root.is_dir() and not media_root.is_symlink(),
+        "PRIVATE_MEDIA_ROOT_INVALID",
+    )
+    removed = 0
+    for path in media_root.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        if path.name.startswith(".") and path.suffix in {".part", ".partial"}:
+            path.unlink()
+            removed += 1
+    return removed
+
+
+def _checkpoint_split_asset(
+    plan: PlannedAsset,
+    checkpoint: _CheckpointAsset,
+) -> SplitAsset:
+    metadata = plan.metadata.remote.metadata
+    longitude, latitude = metadata.computed_geometry.coordinates
+    return SplitAsset(
+        opaque_id=checkpoint.opaque_id,
+        city=plan.metadata.city,
+        role=plan.role,
+        relative_path=(
+            Path("assets") / checkpoint.opaque_id[:2] / f"{checkpoint.opaque_id}.jpg"
+        ).as_posix(),
+        contributor_id=metadata.creator_id or "missing",
+        sequence_id=metadata.sequence_id or "missing",
+        capture_run_id=metadata.sequence_id or "missing",
+        content_sha256=checkpoint.content_sha256,
+        perceptual_hash=checkpoint.perceptual_hash,
+        parent_or_tile_id=plan.metadata.image_id,
+        longitude=longitude,
+        latitude=latitude,
+    )
+
+
+def _media_task_counts(
+    ledger: _MediaTaskLedger,
+    checkpoint_assets: Mapping[str, _CheckpointAsset],
+) -> dict[str, object]:
+    counts = Counter(task.state for task in ledger.tasks.values())
+    return {
+        "accepted": counts["ACCEPTED"],
+        "rejected": counts["REJECTED"],
+        "quarantined": counts["QUARANTINED"],
+        "pending": sum(
+            count
+            for state, count in counts.items()
+            if state not in {"ACCEPTED", "REJECTED", "QUARANTINED"}
+        ),
+        "reserve": sum(
+            task.priority == "RESERVE" and task.state not in {"ACCEPTED", "REJECTED", "QUARANTINED"}
+            for task in ledger.tasks.values()
+        ),
+        "media_bytes": sum(item.admitted_media_bytes for item in checkpoint_assets.values()),
+        "retry_not_before": ledger.retry_not_before,
+    }
+
+
 def _load_acquisition_checkpoint(
     path: Path,
     *,
     planned: Sequence[PlannedAsset],
     media_root: Path,
     run_id: str,
-) -> tuple[
-    dict[str, _CheckpointAsset], AcquisitionGuard, tuple[int, int, int]
-]:
+) -> tuple[dict[str, _CheckpointAsset], AcquisitionGuard, tuple[int, int, int]]:
     if not path.exists():
         _require(
             not media_root.exists()
-            or not any(media_root.rglob("*")),
+            or not any(item.is_file() or item.is_symlink() for item in media_root.rglob("*")),
             "ACQUISITION_CHECKPOINT_MISSING",
         )
         return {}, AcquisitionGuard(), (0, 0, 0)
@@ -1926,16 +2198,13 @@ def _load_acquisition_checkpoint(
     )
     _require(
         all(
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and value >= 0
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
             for value in counters
         ),
         "ACQUISITION_CHECKPOINT_INVALID",
     )
     wanted_by_opaque = {
-        _stable_key(run_id, item.metadata.image_id)[:32]: item.metadata.image_id
-        for item in planned
+        _stable_key(run_id, item.metadata.image_id)[:32]: item.metadata.image_id for item in planned
     }
     completed: dict[str, _CheckpointAsset] = {}
     request_count = 0
@@ -2041,10 +2310,7 @@ def _acquisition_checkpoint_counters(path: Path, run_id: str) -> tuple[int, int,
         )
     )
     _require(
-        all(
-            isinstance(item, int) and not isinstance(item, bool) and item >= 0
-            for item in counters
-        )
+        all(isinstance(item, int) and not isinstance(item, bool) and item >= 0 for item in counters)
         and cast(int, counters[1]) <= cast(int, counters[0]),
         "ACQUISITION_CHECKPOINT_INVALID",
     )
@@ -2089,10 +2355,7 @@ def _read_client_counters(path: Path, run_id: str) -> tuple[int, int, int]:
         value.get(key) for key in ("request_count", "page_count", "rejected_item_count")
     )
     _require(
-        all(
-            isinstance(item, int) and not isinstance(item, bool) and item >= 0
-            for item in counters
-        )
+        all(isinstance(item, int) and not isinstance(item, bool) and item >= 0 for item in counters)
         and cast(int, counters[1]) <= cast(int, counters[0]),
         "CLIENT_COUNTER_CHECKPOINT_INVALID",
     )
@@ -2162,8 +2425,7 @@ def _load_media_failures(
     result: dict[str, str] = {}
     for raw in cast(list[object], rows):
         _require(
-            isinstance(raw, dict)
-            and set(raw) == {"image_id", "reason_code"},
+            isinstance(raw, dict) and set(raw) == {"image_id", "reason_code"},
             "MEDIA_FAILURE_CHECKPOINT_INVALID",
         )
         row = cast(dict[str, object], raw)
@@ -2205,6 +2467,104 @@ def _write_media_failures(
     )
 
 
+def _media_pause(
+    ledger: _MediaTaskLedger,
+    *,
+    state: Literal["PAUSED_PROVIDER_UNAVAILABLE", "PAUSED_RATE_LIMIT"],
+    now: datetime,
+    cooldown_seconds: int,
+) -> None:
+    _require(
+        now.tzinfo is not None and now.utcoffset() is not None,
+        "MEDIA_CLOCK_INVALID",
+    )
+    ledger.pause_state = state
+    ledger.retry_not_before = (
+        now.astimezone(UTC) + timedelta(seconds=cooldown_seconds)
+    ).isoformat()
+
+
+def _media_rate_limit_cooldown(
+    exc: MapillaryApiError | MapillaryLimitError | MapillarySafetyError,
+) -> int:
+    retry_after = exc.retry_after_seconds
+    if retry_after is None:
+        return MEDIA_RATE_LIMIT_COOLDOWN_SECONDS
+    return max(1, min(MEDIA_RATE_LIMIT_COOLDOWN_MAX_SECONDS, math.ceil(retry_after)))
+
+
+def _media_retry_is_blocked(ledger: _MediaTaskLedger, now: datetime) -> bool:
+    if ledger.pause_state is None or ledger.retry_not_before is None:
+        return False
+    try:
+        retry_at = datetime.fromisoformat(ledger.retry_not_before)
+    except ValueError as exc:  # pragma: no cover - validated while loading
+        raise Phase3FCloudJobError("MEDIA_TASK_LEDGER_INVALID") from exc
+    return now.astimezone(UTC) < retry_at.astimezone(UTC)
+
+
+def _media_target_counts(
+    planned: Sequence[PlannedAsset], primary_count: int
+) -> Counter[tuple[str, Role]]:
+    return Counter((item.metadata.city, item.role) for item in planned[:primary_count])
+
+
+def _media_actionable_tasks(
+    ledger: _MediaTaskLedger,
+    targets: Mapping[tuple[str, Role], int],
+) -> list[_MediaTask]:
+    accepted = Counter(
+        (task.city, task.role) for task in ledger.tasks.values() if task.state == "ACCEPTED"
+    )
+    result: list[_MediaTask] = []
+    for bucket, required in targets.items():
+        deficit = required - accepted[bucket]
+        if deficit <= 0:
+            continue
+        primary = [
+            task
+            for task in ledger.tasks.values()
+            if (task.city, task.role) == bucket
+            and task.priority == "PRIMARY"
+            and task.state in {"PENDING", "RETRYABLE"}
+        ]
+        if primary:
+            result.extend(
+                sorted(primary, key=lambda task: (task.attempt_count, task.ordinal))[
+                    :deficit
+                ]
+            )
+            continue
+        reserves = sorted(
+            (
+                task
+                for task in ledger.tasks.values()
+                if (task.city, task.role) == bucket
+                and task.priority == "RESERVE"
+                and task.state in {"PENDING", "RETRYABLE"}
+            ),
+            key=lambda task: (task.attempt_count, task.ordinal),
+        )
+        result.extend(reserves[:deficit])
+    return sorted(result, key=lambda task: (task.attempt_count, task.ordinal))
+
+
+def _media_status(
+    ledger: _MediaTaskLedger,
+    targets: Mapping[tuple[str, Role], int],
+) -> str:
+    if ledger.pause_state is not None:
+        return ledger.pause_state
+    accepted = Counter(
+        (task.city, task.role) for task in ledger.tasks.values() if task.state == "ACCEPTED"
+    )
+    if all(accepted[bucket] >= required for bucket, required in targets.items()):
+        return "MEDIA_READY"
+    if _media_actionable_tasks(ledger, targets):
+        return "MEDIA_IN_PROGRESS"
+    return "MEDIA_SPLIT_MINIMUM_UNAVAILABLE"
+
+
 def acquire_planned_assets(
     client: MapillaryClient,
     areas: Sequence[CityArea],
@@ -2217,27 +2577,34 @@ def acquire_planned_assets(
     max_media_bytes: int = MAX_MEDIA_BYTES,
     checkpoint_observer: Callable[[], None] | None = None,
     allow_item_failures: bool = False,
+    primary_count: int | None = None,
+    now_utc: Callable[[], datetime] | None = None,
 ) -> tuple[tuple[SplitAsset, ...], dict[str, object]]:
     _require(0 < max_media_bytes <= MAX_MEDIA_BYTES, "MEDIA_CAP_INVALID")
+    selected_primary_count = len(planned) if primary_count is None else primary_count
+    _require(
+        0 <= selected_primary_count <= len(planned),
+        "MEDIA_PRIMARY_COUNT_INVALID",
+    )
+    clock = now_utc or (lambda: datetime.now(UTC))
+    now = clock()
+    _require(
+        now.tzinfo is not None and now.utcoffset() is not None,
+        "MEDIA_CLOCK_INVALID",
+    )
     wanted = {item.metadata.image_id: item for item in planned}
     _require(len(wanted) == len(planned), "PLANNED_IMAGE_DUPLICATE")
     completed: dict[str, SplitAsset] = {}
     provenance_hashes: list[str] = []
     checkpoint_assets: dict[str, _CheckpointAsset] = {}
     media_failure_path = (
-        checkpoint_path.with_name("media-failures.json")
-        if checkpoint_path is not None
-        else None
+        checkpoint_path.with_name("media-failures.json") if checkpoint_path is not None else None
     )
-    media_failures = (
-        _load_media_failures(
-            media_failure_path,
-            run_id=run_id,
-            planned=planned,
-        )
-        if media_failure_path is not None
-        else {}
+    media_failures = {}
+    media_task_path = (
+        checkpoint_path.with_name("media-task-ledger.json") if checkpoint_path is not None else None
     )
+    recovered_partial_count = _recover_media_partials(media_root)
     if checkpoint_path is not None:
         checkpoint_assets, restored_guard, historical_counts = _load_acquisition_checkpoint(
             checkpoint_path, planned=planned, media_root=media_root, run_id=run_id
@@ -2248,69 +2615,229 @@ def acquire_planned_assets(
                 page_count=historical_counts[1],
                 rejected_item_count=historical_counts[2],
             )
-        provenance_hashes.extend(
-            item.provenance_sha256 for item in checkpoint_assets.values()
-        )
+        provenance_hashes.extend(item.provenance_sha256 for item in checkpoint_assets.values())
         guard.request_count = restored_guard.request_count
         guard.image_count = restored_guard.image_count
         guard.media_bytes = restored_guard.media_bytes
-    for area in areas:
-        city_wanted = {
-            image_id for image_id, item in wanted.items() if item.metadata.city == area.city
-        }
-        if not city_wanted:
-            continue
-        for remote in client.iter_images(
-            area.boxes,
-            include_thumbnail=True,
-            item_cap=MAX_METADATA_ITEMS_PER_CITY,
-        ):
-            image_id = remote.metadata.mapillary_image_id
-            if image_id not in city_wanted or image_id in completed:
-                continue
-            if image_id in media_failures:
-                continue
-            plan = wanted[image_id]
-            prior = checkpoint_assets.get(image_id)
-            if prior is not None:
-                lon, lat = remote.metadata.computed_geometry.coordinates
-                completed[image_id] = SplitAsset(
-                    opaque_id=prior.opaque_id,
-                    city=plan.metadata.city,
-                    role=plan.role,
-                    relative_path=(
-                        Path("assets")
-                        / prior.opaque_id[:2]
-                        / f"{prior.opaque_id}.jpg"
-                    ).as_posix(),
-                    contributor_id=remote.metadata.creator_id or "missing",
-                    sequence_id=remote.metadata.sequence_id or "missing",
-                    capture_run_id=remote.metadata.sequence_id or "missing",
-                    content_sha256=prior.content_sha256,
-                    perceptual_hash=prior.perceptual_hash,
-                    parent_or_tile_id=image_id,
-                    longitude=lon,
-                    latitude=lat,
+    for image_id, checkpoint in checkpoint_assets.items():
+        completed[image_id] = _checkpoint_split_asset(wanted[image_id], checkpoint)
+    ledger = _load_media_task_ledger(
+        media_task_path or media_root / "media-task-ledger.json",
+        run_id=run_id,
+        planned=planned,
+        primary_count=selected_primary_count,
+        completed=checkpoint_assets,
+    )
+    if media_failure_path is not None and media_failure_path.exists():
+        media_failures = _load_media_failures(
+            media_failure_path,
+            run_id=run_id,
+            planned=planned,
+        )
+        for image_id, reason in media_failures.items():
+            task = ledger.tasks[image_id]
+            if task.state not in {"ACCEPTED", "REJECTED", "QUARANTINED"}:
+                task.state = (
+                    "QUARANTINED"
+                    if any(value in reason for value in ("server", "timeout", "transport"))
+                    else "REJECTED"
                 )
-                if len(completed) == len(planned):
-                    break
+                task.reason_code = reason
+    ledger_path = media_task_path or media_root / "media-task-ledger.json"
+
+    def persist_ledger() -> None:
+        _write_media_task_ledger(ledger_path, ledger)
+        if checkpoint_observer is not None:
+            checkpoint_observer()
+
+    persist_ledger()
+    targets = _media_target_counts(planned, selected_primary_count)
+    if _media_retry_is_blocked(ledger, now):
+        status = cast(str, ledger.pause_state)
+    else:
+        ledger.pause_state = None
+        ledger.retry_not_before = None
+        persist_ledger()
+        status = "MEDIA_IN_PROGRESS"
+
+    while status == "MEDIA_IN_PROGRESS":
+        tasks = _media_actionable_tasks(ledger, targets)
+        if not tasks:
+            status = _media_status(ledger, targets)
+            break
+        task_ids = {task.image_id for task in tasks}
+        target_cities = {task.city for task in tasks}
+        for task in tasks:
+            task.state = "URL_RESOLVING"
+            task.reason_code = None
+        persist_ledger()
+        remotes: dict[str, RemoteImage] = {}
+        try:
+            for area in areas:
+                if area.city not in target_cities:
+                    continue
+                for remote in client.iter_images(
+                    area.boxes,
+                    include_thumbnail=True,
+                    item_cap=MAX_METADATA_ITEMS_PER_CITY,
+                ):
+                    image_id = remote.metadata.mapillary_image_id
+                    if image_id in task_ids:
+                        remotes[image_id] = remote
+        except MapillaryTokenError:
+            raise
+        except MapillaryApiError as exc:
+            for task in tasks:
+                task.state = "RETRYABLE"
+                task.reason_code = exc.code
+            ledger.consecutive_provider_failures += 1
+            if exc.code in {
+                "mapillary_api_rate_limit_retry_exhausted",
+            }:
+                _media_pause(
+                    ledger,
+                    state="PAUSED_RATE_LIMIT",
+                    now=clock(),
+                    cooldown_seconds=_media_rate_limit_cooldown(exc),
+                )
+            elif exc.code in {
+                "mapillary_api_server_retry_exhausted",
+                "mapillary_api_timeout",
+                "mapillary_api_transport_retry_exhausted",
+                "mapillary_api_transport_failed",
+            }:
+                if ledger.consecutive_provider_failures >= MEDIA_CIRCUIT_FAILURE_THRESHOLD:
+                    ledger.circuit_open_count += 1
+                cooldown = min(
+                    MEDIA_PROVIDER_COOLDOWN_MAX_SECONDS,
+                    MEDIA_PROVIDER_COOLDOWN_SECONDS * max(1, ledger.circuit_open_count),
+                )
+                _media_pause(
+                    ledger,
+                    state="PAUSED_PROVIDER_UNAVAILABLE",
+                    now=clock(),
+                    cooldown_seconds=cooldown,
+                )
+            else:
+                raise
+            persist_ledger()
+            status = cast(str, ledger.pause_state)
+            break
+        except (MapillaryLimitError, MapillarySafetyError):
+            for task in tasks:
+                task.state = "RETRYABLE"
+                task.reason_code = "url_resolution_failed"
+            persist_ledger()
+            raise
+        ledger.consecutive_provider_failures = 0
+        ledger.pause_state = None
+        ledger.retry_not_before = None
+        persist_ledger()
+
+        pause_after_task = False
+        for task in tasks:
+            selected_remote = remotes.get(task.image_id)
+            if selected_remote is None or selected_remote.thumbnail_url is None:
+                task.state = "REJECTED"
+                task.reason_code = "media_unavailable"
+                persist_ledger()
                 continue
-            _require(remote.thumbnail_url is not None, "THUMBNAIL_URL_MISSING")
-            thumbnail_url = remote.thumbnail_url
-            if thumbnail_url is None:  # pragma: no cover - narrowed above
-                raise Phase3FCloudJobError("THUMBNAIL_URL_MISSING")
+            task.state = "DOWNLOADING"
+            task.attempt_count += 1
+            persist_ledger()
             guard.begin_request()
             try:
                 payload, _mime = client.download_thumbnail(
-                    thumbnail_url.get_secret_value(),
+                    selected_remote.thumbnail_url.get_secret_value(),
                     max_bytes=16 * 1024 * 1024,
                 )
+            except MapillaryTokenError:
+                guard.finish_request(status_code=500, media_bytes=0, admitted_image=False)
+                if task.url_refresh_count < MEDIA_SIGNED_URL_REFRESH_CAP:
+                    task.url_refresh_count += 1
+                    task.state = "RETRYABLE"
+                    task.reason_code = "signed_url_refresh_required"
+                else:
+                    task.state = "REJECTED"
+                    task.reason_code = "signed_url_expired"
+                persist_ledger()
+                continue
+            except (MapillaryApiError, MapillaryLimitError, MapillarySafetyError) as exc:
+                guard.finish_request(status_code=500, media_bytes=0, admitted_image=False)
+                if not allow_item_failures:
+                    raise
+                code = exc.code
+                if code == "mapillary_media_rate_limit_retry_exhausted":
+                    task.state = (
+                        "QUARANTINED"
+                        if task.attempt_count >= MEDIA_RATE_LIMIT_TASK_ATTEMPT_CAP
+                        else "RETRYABLE"
+                    )
+                    task.reason_code = code
+                    _media_pause(
+                        ledger,
+                        state="PAUSED_RATE_LIMIT",
+                        now=clock(),
+                        cooldown_seconds=_media_rate_limit_cooldown(exc),
+                    )
+                    persist_ledger()
+                    status = "PAUSED_RATE_LIMIT"
+                    pause_after_task = True
+                    break
+                if code in {
+                    "mapillary_request_cap_reached",
+                    "mapillary_operation_cancelled",
+                }:
+                    task.state = "RETRYABLE"
+                    task.reason_code = code
+                    persist_ledger()
+                    raise
+                if code in {
+                    "mapillary_media_server_retry_exhausted",
+                    "mapillary_media_timeout",
+                    "mapillary_media_transport_retry_exhausted",
+                    "mapillary_media_transport_failed",
+                }:
+                    task.state = "QUARANTINED"
+                    task.reason_code = code
+                    ledger.consecutive_provider_failures += 1
+                    if ledger.consecutive_provider_failures >= MEDIA_CIRCUIT_FAILURE_THRESHOLD:
+                        ledger.circuit_open_count += 1
+                        _media_pause(
+                            ledger,
+                            state="PAUSED_PROVIDER_UNAVAILABLE",
+                            now=clock(),
+                            cooldown_seconds=min(
+                                MEDIA_PROVIDER_COOLDOWN_MAX_SECONDS,
+                                MEDIA_PROVIDER_COOLDOWN_SECONDS * ledger.circuit_open_count,
+                            ),
+                        )
+                        status = "PAUSED_PROVIDER_UNAVAILABLE"
+                        pause_after_task = True
+                else:
+                    task.state = "REJECTED"
+                    task.reason_code = code
+                persist_ledger()
+                if pause_after_task:
+                    break
+                continue
+            task.state = "VERIFYING"
+            persist_ledger()
+            try:
                 _require(
                     guard.media_bytes + len(payload) <= max_media_bytes,
                     "MEDIA_CAP_EXCEEDED",
                 )
                 normalized, _width, _height, phash = _normalize_image(payload)
-                source_page = f"https://www.mapillary.com/app/?pKey={image_id}"
+                content_sha = _sha256_bytes(normalized)
+                duplicate = any(
+                    asset.content_sha256 == content_sha
+                    or (int(asset.perceptual_hash, 16) ^ int(phash, 16)).bit_count()
+                    <= NEAR_DUPLICATE_HAMMING
+                    for asset in completed.values()
+                )
+                _require(not duplicate, "MEDIA_DUPLICATE_REJECTED")
+                source_page = f"https://www.mapillary.com/app/?pKey={task.image_id}"
                 receipt_sha = _sha256_bytes(
                     _canonical_bytes(
                         {
@@ -2321,48 +2848,30 @@ def acquire_planned_assets(
                     )
                 )
                 sidecar = ProvenanceSidecar(
-                    mapillary_image_id=image_id,
+                    mapillary_image_id=task.image_id,
                     source_page=source_page,
                     contributor_attribution=(
-                        remote.metadata.creator_id or "Mapillary contributor"
+                        selected_remote.metadata.creator_id or "Mapillary contributor"
                     ),
-                    capture_date=remote.metadata.captured_at,
+                    capture_date=selected_remote.metadata.captured_at,
                     source_policy_receipt_sha256=receipt_sha,
                     revoked=False,
                 )
                 sidecar.validate()
-                privacy_review = PrivacyReview(
-                    passed=True,
-                    face_reidentification_performed=False,
-                    plate_reidentification_performed=False,
-                    raw_ocr_generated=False,
-                )
+                privacy_review = PrivacyReview(passed=True)
                 privacy_review.validate()
-            except MapillaryTokenError:
+            except (Phase3FCloudJobError, AcquisitionRefused) as exc:
                 guard.finish_request(status_code=500, media_bytes=0, admitted_image=False)
-                raise
-            except (MapillaryApiError, MapillaryLimitError, Phase3FCloudJobError) as exc:
-                guard.finish_request(status_code=500, media_bytes=0, admitted_image=False)
-                code = exc.code
-                if code in {
-                    "mapillary_media_rate_limit_retry_exhausted",
-                    "mapillary_request_cap_reached",
-                    "mapillary_operation_cancelled",
-                    "MEDIA_CAP_EXCEEDED",
-                }:
+                if not allow_item_failures or getattr(exc, "code", "") == "MEDIA_CAP_EXCEEDED":
+                    task.state = "RETRYABLE"
+                    task.reason_code = str(
+                        getattr(exc, "code", "media_verification_failed")
+                    ).lower()
+                    persist_ledger()
                     raise
-                if not allow_item_failures:
-                    raise
-                media_failures[image_id] = code.lower()
-                if media_failure_path is not None:
-                    _write_media_failures(
-                        media_failure_path,
-                        run_id=run_id,
-                        planned=planned,
-                        failures=media_failures,
-                    )
-                    if checkpoint_observer is not None:
-                        checkpoint_observer()
+                task.state = "REJECTED"
+                task.reason_code = str(getattr(exc, "code", "media_verification_failed")).lower()
+                persist_ledger()
                 continue
             guard.finish_request(
                 status_code=200,
@@ -2371,10 +2880,10 @@ def acquire_planned_assets(
                 provenance=sidecar,
                 privacy_review=privacy_review,
             )
-            opaque_id = _stable_key(run_id, image_id)[:32]
+            ledger.consecutive_provider_failures = 0
+            opaque_id = _stable_key(run_id, task.image_id)[:32]
             relative = Path("assets") / opaque_id[:2] / f"{opaque_id}.jpg"
-            destination = media_root / relative
-            _atomic_private_bytes(destination, normalized)
+            _atomic_private_bytes(media_root / relative, normalized)
             sidecar_document = {
                 **asdict(sidecar),
                 "capture_date": sidecar.capture_date.astimezone(UTC).isoformat(),
@@ -2385,27 +2894,15 @@ def acquire_planned_assets(
             )
             provenance_sha = _sha256_bytes(_canonical_bytes(sidecar_document))
             provenance_hashes.append(provenance_sha)
-            lon, lat = remote.metadata.computed_geometry.coordinates
-            completed[image_id] = SplitAsset(
+            checkpoint_assets[task.image_id] = _CheckpointAsset(
                 opaque_id=opaque_id,
-                city=plan.metadata.city,
-                role=plan.role,
-                relative_path=relative.as_posix(),
-                contributor_id=remote.metadata.creator_id or "missing",
-                sequence_id=remote.metadata.sequence_id or "missing",
-                capture_run_id=remote.metadata.sequence_id or "missing",
-                content_sha256=_sha256_bytes(normalized),
-                perceptual_hash=phash,
-                parent_or_tile_id=image_id,
-                longitude=lon,
-                latitude=lat,
-            )
-            checkpoint_assets[image_id] = _CheckpointAsset(
-                opaque_id=opaque_id,
-                content_sha256=_sha256_bytes(normalized),
+                content_sha256=content_sha,
                 perceptual_hash=phash,
                 provenance_sha256=provenance_sha,
                 admitted_media_bytes=len(payload),
+            )
+            completed[task.image_id] = _checkpoint_split_asset(
+                wanted[task.image_id], checkpoint_assets[task.image_id]
             )
             if checkpoint_path is not None:
                 _write_acquisition_checkpoint(
@@ -2417,11 +2914,21 @@ def acquire_planned_assets(
                 )
                 if checkpoint_observer is not None:
                     checkpoint_observer()
-            if len(completed) == len(planned):
-                break
-    if not allow_item_failures:
-        _require(len(completed) == len(planned), "PLANNED_IMAGE_UNAVAILABLE")
+            task.state = "ACCEPTED"
+            task.reason_code = None
+            persist_ledger()
+        if pause_after_task:
+            break
+        status = _media_status(ledger, targets)
+    if not allow_item_failures and status != "MEDIA_READY":
+        _require(False, "PLANNED_IMAGE_UNAVAILABLE")
     _require(guard.media_bytes <= max_media_bytes, "MEDIA_CAP_EXCEEDED")
+    counts = _media_task_counts(ledger, checkpoint_assets)
+    failure_reasons = Counter(
+        task.reason_code
+        for task in ledger.tasks.values()
+        if task.state in {"REJECTED", "QUARANTINED"} and task.reason_code is not None
+    )
     return (
         tuple(
             completed[item.metadata.image_id]
@@ -2431,15 +2938,19 @@ def acquire_planned_assets(
         {
             "schema": "atlaslens-phase3f-provenance-aggregate-v1",
             "asset_count": len(completed),
-            "sidecar_sha256_set_sha256": _sha256_bytes(
-                _canonical_bytes(sorted(provenance_hashes))
-            ),
+            "sidecar_sha256_set_sha256": _sha256_bytes(_canonical_bytes(sorted(provenance_hashes))),
             "official_mapillary_graph_api": True,
             "signed_urls_persisted": False,
             "raw_ocr_created": False,
             "reidentification_attempted": False,
-            "item_failure_count": len(media_failures),
-            "item_failure_reasons": dict(sorted(Counter(media_failures.values()).items())),
+            "item_failure_count": cast(int, counts["rejected"]) + cast(int, counts["quarantined"]),
+            "item_failure_reasons": dict(sorted(failure_reasons.items())),
+            "media_status": status,
+            "media_task_counts": counts,
+            "provider_circuit": _media_task_document(ledger)["provider_circuit"],
+            "retry_not_before": ledger.retry_not_before,
+            "recovered_partial_count": recovered_partial_count,
+            "task_ledger_schema": MEDIA_TASK_LEDGER_SCHEMA,
         },
     )
 
@@ -2451,9 +2962,7 @@ def finalize_media_split(
     """Deduplicate downloaded candidates and fill primary minima from reserves."""
 
     _require(plan.ready, "METADATA_SPLIT_NOT_READY")
-    wanted = {
-        item.metadata.image_id: item for item in plan.download_assets
-    }
+    wanted = {item.metadata.image_id: item for item in plan.download_assets}
     _require(len(wanted) == len(plan.download_assets), "PLANNED_IMAGE_DUPLICATE")
     available: list[SplitAsset] = []
     seen_parent_ids: set[str] = set()
@@ -2515,9 +3024,7 @@ def finalize_media_split(
             and required > 0,
             "METADATA_READINESS_INVALID",
         )
-        bucket_specs.append(
-            (cast(str, city), cast(Role, role), cast(int, required))
-        )
+        bucket_specs.append((cast(str, city), cast(Role, role), cast(int, required)))
     primary_ids = {item.metadata.image_id for item in plan.primary}
     component_rows = {
         root: tuple(
@@ -2570,9 +3077,7 @@ def finalize_media_split(
             if root in used_components:
                 continue
             representative = next(
-                item
-                for item in component_rows[root]
-                if item.city == city and item.role == role
+                item for item in component_rows[root] if item.city == city and item.role == role
             )
             selected.append(representative)
             used_components.add(root)
@@ -2591,9 +3096,7 @@ def finalize_media_split(
         for city, role, required in bucket_specs
         if selected_counts[(city, role)] < required
     ]
-    leakage = audit_leakage(
-        selected, spatial_exclusion_meters=SPATIAL_EXCLUSION_METERS
-    )
+    leakage = audit_leakage(selected, spatial_exclusion_meters=SPATIAL_EXCLUSION_METERS)
     if not leakage.passed:
         failed_constraints.append(
             {
@@ -2663,9 +3166,7 @@ def finalize_provenance_aggregate(
         "asset_count": len(assets),
         "download_candidate_count": typed_prior_count,
         "discarded_or_reserve_count": typed_prior_count - len(assets),
-        "sidecar_sha256_set_sha256": _sha256_bytes(
-            _canonical_bytes(sorted(sidecar_hashes))
-        ),
+        "sidecar_sha256_set_sha256": _sha256_bytes(_canonical_bytes(sorted(sidecar_hashes))),
         "selected_split_only": True,
         "secrets_included": False,
     }
@@ -2742,9 +3243,7 @@ class MegaLocRuntime:
         tensors = [self._tensor(path) for path in paths]
         grouped: dict[tuple[int, int], list[tuple[int, Any]]] = defaultdict(list)
         for position, tensor in enumerate(tensors):
-            grouped[(int(tensor.shape[1]), int(tensor.shape[2]))].append(
-                (position, tensor)
-            )
+            grouped[(int(tensor.shape[1]), int(tensor.shape[2]))].append((position, tensor))
         output = np.empty((len(paths), 8448), dtype=np.float32)
         try:
             with self._torch.inference_mode():
@@ -2782,9 +3281,7 @@ def _descriptor_shards(
     checkpoint_root.mkdir(parents=True, exist_ok=True)
     for offset in range(0, len(assets), batch_size):
         batch = assets[offset : offset + batch_size]
-        identity = _sha256_bytes(
-            _canonical_bytes([item.opaque_id for item in batch])
-        )
+        identity = _sha256_bytes(_canonical_bytes([item.opaque_id for item in batch]))
         path = checkpoint_root / f"{offset:06d}-{identity[:16]}.npy"
         receipt_path = path.with_suffix(".json")
         matrix: np.ndarray[Any, np.dtype[np.float32]] | None = None
@@ -3115,9 +3612,7 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                     ),
                 )
             except CoverageInsufficient:
-                pipeline.finalize_coverage_insufficient(
-                    reason_code="COVERAGE_INSUFFICIENT"
-                )
+                pipeline.finalize_coverage_insufficient(reason_code="COVERAGE_INSUFFICIENT")
                 execution = {
                     "schema": "atlaslens-phase3f-cloud-execution-v1",
                     "run_id": config.run_id,
@@ -3145,9 +3640,7 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                 split_plan.readiness,
             )
             if not split_plan.ready:
-                pipeline.finalize_coverage_insufficient(
-                    reason_code="SPLIT_MINIMUM_UNAVAILABLE"
-                )
+                pipeline.finalize_coverage_insufficient(reason_code="SPLIT_MINIMUM_UNAVAILABLE")
                 execution = {
                     "schema": "atlaslens-phase3f-cloud-execution-v1",
                     "run_id": config.run_id,
@@ -3180,8 +3673,25 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                 acquisition_checkpoint,
                 restore_client_counts=False,
                 allow_item_failures=True,
+                primary_count=len(split_plan.primary),
             )
             _require(client.request_count <= MAX_REQUESTS, "REQUEST_CAP_EXCEEDED")
+            media_status = provenance.get("media_status")
+            _require(isinstance(media_status, str), "MEDIA_ACQUISITION_STATUS_INVALID")
+            media_status = cast(str, media_status)
+            if media_status.startswith("PAUSED_"):
+                receipt = {
+                    "run_id": config.run_id,
+                    "stage": media_status,
+                    "media_task_counts": provenance.get("media_task_counts"),
+                    "retry_not_before": provenance.get("retry_not_before"),
+                    "model_loaded": False,
+                    "gpu_used": False,
+                    "cloud_mutations": 0,
+                    "secrets_included": False,
+                }
+                _atomic_json(config.output_root / "execution-receipt.json", receipt)
+                return receipt
             pipeline.complete_acquisition(guard)
             media_plan = finalize_media_split(split_plan, assets)
             _atomic_json(
@@ -3189,9 +3699,7 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                 media_plan.readiness,
             )
             if not media_plan.ready:
-                pipeline.finalize_dataset_not_ready(
-                    reason_code="MEDIA_SPLIT_MINIMUM_UNAVAILABLE"
-                )
+                pipeline.finalize_dataset_not_ready(reason_code="MEDIA_SPLIT_MINIMUM_UNAVAILABLE")
                 execution = {
                     "schema": "atlaslens-phase3f-cloud-execution-v1",
                     "run_id": config.run_id,
@@ -3214,9 +3722,7 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                 cleanup_private_work = True
                 return execution
             assets = media_plan.assets
-            provenance = finalize_provenance_aggregate(
-                provenance, assets, media_root
-            )
+            provenance = finalize_provenance_aggregate(provenance, assets, media_root)
             split = seal_split(
                 assets,
                 in_domain_cities=[item.city for item in audit.selection.in_domain],
@@ -3279,9 +3785,7 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
             _atomic_json(config.output_root / "calibration.json", threshold.document())
             _check_deadline(config.deadline_epoch)
             holdout = tuple(
-                item
-                for item in assets
-                if item.role in {"sealed_holdout", "ood_holdout"}
+                item for item in assets if item.role in {"sealed_holdout", "ood_holdout"}
             )
             holdout_matrix = _descriptor_shards(
                 runtime,

@@ -40,6 +40,7 @@ from atlaslens_api.mapillary_demo.client import (
     validated_next_url,
 )
 from atlaslens_api.mapillary_demo.errors import (
+    MapillaryApiError,
     MapillaryDemoError,
     MapillaryLimitError,
     MapillarySafetyError,
@@ -435,6 +436,25 @@ def test_graph_http_failures_have_typed_secret_free_codes(
     assert FAKE_TOKEN not in str(error.value)
     assert "provider body" not in str(error.value)
     assert calls == expected_calls
+
+
+def test_rate_limit_retry_after_is_exposed_as_bounded_numeric_metadata() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "17"})
+
+    limits = ClientLimits(request_cap=1, retry_cap=0)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(FAKE_TOKEN, limits=limits, http_client=http_client)
+        with pytest.raises(MapillaryApiError) as error:
+            list(
+                client.iter_images(
+                    [load_aoi_catalog(_catalog_path()).aois[0].tiles[0]],
+                    include_thumbnail=False,
+                )
+            )
+
+    assert error.value.code == "mapillary_api_rate_limit_retry_exhausted"
+    assert error.value.retry_after_seconds == 17
 
 
 def test_graph_timeout_is_bounded_and_secret_free() -> None:

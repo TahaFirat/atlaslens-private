@@ -1,5 +1,36 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F media acquisition is an item-ledger state machine
+
+- Context: The completed 8,805-row metadata corpus produced a feasible plan of
+  830 primary and 200 reserve candidates. After 33 media accepts, a four-attempt
+  Graph `/images` 5xx exhaustion escaped from URL resolution before the old
+  per-item download exception boundary. No durable item state identified the
+  failed work, so Resume restarted the resolver scan and surfaced a generic
+  local-acquisition failure even though no RunPod resource had been created.
+- Decision: Persist a private v2 media-task ledger bound to the run and plan
+  hashes. Drive each candidate through `PENDING`, `URL_RESOLVING`,
+  `DOWNLOADING`, `VERIFYING`, and a terminal accepted/rejected/quarantined
+  state. Keep signed URLs memory-only; recover transient states and owned part
+  files deterministically; reconcile accepted v1 acquisition rows without
+  downloading them again. Quarantine bounded item 5xx/transport failures and
+  fill the same city/role bucket from deterministic reserves. Pause Graph
+  resolver outages or five consecutive item server failures with an atomic
+  provider circuit, a bounded cooldown, and `retry_not_before`. Honor bounded
+  `Retry-After`; fail closed on Graph authorization; refresh a signed media URL
+  once; and keep all post-media duplicate and leakage gates unchanged.
+- Alternatives: Add a new per-image endpoint; keep a failure dictionary without
+  transition state; retry the same candidate indefinitely; lower split minima;
+  let provider 5xx escape to the generic PowerShell boundary.
+- Consequences: Expected media pauses return one sanitized JSON result with
+  accepted/rejected/quarantined/pending/reserve/byte counts and do not advance
+  to cloud readiness or RunPod creation. A depleted reserve bucket reports
+  `MEDIA_SPLIT_MINIMUM_UNAVAILABLE`. The existing run, metadata, split plan, and
+  33 accepted files need no eager migration and remain unchanged until an
+  operator explicitly resumes after the reported cooldown.
+- Target phase: Product Phase 3F bounded local-first acquisition and private
+  fine-tuning only.
+
 ## 2026-07-20 - Phase 3F allocates split isolation groups before media acquisition
 
 - Context: The completed sixteen-city metadata checkpoint contains 8,805 unique

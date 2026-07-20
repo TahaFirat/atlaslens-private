@@ -97,13 +97,22 @@ function Invoke-LocalAcquisition {
     try {
         Invoke-WithSecureEnvironment -Name "MAPILLARY_ACCESS_TOKEN" -Secret $mapillarySecret -Operation {
             $localAction = if ($ResumeExisting) { "Resume" } else { "AcquireOnly" }
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $localLauncher `
+            $localOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $localLauncher `
                 -Action $localAction `
                 -RuntimeRoot $resolvedRuntime `
                 -MaxWallMinutes $AcquisitionMaxWallMinutes `
-                -PythonPath $resolvedPython
+                -PythonPath $resolvedPython)
             if ($LASTEXITCODE -ne 0) {
                 throw "PHASE3F_LOCAL_ACQUISITION_FAILED"
+            }
+            if ($localOutput.Count -ne 1) {
+                throw "PHASE3F_LOCAL_ACQUISITION_OUTPUT_INVALID"
+            }
+            try {
+                return ($localOutput[0] | ConvertFrom-Json -ErrorAction Stop)
+            }
+            catch {
+                throw "PHASE3F_LOCAL_ACQUISITION_OUTPUT_INVALID"
             }
         }
     }
@@ -156,13 +165,20 @@ switch ($Action) {
         Invoke-Control -ControlAction "status"
     }
     { $_ -in @("Execute", "Resume") } {
-        Invoke-Control -ControlAction "preflight"
+        $null = Invoke-Control -ControlAction "preflight"
         $currentPath = Join-Path $resolvedRuntime "current.json"
         $resumeExisting = Test-Path -LiteralPath $currentPath -PathType Leaf
         if ($Action -eq "Resume" -and -not $resumeExisting) {
             throw "PHASE3F_RESUME_STATE_MISSING"
         }
-        Invoke-LocalAcquisition -ResumeExisting $resumeExisting
+        $localResult = Invoke-LocalAcquisition -ResumeExisting $resumeExisting
+        if (
+            [string]$localResult.stage -like "PAUSED_*" -or
+            [string]$localResult.stage -eq "MEDIA_SPLIT_MINIMUM_UNAVAILABLE"
+        ) {
+            $localResult | ConvertTo-Json -Compress -Depth 4
+            break
+        }
         Invoke-Control -ControlAction "readiness"
         $current = Get-Content -LiteralPath $currentPath -Raw -Encoding UTF8 | ConvertFrom-Json
         $runId = [string]$current.run_id

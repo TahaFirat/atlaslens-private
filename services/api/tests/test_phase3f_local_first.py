@@ -73,6 +73,17 @@ def test_mapillary_secret_is_process_environment_only_and_never_described(
     assert token not in str(unresolved.value)
 
 
+def test_mapillary_auth_failures_are_terminal_acquisition_states() -> None:
+    assert (
+        local_first._acquisition_failure_stage("MAPILLARY_TOKEN_REJECTED")
+        == "ACQUISITION_FAILED_TERMINAL"
+    )
+    assert (
+        local_first._acquisition_failure_stage("MAPILLARY_PERMISSION_DENIED")
+        == "ACQUISITION_FAILED_TERMINAL"
+    )
+
+
 def test_checksum_inventory_seals_and_detects_tampering(tmp_path: Path) -> None:
     sealed = tmp_path / "sealed"
     sealed.mkdir()
