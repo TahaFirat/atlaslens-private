@@ -1,5 +1,34 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F uses local sealed acquisition and bounded cloud fine-tuning
+
+- Context: The local resumable acquisition initially had 569 İstanbul metadata
+  rows and later advanced to 1,350 multi-city rows with no media, while the cloud
+  worker still called descriptor/index generation "compute" and did not perform
+  model-weight training. Repeated provider 5xx failures also required operator
+  resumes without a consolidated failure/budget ledger.
+- Decision: Preserve the existing run and page/media checkpoints, add an
+  additive atomic scheduler schema v4, keep Mapillary acquisition on the local
+  host, fail closed on a sealed-corpus readiness report, and transfer only the
+  checksummed private corpus plus pinned training artifacts. On one bounded
+  receipt-owned RunPod Pod, measure a validation-only pretrained baseline, run
+  real mixed-precision batch-hard metric learning with a bounded trainable
+  MegaLoc tail, lock calibration, and open the locked holdout exactly once for
+  final evaluation. Cap fine-tuning at USD 3 per run and refuse a new Pod when
+  its full allowance would cross a conservative USD 10 historical total. Never
+  automatically replace the production model.
+- Alternatives: Continue describing a descriptor/index rebuild as training;
+  send the Mapillary token to RunPod; open holdout for baseline and tuning;
+  create a Pod before corpus readiness; automatically promote any completed
+  checkpoint.
+- Consequences: The operator has one explicit-consent PowerShell entry point and
+  resumable acquisition/training checkpoints. Fine-tuning remains a private
+  pilot candidate: the final weight is published only as a checksummed artifact,
+  and regression leaves production unchanged. Dataset/readiness failures use no
+  paid compute.
+- Target phase: Product Phase 3F licensed multi-region corpus and independent
+  calibration only.
+
 ## 2026-07-20 - Phase 3F treats metadata capacity as balanced city quotas
 
 - Context: After adaptive partitioning, local run

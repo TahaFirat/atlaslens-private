@@ -14,7 +14,10 @@ param(
     [int]$MaxWallMinutes = 345,
     [ValidateNotNullOrEmpty()]
     [string]$RuntimeRoot = "C:\AtlasLensRuntime\phase3f",
-    [string]$PythonPath = ""
+    [string]$PythonPath = "",
+    [string]$SealedAcquisition = "",
+    [ValidatePattern("^$|^[0-9a-f]{32}$")]
+    [string]$DatasetRunId = ""
 )
 
 Set-StrictMode -Version Latest
@@ -71,6 +74,19 @@ $arguments = @(
 if ($Execute) {
     $arguments += "--execute"
 }
+if (-not [string]::IsNullOrWhiteSpace($SealedAcquisition)) {
+    if ([string]::IsNullOrWhiteSpace($DatasetRunId)) {
+        throw "PHASE3F_DATASET_RUN_ID_MISSING"
+    }
+    $resolvedSealedAcquisition = (Resolve-Path -LiteralPath $SealedAcquisition).Path
+    $arguments += @(
+        "--sealed-acquisition", $resolvedSealedAcquisition,
+        "--dataset-run-id", $DatasetRunId
+    )
+}
+elseif (-not [string]::IsNullOrWhiteSpace($DatasetRunId)) {
+    throw "PHASE3F_SEALED_ACQUISITION_MISSING"
+}
 elseif ($LiveReadiness) {
     $arguments += "--live-readiness"
 }
@@ -83,14 +99,20 @@ try {
 }
 finally {
     if ($Execute -and (Test-Path -LiteralPath $operatorReceipt -PathType Leaf)) {
-        $currentRunId = $null
+        $currentReceipt = $null
         try {
-            $currentRunId = (Get-Content -LiteralPath $operatorReceipt -Raw | ConvertFrom-Json).run_id
+            $currentReceipt = Get-Content -LiteralPath $operatorReceipt -Raw | ConvertFrom-Json
         }
         catch {
             $cleanupExitCode = 1
         }
-        if ($null -ne $currentRunId -and $currentRunId -ne $initialRunId) {
+        $needsCleanup = (
+            $null -ne $currentReceipt -and (
+                $currentReceipt.stage -ne "terminated" -or
+                $currentReceipt.cleanup_verified -ne $true
+            )
+        )
+        if ($needsCleanup) {
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
                 (Join-Path $PSScriptRoot "stop-phase3f-runpod.ps1") `
                 -RuntimeRoot $resolvedRuntimeRoot `

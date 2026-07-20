@@ -10,11 +10,12 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -32,7 +33,11 @@ from atlaslens_api.mapillary_demo.client import (
     RemoteImage,
     validated_next_url,
 )
-from atlaslens_api.mapillary_demo.errors import MapillaryApiError, MapillaryLimitError
+from atlaslens_api.mapillary_demo.errors import (
+    MapillaryApiError,
+    MapillaryLimitError,
+    MapillaryTokenError,
+)
 from atlaslens_api.mapillary_demo.models import BoundingBox, ClientLimits, ImageMetadata
 from atlaslens_api.phase3f.acquisition import (
     MAX_IMAGES,
@@ -888,6 +893,24 @@ def migrate_and_subdivide_failed_pagination_checkpoint(
     }
 
 
+def _quarantine_active_metadata_cell(
+    state: _MetadataPageCheckpoint,
+    *,
+    areas: Sequence[CityArea],
+    checkpoint_path: Path,
+) -> None:
+    _require(0 <= state.city_index < len(areas), "MAPILLARY_QUARANTINE_STATE_INVALID")
+    city = areas[state.city_index].city
+    _require(
+        0 <= state.box_index < len(state.cells_by_city[city]),
+        "MAPILLARY_QUARANTINE_STATE_INVALID",
+    )
+    state.box_index += 1
+    state.next_url = None
+    state.visited_page_sha256 = ()
+    _write_metadata_page_checkpoint(checkpoint_path, state)
+
+
 def audit_metadata(
     client: MapillaryClient,
     areas: Sequence[CityArea],
@@ -1004,17 +1027,37 @@ def audit_metadata(
                 except _MetadataCityQuotaReached:
                     pass
                 except MapillaryApiError as exc:
-                    if exc.code != "mapillary_api_server_retry_exhausted":
+                    if exc.code not in {
+                        "mapillary_api_server_retry_exhausted",
+                        "mapillary_api_timeout",
+                        "mapillary_api_transport_retry_exhausted",
+                    }:
                         raise
                     _require(
                         checkpoint_path is not None,
                         "MAPILLARY_PARTITION_CHECKPOINT_REQUIRED",
                     )
-                    _subdivide_failed_metadata_cell(
-                        checkpoint,
-                        areas=areas,
-                        checkpoint_path=cast(Path, checkpoint_path),
-                    )
+                    try:
+                        _subdivide_failed_metadata_cell(
+                            checkpoint,
+                            areas=areas,
+                            checkpoint_path=cast(Path, checkpoint_path),
+                        )
+                    except Phase3FCloudJobError as partition_error:
+                        if partition_error.code not in {
+                            "MAPILLARY_PARTITION_DEPTH_LIMIT_REACHED",
+                            "MAPILLARY_PARTITION_MIN_AREA_REACHED",
+                            "MAPILLARY_PARTITION_CELL_LIMIT_REACHED",
+                        }:
+                            raise
+                        _quarantine_active_metadata_cell(
+                            checkpoint,
+                            areas=areas,
+                            checkpoint_path=cast(Path, checkpoint_path),
+                        )
+                        raise Phase3FCloudJobError(
+                            "MAPILLARY_PARTITION_CELL_QUARANTINED"
+                        ) from partition_error
                     raise
                 except MapillaryLimitError as exc:
                     if exc.code == "mapillary_item_cap_reached":
@@ -1560,6 +1603,78 @@ def _write_acquisition_checkpoint(
     )
 
 
+def _load_media_failures(
+    path: Path,
+    *,
+    run_id: str,
+    planned: Sequence[PlannedAsset],
+) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    _require(
+        path.is_file() and not path.is_symlink() and path.stat().st_size <= 4 * 1024 * 1024,
+        "MEDIA_FAILURE_CHECKPOINT_INVALID",
+    )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Phase3FCloudJobError("MEDIA_FAILURE_CHECKPOINT_INVALID") from exc
+    _require(
+        isinstance(value, dict)
+        and value.get("schema") == "atlaslens-phase3f-media-failures-v1"
+        and value.get("run_id") == run_id
+        and value.get("planned_sha256") == _planned_acquisition_sha256(planned),
+        "MEDIA_FAILURE_CHECKPOINT_INVALID",
+    )
+    rows = value.get("failures")
+    _require(isinstance(rows, list), "MEDIA_FAILURE_CHECKPOINT_INVALID")
+    wanted = {item.metadata.image_id for item in planned}
+    result: dict[str, str] = {}
+    for raw in cast(list[object], rows):
+        _require(
+            isinstance(raw, dict)
+            and set(raw) == {"image_id", "reason_code"},
+            "MEDIA_FAILURE_CHECKPOINT_INVALID",
+        )
+        row = cast(dict[str, object], raw)
+        image_id = row.get("image_id")
+        reason_code = row.get("reason_code")
+        _require(
+            isinstance(image_id, str)
+            and image_id in wanted
+            and image_id not in result
+            and isinstance(reason_code, str)
+            and bool(re.fullmatch(r"[a-z0-9_]+", reason_code)),
+            "MEDIA_FAILURE_CHECKPOINT_INVALID",
+        )
+        result[cast(str, image_id)] = cast(str, reason_code)
+    return result
+
+
+def _write_media_failures(
+    path: Path,
+    *,
+    run_id: str,
+    planned: Sequence[PlannedAsset],
+    failures: Mapping[str, str],
+) -> None:
+    _atomic_private_json(
+        path,
+        {
+            "schema": "atlaslens-phase3f-media-failures-v1",
+            "run_id": run_id,
+            "planned_sha256": _planned_acquisition_sha256(planned),
+            "failures": [
+                {"image_id": image_id, "reason_code": failures[image_id]}
+                for image_id in sorted(failures)
+            ],
+            "retry_exhausted_items_are_not_retried": True,
+            "secrets_included": False,
+            "signed_urls_included": False,
+        },
+    )
+
+
 def acquire_planned_assets(
     client: MapillaryClient,
     areas: Sequence[CityArea],
@@ -1570,6 +1685,8 @@ def acquire_planned_assets(
     checkpoint_path: Path | None = None,
     restore_client_counts: bool = True,
     max_media_bytes: int = MAX_MEDIA_BYTES,
+    checkpoint_observer: Callable[[], None] | None = None,
+    allow_item_failures: bool = False,
 ) -> tuple[tuple[SplitAsset, ...], dict[str, object]]:
     _require(0 < max_media_bytes <= MAX_MEDIA_BYTES, "MEDIA_CAP_INVALID")
     wanted = {item.metadata.image_id: item for item in planned}
@@ -1577,6 +1694,20 @@ def acquire_planned_assets(
     completed: dict[str, SplitAsset] = {}
     provenance_hashes: list[str] = []
     checkpoint_assets: dict[str, _CheckpointAsset] = {}
+    media_failure_path = (
+        checkpoint_path.with_name("media-failures.json")
+        if checkpoint_path is not None
+        else None
+    )
+    media_failures = (
+        _load_media_failures(
+            media_failure_path,
+            run_id=run_id,
+            planned=planned,
+        )
+        if media_failure_path is not None
+        else {}
+    )
     if checkpoint_path is not None:
         checkpoint_assets, restored_guard, historical_counts = _load_acquisition_checkpoint(
             checkpoint_path, planned=planned, media_root=media_root, run_id=run_id
@@ -1606,6 +1737,8 @@ def acquire_planned_assets(
         ):
             image_id = remote.metadata.mapillary_image_id
             if image_id not in city_wanted or image_id in completed:
+                continue
+            if image_id in media_failures:
                 continue
             plan = wanted[image_id]
             prior = checkpoint_assets.get(image_id)
@@ -1675,9 +1808,32 @@ def acquire_planned_assets(
                     raw_ocr_generated=False,
                 )
                 privacy_review.validate()
-            except BaseException:
+            except MapillaryTokenError:
                 guard.finish_request(status_code=500, media_bytes=0, admitted_image=False)
                 raise
+            except (MapillaryApiError, MapillaryLimitError, Phase3FCloudJobError) as exc:
+                guard.finish_request(status_code=500, media_bytes=0, admitted_image=False)
+                code = exc.code
+                if code in {
+                    "mapillary_media_rate_limit_retry_exhausted",
+                    "mapillary_request_cap_reached",
+                    "mapillary_operation_cancelled",
+                    "MEDIA_CAP_EXCEEDED",
+                }:
+                    raise
+                if not allow_item_failures:
+                    raise
+                media_failures[image_id] = code.lower()
+                if media_failure_path is not None:
+                    _write_media_failures(
+                        media_failure_path,
+                        run_id=run_id,
+                        planned=planned,
+                        failures=media_failures,
+                    )
+                    if checkpoint_observer is not None:
+                        checkpoint_observer()
+                continue
             guard.finish_request(
                 status_code=200,
                 media_bytes=len(payload),
@@ -1729,9 +1885,12 @@ def acquire_planned_assets(
                     run_id=run_id,
                     client=client,
                 )
+                if checkpoint_observer is not None:
+                    checkpoint_observer()
             if len(completed) == len(planned):
                 break
-    _require(len(completed) == len(planned), "PLANNED_IMAGE_UNAVAILABLE")
+    if not allow_item_failures:
+        _require(len(completed) == len(planned), "PLANNED_IMAGE_UNAVAILABLE")
     _require(guard.media_bytes <= max_media_bytes, "MEDIA_CAP_EXCEEDED")
     return (
         tuple(completed[item.metadata.image_id] for item in planned),
@@ -1745,6 +1904,8 @@ def acquire_planned_assets(
             "signed_urls_persisted": False,
             "raw_ocr_created": False,
             "reidentification_attempted": False,
+            "item_failure_count": len(media_failures),
+            "item_failure_reasons": dict(sorted(Counter(media_failures.values()).items())),
         },
     )
 

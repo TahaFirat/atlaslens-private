@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +49,7 @@ from atlaslens_api.phase3f.safety import (  # noqa: E402
     PodRequest,
     RunPodLease,
     SinglePodSession,
+    TARGET_BUDGET_USD,
 )
 from atlaslens_api.phase3f.supervisor import (  # noqa: E402
     LICENSE_CRLF_SHA256,
@@ -81,6 +82,9 @@ GPU_PREFERENCES = (
     "NVIDIA GeForce RTX 3090",
 )
 REMOTE_JOB_SECONDS = 5 * 60 * 60 + 30 * 60
+E2E_RUN_BUDGET_USD = Decimal("3")
+E2E_HISTORICAL_BUDGET_USD = Decimal("10")
+MAX_HISTORICAL_RECEIPTS = 1_000
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -425,6 +429,7 @@ def _operation(
     operator_receipt: OperatorReceipt,
     operator_receipt_path: Path,
     remote_job_seconds: int,
+    training_dataset: Path | None = None,
 ) -> dict[str, object]:
     bound_receipt = read_operator_receipt(operator_receipt_path)
     _require(
@@ -454,12 +459,15 @@ def _operation(
         [*ssh, "mkdir -p /workspace/phase3f-transfer/vendor"],
         timeout_seconds=remaining(),
     )
-    for local, remote in (
+    transfer_items = [
         (bundle_root / "atlaslens-phase3f-source.tar", f"{remote_transfer}/source.tar"),
         (bundle_root / "model.safetensors", f"{remote_transfer}/model.safetensors"),
         (bundle_root / "vendor" / "megaloc_model.py", f"{remote_transfer}/vendor/megaloc_model.py"),
         (bundle_root / "vendor" / "LICENSE", f"{remote_transfer}/vendor/LICENSE"),
-    ):
+    ]
+    if training_dataset is not None:
+        transfer_items.append((training_dataset, f"{remote_transfer}/sealed-acquisition.tar"))
+    for local, remote in transfer_items:
         _run_command(
             [*scp, str(local), f"root@{connection.public_ip}:{remote}"],
             timeout_seconds=remaining(),
@@ -471,23 +479,50 @@ def _operation(
         "numpy==2.2.6 safetensors==0.5.3 faiss-cpu==1.14.3"
     )
     deadline = int(time.time() + remote_job_seconds)
-    remote_command = " && ".join(
+    job_command = (
         (
-            "rm -rf /workspace/phase3f-repo /workspace/phase3f-output /workspace/phase3f-work",
+            "timeout --signal=TERM "
+            f"{remote_job_seconds} python /workspace/phase3f-repo/scripts/phase3f/training_job.py "
+            "--repository-root /workspace/phase3f-repo "
+            f"--run-id {run_id} "
+            "--sealed-root /workspace/phase3f-dataset/sealed-acquisition "
+            "--model /workspace/phase3f-transfer/model.safetensors "
+            "--vendor-root /workspace/phase3f-transfer/vendor "
+            "--work-root /workspace/phase3f-work "
+            "--output-root /workspace/phase3f-output "
+            f"--deadline-epoch {deadline}"
+        )
+        if training_dataset is not None
+        else (
+            "timeout --signal=TERM "
+            f"{remote_job_seconds} python /workspace/phase3f-repo/scripts/phase3f/cloud_job.py "
+            "--repository-root /workspace/phase3f-repo "
+            f"--run-id {run_id} "
+            "--model /workspace/phase3f-transfer/model.safetensors "
+            "--vendor-root /workspace/phase3f-transfer/vendor "
+            "--work-root /workspace/phase3f-work "
+            "--output-root /workspace/phase3f-output "
+            f"--deadline-epoch {deadline}"
+        )
+    )
+    preparation = [
+        "rm -rf /workspace/phase3f-repo /workspace/phase3f-output /workspace/phase3f-work /workspace/phase3f-dataset",
             "mkdir -p /workspace/phase3f-repo",
             "tar -xf /workspace/phase3f-transfer/source.tar -C /workspace/phase3f-repo",
             f"python -m pip install --disable-pip-version-check --no-cache-dir {dependencies}",
+    ]
+    if training_dataset is not None:
+        preparation.extend(
             (
-                "timeout --signal=TERM "
-                f"{remote_job_seconds} python /workspace/phase3f-repo/scripts/phase3f/cloud_job.py "
-                "--repository-root /workspace/phase3f-repo "
-                f"--run-id {run_id} "
-                "--model /workspace/phase3f-transfer/model.safetensors "
-                "--vendor-root /workspace/phase3f-transfer/vendor "
-                "--work-root /workspace/phase3f-work "
-                "--output-root /workspace/phase3f-output "
-                f"--deadline-epoch {deadline}"
-            ),
+                "mkdir -p /workspace/phase3f-dataset",
+                "tar -xf /workspace/phase3f-transfer/sealed-acquisition.tar -C /workspace/phase3f-dataset",
+                "unset MAPILLARY_ACCESS_TOKEN",
+            )
+        )
+    remote_command = " && ".join(
+        (
+            *preparation,
+            job_command,
             "tar -C /workspace -cf /workspace/phase3f-transfer/output.tar phase3f-output",
         )
     )
@@ -509,7 +544,7 @@ def _operation(
         _emit("PHASE3F_ARTIFACT_DOWNLOADED", run_id=run_id)
     finally:
         cleanup = (
-            "rm -rf /workspace/phase3f-work /workspace/phase3f-output "
+            "rm -rf /workspace/phase3f-work /workspace/phase3f-output /workspace/phase3f-dataset "
             "/workspace/phase3f-repo /workspace/phase3f-transfer"
         )
         try:
@@ -544,6 +579,74 @@ def _write_receipt(path: Path, value: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
+def _historical_conservative_spend(runtime_root: Path) -> Decimal:
+    spend_by_run: dict[str, Decimal] = {}
+    receipt_root = runtime_root / "_receipts"
+    if receipt_root.exists():
+        _require(receipt_root.is_dir() and not receipt_root.is_symlink(), "HISTORICAL_RECEIPTS_INVALID")
+        paths = sorted(receipt_root.glob("*.json"))
+        _require(len(paths) <= MAX_HISTORICAL_RECEIPTS, "HISTORICAL_RECEIPT_CAP_EXCEEDED")
+        for path in paths:
+            _require(
+                path.is_file() and not path.is_symlink() and path.stat().st_size <= 1024 * 1024,
+                "HISTORICAL_RECEIPT_INVALID",
+            )
+            try:
+                row = json.loads(path.read_bytes())
+                _require(isinstance(row, dict), "HISTORICAL_RECEIPT_INVALID")
+                run_id = row.get("run_id")
+                raw_spend = row.get("conservative_incremental_upper_usd")
+                amount = Decimal(str(raw_spend))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, InvalidOperation, ValueError) as exc:
+                raise SupervisorExecutionError("HISTORICAL_RECEIPT_INVALID") from exc
+            _require(
+                row.get("schema") == "atlaslens-phase3f-local-supervisor-receipt-v1"
+                and isinstance(run_id, str)
+                and bool(_RUN_ID.fullmatch(run_id))
+                and run_id not in spend_by_run
+                and amount.is_finite()
+                and amount >= 0,
+                "HISTORICAL_RECEIPT_INVALID",
+            )
+            spend_by_run[run_id] = amount
+
+    operator_root = runtime_root / "_operator"
+    operator_paths: list[Path] = []
+    current = operator_root / "phase3f-current.json"
+    if current.exists():
+        operator_paths.append(current)
+    archive = operator_root / "archive"
+    if archive.exists():
+        _require(archive.is_dir() and not archive.is_symlink(), "HISTORICAL_RECEIPTS_INVALID")
+        operator_paths.extend(sorted(archive.glob("*.json")))
+    _require(len(operator_paths) <= MAX_HISTORICAL_RECEIPTS, "HISTORICAL_RECEIPT_CAP_EXCEEDED")
+    for path in operator_paths:
+        receipt = read_operator_receipt(path)
+        _require(
+            receipt.cleanup_verified and receipt.stage in {"failed", "terminated"},
+            "HISTORICAL_RECEIPT_INVALID",
+        )
+        if receipt.run_id not in spend_by_run and receipt.pod_id is not None:
+            spend_by_run[receipt.run_id] = receipt.max_spend_usd
+    total = sum(spend_by_run.values(), Decimal("0"))
+    _require(total <= E2E_HISTORICAL_BUDGET_USD, "HISTORICAL_BUDGET_ALREADY_EXCEEDED")
+    return total
+
+
+def _require_e2e_budget(policy: BudgetPolicy, runtime_root: Path) -> tuple[Decimal, Decimal]:
+    _require(
+        policy.absolute_usd <= E2E_RUN_BUDGET_USD,
+        "TRAINING_RUN_BUDGET_EXCEEDS_3_USD",
+    )
+    historical = _historical_conservative_spend(runtime_root)
+    projected = historical + policy.absolute_usd
+    _require(
+        projected <= E2E_HISTORICAL_BUDGET_USD,
+        "HISTORICAL_BUDGET_WOULD_EXCEED_10_USD",
+    )
+    return historical, projected
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="atlaslens-phase3f-supervisor")
     actions = parser.add_mutually_exclusive_group()
@@ -558,12 +661,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--hard-stop-usd", type=Decimal, default=Decimal("9"))
     parser.add_argument("--max-gpu-hourly-usd", type=Decimal, default=Decimal("0.50"))
     parser.add_argument("--max-wall-minutes", type=int, default=345)
+    parser.add_argument("--sealed-acquisition", type=Path)
+    parser.add_argument("--dataset-run-id")
     return parser
 
 
 def _policy(args: argparse.Namespace) -> BudgetPolicy:
     _require(30 <= args.max_wall_minutes <= 345, "MAX_WALL_MINUTES_INVALID")
     return BudgetPolicy(
+        target_usd=min(TARGET_BUDGET_USD, args.soft_stop_usd - Decimal("0.01")),
         soft_stop_usd=args.soft_stop_usd,
         terminate_usd=args.hard_stop_usd,
         absolute_usd=args.max_spend_usd,
@@ -865,7 +971,7 @@ def _run_execute(
     receipt_path: Path,
 ) -> int:
     policy = _policy(args)
-    run_id = os.urandom(16).hex()
+    run_id = args.dataset_run_id or os.urandom(16).hex()
     _require(bool(_RUN_ID.fullmatch(run_id)), "RUN_ID_INVALID")
     key_root = Path(r"C:\tmp")
     key = key_root / f"atlaslens-phase3f-{run_id}"
@@ -895,11 +1001,18 @@ def _run_execute(
     session: SinglePodSession | None = None
     capacity_race_inventory_verified = False
     full_inventory_restored = False
+    historical_spend_before = Decimal("0")
+    historical_projected_ceiling = Decimal("0")
     try:
         _disk_gate()
         head, tracked = _preflight_repository()
         _verify_local_readiness()
         require_startable_receipt(receipt_path)
+        if args.sealed_acquisition is not None:
+            historical_spend_before, historical_projected_ceiling = _require_e2e_budget(
+                policy,
+                args.runtime_root,
+            )
         archive_completed_operator_receipt(receipt_path)
         write_operator_receipt(receipt_path, operator_receipt)
         owns_operator_receipt = True
@@ -928,6 +1041,11 @@ def _run_execute(
             tracked_paths=tracked,
             model_path=ROOT / ".local" / "models" / "phase6c" / "megaloc" / "model.safetensors",
             vendor_root=ROOT / ".local" / "vendor" / "megaloc",
+            sealed_root=args.sealed_acquisition,
+        )
+        _require(
+            args.sealed_acquisition is None or bundle.dataset_archive is not None,
+            "TRAINING_DATASET_ARCHIVE_MISSING",
         )
         config = RunPodConfig(
             image_name=IMAGE,
@@ -999,6 +1117,11 @@ def _run_execute(
                         remote_job_seconds=max(
                             60,
                             min(REMOTE_JOB_SECONDS, policy.max_runtime_seconds - 15 * 60),
+                        ),
+                        training_dataset=(
+                            bundle.dataset_archive.path
+                            if bundle.dataset_archive is not None
+                            else None
                         ),
                     ),
                 )
@@ -1079,6 +1202,15 @@ def _run_execute(
             "published_path_name": published.name,
             "secret_values_included": False,
         }
+        if args.sealed_acquisition is not None:
+            receipt.update(
+                {
+                    "training_run_budget_usd": str(E2E_RUN_BUDGET_USD),
+                    "historical_conservative_before_usd": str(historical_spend_before),
+                    "historical_projected_ceiling_usd": str(historical_projected_ceiling),
+                    "historical_budget_limit_usd": str(E2E_HISTORICAL_BUDGET_USD),
+                }
+            )
         _write_receipt(
             args.runtime_root / "_receipts" / f"{published.name}.json",
             receipt,
@@ -1157,6 +1289,14 @@ def _run_execute(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if (args.sealed_acquisition is None) != (args.dataset_run_id is None):
+        print("PHASE3F_TRAINING_DATASET_ARGUMENTS_INCOMPLETE")
+        return 1
+    if args.dataset_run_id is not None and not _RUN_ID.fullmatch(args.dataset_run_id):
+        print("RUN_ID_INVALID")
+        return 1
+    if args.sealed_acquisition is not None:
+        os.environ.pop("MAPILLARY_ACCESS_TOKEN", None)
     token = os.environ.get("RUNPOD_API_KEY")
     if not token:
         print("RUNPOD_API_KEY_NOT_VISIBLE_IN_APP")

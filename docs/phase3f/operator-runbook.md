@@ -5,6 +5,70 @@ local-only dry-run unless `-Execute` is present. The API key is read only from
 the PowerShell process environment; it is not accepted as an argument or
 printed. The wrapper does not read `.env` or `asda.html`.
 
+## One-command acquisition to fine-tuning pipeline
+
+The production operator entry point is `scripts\phase3f-end-to-end.ps1`. It
+preserves the current local run ID, resumes acquisition, validates and seals the
+private corpus, creates immutable train/validation/locked-holdout manifests,
+measures the pinned pretrained MegaLoc baseline on validation, transfers only
+the sealed corpus/training package, runs real mixed-precision metric-learning
+fine-tuning on one bounded RunPod Pod, retrieves checksummed outputs, terminates
+the exact receipt-bound Pod, and verifies the full pre-run cloud inventory is
+restored. Execute requires an explicit cloud-consent switch:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Preflight
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Execute -CloudConsent
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Status
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Resume -CloudConsent
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action EmergencyStop
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Cleanup
+```
+
+`Execute`/`Resume` read the Mapillary token and RunPod key separately with
+`Read-Host -AsSecureString`. The Mapillary token exists only in the local
+acquisition child environment and is cleared before the RunPod key is requested.
+The RunPod key exists only for lifecycle children. Neither value is passed on
+argv or written to state, logs, archives or receipts; both process variables are
+cleared in `finally` blocks and the secure BSTR is zeroed.
+
+The fine-tuning path has a hard USD 3 ceiling per run (`2.95` soft stop,
+`2.99` termination stop) and a fail-closed USD 10 historical ceiling. Before
+the RunPod client is created, verified completed receipts are summed by their
+conservative incremental upper bound; any prior cleaned-up run that opened a
+Pod but lacks a completed output receipt reserves its declared maximum. A new
+run is refused when its full USD 3 allowance would cross the historical limit.
+
+The v4 acquisition supervisor checkpoint is written atomically beside the
+existing page and media checkpoints. Migration is additive: it records the v3
+metadata-checkpoint SHA and preserves its run ID, first-seen rows and cursor
+state. It contains the pending cell queue, completed/partial/failed cells,
+active city/bbox/depth/cursor, first-seen ledger, city/global quotas, typed
+failure ledger, request/wall/media budgets, last atomic transition and coverage
+summary. Server, timeout and transport exhaustion subdivide the active cell and
+continue bounded work; paging loops/malformed paging quarantine the cell before
+continuing. Eight consecutive failures without a successful page pause the run.
+Media authorization failures are terminal, rate limiting pauses globally, and
+unavailable/retry-exhausted individual media are checkpointed and not retried
+forever.
+
+Before any Pod create, the sealed corpus must pass multi-region/city minimums,
+checksum inventory, provenance, image-label binding, duplicate and
+sequence/contributor concentration gates, plus secret/private-path scans. A
+failure produces one `DATASET_NOT_READY_FOR_TRAINING` report with
+`gpu_started=false` and `cloud_mutations=0`.
+
+Training freezes most of pinned MegaLoc and fine-tunes a bounded tail with a
+batch-hard cosine metric objective, AdamW, real backward/optimizer steps,
+mixed precision, deterministic seed and train-only augmentation. Batch size is
+selected from GPU memory with gradient accumulation. CUDA OOM can reduce the
+batch at most twice; epoch checkpoints support interruption resume; validation
+early stopping and the 345-minute Pod wall limit remain hard bounds. The locked
+holdout is described once, only after the fine-tuned validation threshold is
+locked. Outputs include pretrained/fine-tuned validation comparisons, final
+holdout benchmark, changed weight hashes and provenance. Regression never
+changes the production model automatically.
+
 ## Preferred local-first execution
 
 Phase 3F acquisition and GPU compute are separate checkpoints. Acquisition runs
@@ -56,7 +120,9 @@ full URL, hashes allowlisted request IDs, and never downloads imagery. The
 reduced-limit requests returned 500 while baseline and two quarter cells
 returned 200. Phase 3F therefore quarters every former cell in stable
 SW/SE/NW/NE order; fields, limit, token, and retry policy are unchanged.
-Checkpoint v3 binds both the original and adaptive ordered cell plans by hash.
+The page engine checkpoint v3 binds both the original and adaptive ordered cell
+plans by hash; the additive v4 supervisor checkpoint described above seals its
+state and budgets without rewriting accepted rows.
 If a cell's first request or a later cursor exhausts server retries, only that
 cell is atomically replaced in-place by SW/SE/NW/NE children for the next
 Resume. Accepted metadata rows remain first-seen deduplicated and unchanged.

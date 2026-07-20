@@ -620,6 +620,10 @@ class MapillaryClient:
                         continue
                     if response.is_redirect:
                         raise MapillarySafetyError("mapillary_media_redirect_refused")
+                    if response.status_code in {401, 403}:
+                        raise MapillaryTokenError("mapillary_media_authorization_rejected")
+                    if response.status_code in {404, 410}:
+                        raise MapillaryApiError("mapillary_media_unavailable")
                     if not 200 <= response.status_code < 300:
                         raise MapillaryApiError("mapillary_media_request_failed")
                     content_length = response.headers.get("Content-Length")

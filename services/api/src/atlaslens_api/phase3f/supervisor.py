@@ -24,6 +24,7 @@ from atlaslens_api.phase3f.packaging import (
 )
 from atlaslens_api.phase3f.pipeline import MAX_LOCAL_DERIVED_ARTIFACT_BYTES
 from atlaslens_api.phase3f.runpod import RunPodInventory
+from atlaslens_api.phase3f.training import DatasetArchive, write_dataset_archive
 
 MODEL_SHA256: Final = "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8"
 MODEL_SIZE: Final = 914_577_436
@@ -32,7 +33,7 @@ SOURCE_CRLF_SHA256: Final = "c0848dfb287ba15b519d7b54415db824e16ec2f2b5a6899507b
 LICENSE_LF_SHA256: Final = "0a906f9a65db6f645483f6cbf56b01e20615b9b943df3f70112f3d0fe0521e2a"
 LICENSE_CRLF_SHA256: Final = "40c6c4894aecc5b676f0fb93697a6c1f82b08df71b25e485b662779b2c899667"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_ALLOWED_OUTPUT_SUFFIXES = {".json", ".npy", ".faiss"}
+_ALLOWED_OUTPUT_SUFFIXES = {".json", ".npy", ".faiss", ".safetensors"}
 
 
 class Phase3FSupervisorError(RuntimeError):
@@ -62,6 +63,7 @@ class TransferBundle:
     model_path: Path
     canonical_source_path: Path
     canonical_license_path: Path
+    dataset_archive: DatasetArchive | None = None
 
 
 def prepare_transfer_bundle(
@@ -72,6 +74,7 @@ def prepare_transfer_bundle(
     tracked_paths: tuple[str, ...],
     model_path: Path,
     vendor_root: Path,
+    sealed_root: Path | None = None,
 ) -> TransferBundle:
     transfer = transfer_root.resolve()
     _require(not transfer.exists(), "TRANSFER_ROOT_ALREADY_EXISTS")
@@ -121,6 +124,15 @@ def prepare_transfer_bundle(
         and _sha256_path(transfer_model) == MODEL_SHA256,
         "TRANSFER_MODEL_MISMATCH",
     )
+    dataset_archive = (
+        write_dataset_archive(
+            sealed_root,
+            transfer / "sealed-acquisition.tar",
+            readiness_report_path=transfer / "training-readiness.json",
+        )
+        if sealed_root is not None
+        else None
+    )
     return TransferBundle(
         root=transfer,
         source_archive=archive,
@@ -128,6 +140,7 @@ def prepare_transfer_bundle(
         model_path=transfer_model,
         canonical_source_path=canonical_vendor / "megaloc_model.py",
         canonical_license_path=canonical_vendor / "LICENSE",
+        dataset_archive=dataset_archive,
     )
 
 

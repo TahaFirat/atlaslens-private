@@ -12,7 +12,7 @@ import socket
 import stat
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +40,7 @@ from atlaslens_api.phase3f.coverage import (
     CoverageSelectionLock,
 )
 from atlaslens_api.phase3f.pipeline import DescriptorPublication, Phase3FPipeline
+from atlaslens_api.phase3f.scheduler import sync_scheduler_checkpoint
 from atlaslens_api.phase3f.splits import SealedSplit, SplitAsset, seal_split
 
 LOCAL_RUNTIME_CAP_BYTES: Final = 8 * 1024 * 1024 * 1024
@@ -64,6 +65,24 @@ _TERMINAL_ACQUISITION_ERRORS: Final = frozenset(
         "MAPILLARY_METADATA_QUOTA_INVARIANT_FAILED",
     }
 )
+_AUTO_CONTINUE_METADATA_FAILURES: Final = frozenset(
+    {
+        "MAPILLARY_API_SERVER_RETRY_EXHAUSTED",
+        "MAPILLARY_API_TIMEOUT",
+        "MAPILLARY_API_TRANSPORT_RETRY_EXHAUSTED",
+        "MAPILLARY_PAGING_CELL_QUARANTINED",
+        "MAPILLARY_PARTITION_CELL_QUARANTINED",
+    }
+)
+_QUARANTINE_METADATA_FAILURES: Final = frozenset(
+    {
+        "MAPILLARY_API_PAGE_INVALID",
+        "MAPILLARY_PAGING_LOOP_DETECTED",
+        "MAPILLARY_PAGING_URL_INVALID",
+        "MAPILLARY_PAGING_QUERY_DUPLICATE",
+    }
+)
+MAX_CONSECUTIVE_PROVIDER_FAILURES: Final = 8
 
 
 class LocalFirstError(RuntimeError):
@@ -877,6 +896,7 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
     metadata_path = work_root / "metadata-pages.json"
     counters_path = work_root / "client-counters.json"
     acquisition_path = work_root / "acquisition-checkpoint.json"
+    scheduler_path = work_root / "acquisition-scheduler-v4.json"
     media_root = work_root / "private-media"
     if config.resume:
         historical = worker._read_client_counters(counters_path, run_id)  # noqa: SLF001
@@ -906,6 +926,23 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
         metadata = worker._new_metadata_page_checkpoint(areas, run_id)  # noqa: SLF001
         worker._write_metadata_page_checkpoint(metadata_path, metadata)  # noqa: SLF001
         worker._write_client_counters(counters_path, run_id, 0, 0, 0)  # noqa: SLF001
+    sync_scheduler_checkpoint(
+        scheduler_path,
+        run_id=run_id,
+        metadata_checkpoint=metadata_path,
+        client_counters=counters_path,
+        acquisition_checkpoint=acquisition_path,
+        request_cap=MAX_REQUESTS,
+        media_byte_cap=LOCAL_MEDIA_CAP_BYTES,
+        max_wall_seconds=config.max_wall_seconds,
+        status="ACQUISITION_RUNNING",
+        failure_code=(
+            cast(str, prior_state["error_code"])
+            if config.resume and isinstance(prior_state.get("error_code"), str)
+            else None
+        ),
+        city_order=[area.city for area in areas],
+    )
     deadline = time.time() + config.max_wall_seconds
     limits = ClientLimits(
         request_cap=MAX_REQUESTS,
@@ -938,22 +975,95 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
                     page_count=historical[1],
                     rejected_item_count=historical[2],
                 )
-            try:
-                audit = worker.audit_metadata(
-                    client,
-                    areas,
-                    checkpoint=metadata,
-                    checkpoint_path=metadata_path,
-                    run_id=run_id,
-                    progress=lambda city, page_count, stage: _write_state(
-                        runtime_root,
-                        run_id,
-                        "ACQUISITION_RUNNING",
-                        region=city,
-                        page_count=page_count,
-                        progress_stage=stage,
-                    ),
+
+            consecutive_provider_failures = 0
+
+            def record_progress(city: str, page_count: int, stage: str) -> None:
+                nonlocal consecutive_provider_failures
+                _require(time.time() < deadline, "LOCAL_ACQUISITION_DEADLINE_REACHED")
+                consecutive_provider_failures = 0
+                _write_state(
+                    runtime_root,
+                    run_id,
+                    "ACQUISITION_RUNNING",
+                    region=city,
+                    page_count=page_count,
+                    progress_stage=stage,
                 )
+                sync_scheduler_checkpoint(
+                    scheduler_path,
+                    run_id=run_id,
+                    metadata_checkpoint=metadata_path,
+                    client_counters=counters_path,
+                    acquisition_checkpoint=acquisition_path,
+                    request_cap=MAX_REQUESTS,
+                    media_byte_cap=LOCAL_MEDIA_CAP_BYTES,
+                    max_wall_seconds=config.max_wall_seconds,
+                    status="ACQUISITION_RUNNING",
+                    city_order=[area.city for area in areas],
+                )
+
+            def record_media_checkpoint() -> None:
+                _require(time.time() < deadline, "LOCAL_ACQUISITION_DEADLINE_REACHED")
+                sync_scheduler_checkpoint(
+                    scheduler_path,
+                    run_id=run_id,
+                    metadata_checkpoint=metadata_path,
+                    client_counters=counters_path,
+                    acquisition_checkpoint=acquisition_path,
+                    request_cap=MAX_REQUESTS,
+                    media_byte_cap=LOCAL_MEDIA_CAP_BYTES,
+                    max_wall_seconds=config.max_wall_seconds,
+                    status="MEDIA_ACQUISITION_RUNNING",
+                    city_order=[area.city for area in areas],
+                )
+
+            try:
+                while True:
+                    try:
+                        audit = worker.audit_metadata(
+                            client,
+                            areas,
+                            checkpoint=metadata,
+                            checkpoint_path=metadata_path,
+                            run_id=run_id,
+                            progress=record_progress,
+                        )
+                        break
+                    except BaseException as metadata_error:
+                        raw_code = getattr(metadata_error, "code", None)
+                        normalized_code = (
+                            raw_code.upper()
+                            if isinstance(raw_code, str)
+                            else "METADATA_ACQUISITION_FAILED"
+                        )
+                        if normalized_code in _QUARANTINE_METADATA_FAILURES:
+                            worker._quarantine_active_metadata_cell(  # noqa: SLF001
+                                metadata,
+                                areas=areas,
+                                checkpoint_path=metadata_path,
+                            )
+                            normalized_code = "MAPILLARY_PAGING_CELL_QUARANTINED"
+                        if normalized_code not in _AUTO_CONTINUE_METADATA_FAILURES:
+                            raise
+                        consecutive_provider_failures += 1
+                        sync_scheduler_checkpoint(
+                            scheduler_path,
+                            run_id=run_id,
+                            metadata_checkpoint=metadata_path,
+                            client_counters=counters_path,
+                            acquisition_checkpoint=acquisition_path,
+                            request_cap=MAX_REQUESTS,
+                            media_byte_cap=LOCAL_MEDIA_CAP_BYTES,
+                            max_wall_seconds=config.max_wall_seconds,
+                            status="ACQUISITION_RUNNING",
+                            failure_code=normalized_code,
+                            city_order=[area.city for area in areas],
+                        )
+                        if consecutive_provider_failures >= MAX_CONSECUTIVE_PROVIDER_FAILURES:
+                            raise LocalFirstError(
+                                "MAPILLARY_CONSECUTIVE_PROVIDER_FAILURE_LIMIT_REACHED"
+                            ) from metadata_error
             except CoverageInsufficient as exc:
                 _write_state(
                     runtime_root,
@@ -974,13 +1084,56 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
                 acquisition_path,
                 restore_client_counts=False,
                 max_media_bytes=LOCAL_MEDIA_CAP_BYTES,
+                checkpoint_observer=record_media_checkpoint,
+                allow_item_failures=True,
             )
+            if len(assets) != len(planned):
+                report = {
+                    "schema": "atlaslens-phase3f-training-readiness-v1",
+                    "outcome": "DATASET_NOT_READY_FOR_TRAINING",
+                    "ready": False,
+                    "planned_asset_count": len(planned),
+                    "usable_asset_count": len(assets),
+                    "item_failure_count": len(planned) - len(assets),
+                    "gpu_started": False,
+                    "cloud_mutations": 0,
+                    "secrets_included": False,
+                }
+                _atomic_private_json(run_root / "training-readiness.json", report)
+                _write_state(
+                    runtime_root,
+                    run_id,
+                    "DATASET_NOT_READY_FOR_TRAINING",
+                    asset_count=len(assets),
+                    item_failure_count=len(planned) - len(assets),
+                    model_loaded=False,
+                    gpu_used=False,
+                )
+                return {
+                    "run_id": run_id,
+                    "stage": "DATASET_NOT_READY_FOR_TRAINING",
+                    "asset_count": len(assets),
+                    "secrets_included": False,
+                }
             split = seal_split(
                 assets,
                 in_domain_cities=[item.city for item in audit.selection.in_domain],
                 ood_cities=[item.city for item in audit.selection.ood],
             )
             _require(time.time() < deadline, "LOCAL_ACQUISITION_DEADLINE_REACHED")
+            sync_scheduler_checkpoint(
+                scheduler_path,
+                run_id=run_id,
+                metadata_checkpoint=metadata_path,
+                client_counters=counters_path,
+                acquisition_checkpoint=acquisition_path,
+                request_cap=MAX_REQUESTS,
+                media_byte_cap=LOCAL_MEDIA_CAP_BYTES,
+                max_wall_seconds=config.max_wall_seconds,
+                status="CORPUS_READY_TO_SEAL",
+                city_order=[area.city for area in areas],
+            )
+            shutil.copy2(scheduler_path, media_root / "acquisition-scheduler-v4.json")
             _seal_acquisition(
                 run_id=run_id,
                 media_root=media_root,
@@ -1029,6 +1182,21 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
             model_loaded=False,
             gpu_used=False,
         )
+        if metadata_path.is_file() and counters_path.is_file():
+            with suppress(BaseException):
+                sync_scheduler_checkpoint(
+                    scheduler_path,
+                    run_id=run_id,
+                    metadata_checkpoint=metadata_path,
+                    client_counters=counters_path,
+                    acquisition_checkpoint=acquisition_path,
+                    request_cap=MAX_REQUESTS,
+                    media_byte_cap=LOCAL_MEDIA_CAP_BYTES,
+                    max_wall_seconds=config.max_wall_seconds,
+                    status=_acquisition_failure_stage(safe_code),
+                    failure_code=safe_code,
+                    city_order=[area.city for area in areas],
+                )
         raise
 
 
