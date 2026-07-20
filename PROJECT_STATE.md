@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-20T11:34:02+03:00
+last_verified_at: 2026-07-20T12:41:56+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: local_mapillary_acquisition_resume_repaired_manual_pod_remains_stopped
+product_phase_status: existing_pod_mapillary_secret_inheritance_hotfix_complete_manual_pod_remains_stopped
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -341,16 +341,21 @@ phase_3f_mapillary_resume: private_atomic_page_cursor_rows_loop_hash_and_cumulat
 phase_3f_mapillary_historical_resume: unavailable_old_job_predates_page_checkpoint_first_repaired_run_is_fresh
 phase_3f_manual_existing_pod_package: hash_bound_exact_commit_git_bundle_in_pod_only_prepare_start_status_tail_stop_global_lock_pid_identity_4_5h_job_deadline_no_pod_lifecycle
 phase_3f_manual_child_environment: explicit_python_cuda_mapillary_allowlist_runpod_and_unrelated_credentials_excluded
-phase_3f_mapillary_focused_tests: pass_8_resume_31_connector
-phase_3f_mapillary_plus_phase3f_tests: pass_176
-phase_3f_phase3f_full_tests: pass_145
+phase_3f_secret_inheritance_root_cause: shell_variable_present_but_not_exported_to_wrapper_process_environment
+phase_3f_secret_classification: mly_prefix_resolved_literal_runpod_reference_unresolved_absent_missing_other_invalid
+phase_3f_secret_transport: inherited_environment_only_never_argv_log_receipt_checkpoint_hash_or_length
+phase_3f_secret_subprocess_test: pass_real_parent_controller_child_and_git_bash_wrapper_present_absent_unresolved
+phase_3f_secret_failed_prepare: pass_no_current_root_state_log_or_cloud_job_start
+phase_3f_mapillary_focused_tests: pass_17_resume_and_secret_inheritance
+phase_3f_mapillary_plus_phase3f_tests: pass_176_prior_repair_checkpoint
+phase_3f_phase3f_full_tests: pass_154_after_secret_inheritance_hotfix
 phase_3f_mapillary_static: pass_ruff_strict_mypy_diff_check
 phase_3f_mapillary_live_diagnostic: skipped_mapillary_token_not_visible_locally_zero_requests
 phase_3f_mapillary_downloads: zero_images_datasets_models
 phase_3f_mapillary_cloud_mutations: zero
 phase_3f_manual_l4_pod_state: user_reported_stopped_compute_zero_per_hour_not_queried_or_mutated
 phase_3f_mapillary_repair_agents: implementation_pass_security_pass_validation_pass
-phase_3f_next_action: keep_manual_l4_pod_stopped_until_separate_start_decision_then_apply_unexecuted_runbook_package
+phase_3f_next_action: keep_manual_l4_pod_stopped_until_separate_start_decision_then_apply_new_immutable_secret_hotfix_bundle
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
 phase_6c_dataset_qa_ui_gate: pass
@@ -405,6 +410,32 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F existing-Pod secret inheritance hotfix
+
+Status: **LOCAL HOTFIX COMPLETE - MANUAL POD MUST REMAIN STOPPED**.
+
+The live shell check proved that `MAPILLARY_ACCESS_TOKEN` had a shell value, but
+not that Bash had exported it into child process environments. The wrapper
+therefore correctly observed it as absent. Prepare created no current root, and
+the following start stopped at `PHASE3F_CURRENT_ROOT_MISSING`; no cloud job ran.
+
+The existing-Pod chain now has a presence-only `secret-status` wrapper and
+repeats the same real child-subprocess attestation before prepare and start. An
+inherited `MLY` prefix is reported only as `RESOLVED_SECRET`; a literal RunPod
+secret reference and an absent value get their exact safe terminal codes. The
+token itself, its length, and its hash never enter output, argv, logs, state,
+receipts, or checkpoints. Only the explicit cloud-child environment allowlist
+receives the exact inherited value. The runbook now requires the safe
+no-assignment command `export MAPILLARY_ACCESS_TOKEN` in the same Pod shell.
+
+Presence/absence/unresolved classifications passed through a real
+parent-controller-child subprocess chain and the Git Bash wrapper. A failed
+prepare left no current root, job state, log, or process launch; the following
+start remained fail-closed. The dedicated hotfix/resume file passed 17 tests and
+the full Phase 3F focused selection passed 154. Ruff and strict mypy passed. No
+network call, image/model/data download, RunPod mutation, or push occurred. The
+Pod remains in the user-reported STOPPED state and was not queried.
 
 ## Product Phase 3F resumable Mapillary acquisition checkpoint
 

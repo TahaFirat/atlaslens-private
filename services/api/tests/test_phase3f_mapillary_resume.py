@@ -3,6 +3,10 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -24,7 +28,24 @@ from atlaslens_api.phase3f.coverage import CoverageInsufficient
 
 ROOT = Path(__file__).parents[3]
 MANUAL_SCRIPT = ROOT / "scripts" / "phase3f" / "existing_pod_job.py"
-FAKE_TOKEN = "fixture-token-not-a-secret"
+SECRET_STATUS_WRAPPER = ROOT / "scripts" / "phase3f" / "existing-pod-secret-status.sh"
+FAKE_TOKEN = "MLY_fixture-token-not-a-secret"
+UNRESOLVED_REFERENCE = "{{ RUNPOD_SECRET_atlaslens_mapillary_access_token }}"
+
+
+def _native_bash() -> str | None:
+    if os.name == "nt":
+        for candidate in (
+            Path("C:/Program Files/Git/bin/bash.exe"),
+            Path("C:/Program Files/Git/usr/bin/bash.exe"),
+        ):
+            if candidate.is_file():
+                return str(candidate)
+        return None
+    return shutil.which("bash")
+
+
+NATIVE_BASH = _native_bash()
 
 
 def _row(identifier: str) -> dict[str, object]:
@@ -45,6 +66,18 @@ def _manual_module() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _subprocess_environment(token: str | None) -> dict[str, str]:
+    environment = {
+        name: value
+        for name in ("PATH", "SYSTEMROOT", "TEMP", "TMP")
+        if (value := os.environ.get(name)) is not None
+    }
+    environment["PYTHONIOENCODING"] = "utf-8"
+    if token is not None:
+        environment["MAPILLARY_ACCESS_TOKEN"] = token
+    return environment
 
 
 def test_metadata_page_checkpoint_resumes_without_repeating_completed_page(
@@ -157,6 +190,11 @@ def test_manual_prepare_creates_only_run_parent_and_current_record(
     monkeypatch.setattr(module.secrets, "token_hex", lambda _size: "c" * 32)
     monkeypatch.setattr(module, "_prepare_readiness", lambda *_args: None)
     monkeypatch.setattr(module, "_existing_cloud_jobs", lambda: ())
+    monkeypatch.setattr(
+        module,
+        "_attest_mapillary_secret_inheritance",
+        lambda: "RESOLVED_SECRET",
+    )
 
     result = module.main(
         [
@@ -186,6 +224,7 @@ def test_manual_prepare_creates_only_run_parent_and_current_record(
 def test_manual_start_is_single_job_fresh_output_and_stale_pid_safe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     module = _manual_module()
     runtime = tmp_path / "runtime"
@@ -200,15 +239,22 @@ def test_manual_start_is_single_job_fresh_output_and_stale_pid_safe(
     monkeypatch.setattr(module, "_existing_cloud_jobs", lambda: ())
     monkeypatch.setattr(module, "_proc_identity", lambda _pid: ("123", "e" * 64))
     monkeypatch.setenv("MAPILLARY_ACCESS_TOKEN", FAKE_TOKEN)
+    monkeypatch.setattr(
+        module,
+        "_attest_mapillary_secret_inheritance",
+        lambda: "RESOLVED_SECRET",
+    )
     fake_fcntl = SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=lambda *_args: None)
     monkeypatch.setattr(module.importlib, "import_module", lambda _name: fake_fcntl)
     commands: list[list[str]] = []
+    child_environments: list[dict[str, str]] = []
 
     class FakeProcess:
         pid = 4321
 
         def __init__(self, command: list[str], **_kwargs: Any) -> None:
             commands.append(command)
+            child_environments.append(_kwargs["env"])
 
         def poll(self) -> None:
             return None
@@ -233,12 +279,21 @@ def test_manual_start_is_single_job_fresh_output_and_stale_pid_safe(
     ]
 
     assert module.main(arguments) == 0
+    first_output = capsys.readouterr().out
+    assert first_output.splitlines() == ["RESOLVED_SECRET", "PHASE3F_IN_POD_JOB_STARTED"]
+    assert FAKE_TOKEN not in first_output
     assert len(commands) == 1
+    assert FAKE_TOKEN not in "\n".join(commands[0])
+    assert child_environments[0]["MAPILLARY_ACCESS_TOKEN"] == FAKE_TOKEN
+    assert "RUNPOD_API_KEY" not in child_environments[0]
     assert commands[0].count(str(ROOT / "scripts" / "phase3f" / "cloud_job.py")) == 1
     assert "--resume" not in commands[0]
     assert not (run_parent / "work").exists()
     output_path = Path(commands[0][commands[0].index("--output-root") + 1])
     assert not output_path.exists()
+    for private_file in run_parent.rglob("*"):
+        if private_file.is_file():
+            assert FAKE_TOKEN.encode() not in private_file.read_bytes()
     assert module.main(arguments) == 1
     assert len(commands) == 1
 
@@ -292,6 +347,163 @@ def test_manual_child_environment_excludes_unrelated_credentials(
     assert environment["TRANSFORMERS_OFFLINE"] == "1"
     assert "RUNPOD_API_KEY" not in environment
     assert "UNRELATED_CREDENTIAL" not in environment
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (FAKE_TOKEN, "RESOLVED_SECRET"),
+        (UNRESOLVED_REFERENCE, "UNRESOLVED_RUNPOD_SECRET_REFERENCE"),
+        (None, "MAPILLARY_ACCESS_TOKEN_MISSING"),
+        ("fixture-invalid-format", "MAPILLARY_ACCESS_TOKEN_INVALID_FORMAT"),
+    ],
+)
+def test_manual_secret_classification_is_presence_only(
+    value: str | None,
+    expected: str,
+) -> None:
+    module = _manual_module()
+    assert module._classify_mapillary_secret(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("token", "expected", "returncode"),
+    [
+        (FAKE_TOKEN, "RESOLVED_SECRET", 0),
+        (UNRESOLVED_REFERENCE, "UNRESOLVED_RUNPOD_SECRET_REFERENCE", 1),
+        (None, "MAPILLARY_ACCESS_TOKEN_MISSING", 1),
+    ],
+)
+def test_secret_status_real_controller_and_child_subprocess_chain(
+    token: str | None,
+    expected: str,
+    returncode: int,
+) -> None:
+    command = [sys.executable, str(MANUAL_SCRIPT), "secret-status"]
+    result = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env=_subprocess_environment(token),
+        check=False,
+        timeout=30,
+        text=True,
+    )
+
+    assert result.returncode == returncode
+    assert result.stdout.strip() == expected
+    assert result.stderr == ""
+    if token is not None:
+        assert token not in result.stdout
+        assert token not in result.stderr
+        assert token not in "\n".join(command)
+
+
+@pytest.mark.skipif(
+    NATIVE_BASH is None,
+    reason="native bash unavailable",
+)
+def test_secret_status_shell_wrapper_inherits_only_exported_environment(
+    tmp_path: Path,
+) -> None:
+    assert NATIVE_BASH is not None
+    environment = _subprocess_environment(FAKE_TOKEN)
+    if os.name == "nt":
+        launcher = tmp_path / "python3"
+        executable = Path(sys.executable).as_posix()
+        launcher.write_text(
+            f"#!/usr/bin/env bash\nexec '{executable}' \"$@\"\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+        environment["PATH"] = f"{tmp_path}{os.pathsep}{environment['PATH']}"
+    command = [NATIVE_BASH, str(SECRET_STATUS_WRAPPER)]
+    resolved = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env=environment,
+        check=False,
+        timeout=30,
+        text=True,
+    )
+    missing = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env={
+            key: value
+            for key, value in environment.items()
+            if key != "MAPILLARY_ACCESS_TOKEN"
+        },
+        check=False,
+        timeout=30,
+        text=True,
+    )
+
+    assert resolved.returncode == 0
+    assert resolved.stdout.strip() == "RESOLVED_SECRET"
+    assert missing.returncode == 1
+    assert missing.stdout.strip() == "MAPILLARY_ACCESS_TOKEN_MISSING"
+    combined = resolved.stdout + resolved.stderr + missing.stdout + missing.stderr
+    assert FAKE_TOKEN not in combined
+    assert FAKE_TOKEN not in "\n".join(command)
+
+
+def test_failed_prepare_creates_no_current_root_and_start_never_launches(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    common = [
+        "--runtime-root",
+        str(runtime),
+        "--repository-root",
+        str(ROOT),
+        "--model",
+        str(tmp_path / "missing-model.safetensors"),
+        "--vendor-root",
+        str(tmp_path / "missing-vendor"),
+        "--source-commit",
+        "1" * 40,
+    ]
+    prepare_command = [sys.executable, str(MANUAL_SCRIPT), "prepare-check", *common]
+    prepare = subprocess.run(
+        prepare_command,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env=_subprocess_environment(None),
+        check=False,
+        timeout=30,
+        text=True,
+    )
+
+    assert prepare.returncode == 1
+    assert prepare.stdout.strip() == "MAPILLARY_ACCESS_TOKEN_MISSING"
+    assert prepare.stderr == ""
+    assert not (runtime / "current-root.json").exists()
+    assert not any(runtime.glob("*/job-state.json"))
+    assert not any(runtime.glob("*/job.log"))
+
+    start_command = [sys.executable, str(MANUAL_SCRIPT), "start-job", *common]
+    start = subprocess.run(
+        start_command,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env=_subprocess_environment(FAKE_TOKEN),
+        check=False,
+        timeout=30,
+        text=True,
+    )
+
+    assert start.returncode == 1
+    assert start.stdout.strip() == "PHASE3F_CURRENT_ROOT_MISSING"
+    assert start.stderr == ""
+    assert FAKE_TOKEN not in start.stdout
+    assert FAKE_TOKEN not in start.stderr
+    assert FAKE_TOKEN not in "\n".join(start_command)
+    assert not any(runtime.glob("*/job-state.json"))
+    assert not any(runtime.glob("*/job.log"))
 
 
 def test_manual_status_and_stop_use_only_bound_process(

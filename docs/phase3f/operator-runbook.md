@@ -176,23 +176,32 @@ record both roots of trust on Windows. These commands have not been executed on
 the stopped Pod:
 
 ```powershell
-git -C "D:\geoSearch" bundle create "D:\geoSearch\.local\phase3f-mapillary-resume.bundle" HEAD
+git -C "D:\geoSearch" bundle create "D:\geoSearch\.local\phase3f-mapillary-secret-hotfix.bundle" HEAD
 git -C "D:\geoSearch" rev-parse HEAD
-(Get-FileHash -Algorithm SHA256 -LiteralPath "D:\geoSearch\.local\phase3f-mapillary-resume.bundle").Hash.ToLowerInvariant()
+(Get-FileHash -Algorithm SHA256 -LiteralPath "D:\geoSearch\.local\phase3f-mapillary-secret-hotfix.bundle").Hash.ToLowerInvariant()
 ```
 
 Upload that bundle without modifying it to
-`/workspace/phase3f-transfer/phase3f-mapillary-resume.bundle`. Copy the exact
+`/workspace/phase3f-transfer/phase3f-mapillary-secret-hotfix.bundle`. Copy the exact
 commit and bundle SHA-256 printed in the final local handoff into the two
 variables below. After separately starting the Pod, use these commands inside
 the Pod. They are intentionally not Pod-start or RunPod commands and have not
 been executed as part of this repair:
 
+`test -n "${MAPILLARY_ACCESS_TOKEN:-}"` proves only that a shell variable has a
+value; it does not prove the value is exported to child processes. In the same
+shell that received the secret, run `export MAPILLARY_ACCESS_TOKEN` without an
+assignment. This does not place the value in argv or print it. Then require the
+presence-only status command to emit exactly `RESOLVED_SECRET`. A literal
+`{{ RUNPOD_SECRET_... }}` is rejected as
+`UNRESOLVED_RUNPOD_SECRET_REFERENCE`; an absent value is rejected as
+`MAPILLARY_ACCESS_TOKEN_MISSING`. The value, length, and hash are never emitted.
+
 ```bash
 set -euo pipefail
 expected_commit='<FINAL_COMMIT_SHA>'
 expected_bundle_sha256='<FINAL_BUNDLE_SHA256>'
-bundle=/workspace/phase3f-transfer/phase3f-mapillary-resume.bundle
+bundle=/workspace/phase3f-transfer/phase3f-mapillary-secret-hotfix.bundle
 test "$(sha256sum "$bundle" | awk '{print $1}')" = "$expected_bundle_sha256"
 test ! -e /workspace/phase3f-repo-mapillary-resume
 git clone --no-checkout "$bundle" /workspace/phase3f-repo-mapillary-resume
@@ -201,6 +210,8 @@ test "$(git -C /workspace/phase3f-repo-mapillary-resume rev-parse HEAD)" = "$exp
 git -C /workspace/phase3f-repo-mapillary-resume fsck --strict
 test -z "$(git -C /workspace/phase3f-repo-mapillary-resume status --porcelain=v1 --untracked-files=all)"
 install -d -m 700 /workspace/phase3f-manual
+export MAPILLARY_ACCESS_TOKEN
+bash /workspace/phase3f-repo-mapillary-resume/scripts/phase3f/existing-pod-secret-status.sh
 bash /workspace/phase3f-repo-mapillary-resume/scripts/phase3f/existing-pod-prepare-check.sh \
   --runtime-root /workspace/phase3f-manual \
   --repository-root /workspace/phase3f-repo-mapillary-resume \
@@ -214,6 +225,12 @@ bash /workspace/phase3f-repo-mapillary-resume/scripts/phase3f/existing-pod-start
   --vendor-root /workspace/phase3f-transfer/vendor \
   --source-commit "$expected_commit"
 ```
+
+If the repository directory already exists from the preceding immutable bundle,
+do not clone over it. Require a clean checkout, verify the new bundle hash, then
+run `git fetch "$bundle" HEAD`, detached-checkout the new exact commit, rerun
+`git fsck --strict`, and require clean status before the export/status/prepare
+commands above.
 
 Status and sanitized log projection, from the already-running Pod:
 

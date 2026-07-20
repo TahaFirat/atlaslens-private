@@ -16,11 +16,14 @@ import sys
 import time
 from pathlib import Path
 from collections.abc import Callable
-from typing import BinaryIO, cast
+from typing import BinaryIO, Literal, cast
 from uuid import uuid4
 
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 _SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_RUNPOD_SECRET_REFERENCE = re.compile(
+    r"^\{\{\s*RUNPOD_SECRET_[A-Za-z0-9_.-]+\s*\}\}$"
+)
 _MAX_WALL_SECONDS = 16_200
 _MODEL_SIZE = 914_577_436
 _MODEL_SHA256 = "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8"
@@ -47,6 +50,13 @@ _SAFE_CHILD_ENV_NAMES = frozenset(
     }
 )
 
+SecretClassification = Literal[
+    "RESOLVED_SECRET",
+    "UNRESOLVED_RUNPOD_SECRET_REFERENCE",
+    "MAPILLARY_ACCESS_TOKEN_MISSING",
+    "MAPILLARY_ACCESS_TOKEN_INVALID_FORMAT",
+]
+
 
 class ManualJobError(RuntimeError):
     pass
@@ -57,6 +67,16 @@ def _require(condition: bool, code: str) -> None:
         raise ManualJobError(code)
 
 
+def _classify_mapillary_secret(value: str | None) -> SecretClassification:
+    if value is None or value == "":
+        return "MAPILLARY_ACCESS_TOKEN_MISSING"
+    if _RUNPOD_SECRET_REFERENCE.fullmatch(value):
+        return "UNRESOLVED_RUNPOD_SECRET_REFERENCE"
+    if value.startswith("MLY"):
+        return "RESOLVED_SECRET"
+    return "MAPILLARY_ACCESS_TOKEN_INVALID_FORMAT"
+
+
 def _child_environment(*, include_mapillary_token: bool) -> dict[str, str]:
     environment = {
         name: value
@@ -65,7 +85,8 @@ def _child_environment(*, include_mapillary_token: bool) -> dict[str, str]:
     }
     if include_mapillary_token:
         token = os.environ.get("MAPILLARY_ACCESS_TOKEN")
-        _require(bool(token), "MAPILLARY_ACCESS_TOKEN_MISSING")
+        classification = _classify_mapillary_secret(token)
+        _require(classification == "RESOLVED_SECRET", classification)
         environment["MAPILLARY_ACCESS_TOKEN"] = cast(str, token)
     environment.update(
         {
@@ -76,6 +97,35 @@ def _child_environment(*, include_mapillary_token: bool) -> dict[str, str]:
         }
     )
     return environment
+
+
+def _attest_mapillary_secret_inheritance() -> SecretClassification:
+    classification = _classify_mapillary_secret(os.environ.get("MAPILLARY_ACCESS_TOKEN"))
+    _require(classification == "RESOLVED_SECRET", classification)
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os;"
+                "value=os.environ.get('MAPILLARY_ACCESS_TOKEN');"
+                "print('RESOLVED_SECRET' if value is not None and "
+                "value.startswith('MLY') else 'MAPILLARY_SECRET_INHERITANCE_FAILED')"
+            ),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=_child_environment(include_mapillary_token=True),
+        check=False,
+        timeout=30,
+        text=True,
+    )
+    _require(
+        probe.returncode == 0 and probe.stdout == "RESOLVED_SECRET\n",
+        "MAPILLARY_SECRET_INHERITANCE_FAILED",
+    )
+    return classification
 
 
 def _open_private_regular(path: Path, flags: int, code: str) -> int:
@@ -315,7 +365,6 @@ def _prepare_readiness(
         == _LICENSE_SHA256,
         "PHASE3F_VENDOR_HASH_MISMATCH",
     )
-    _require(bool(os.environ.get("MAPILLARY_ACCESS_TOKEN")), "MAPILLARY_ACCESS_TOKEN_MISSING")
     probe = subprocess.run(
         [
             sys.executable,
@@ -409,9 +458,16 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="atlaslens-phase3f-existing-pod-job")
     parser.add_argument(
         "action",
-        choices=("prepare-check", "start-job", "status-job", "tail-log", "stop-job"),
+        choices=(
+            "secret-status",
+            "prepare-check",
+            "start-job",
+            "status-job",
+            "tail-log",
+            "stop-job",
+        ),
     )
-    parser.add_argument("--runtime-root", type=Path, required=True)
+    parser.add_argument("--runtime-root", type=Path)
     parser.add_argument("--repository-root", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--vendor-root", type=Path)
@@ -424,13 +480,19 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     lock_stream: BinaryIO | None = None
     try:
+        if args.action == "secret-status":
+            print(_attest_mapillary_secret_inheritance())
+            return 0
+        _require(args.runtime_root is not None, "RUNTIME_ROOT_ARGUMENT_MISSING")
         runtime_root = args.runtime_root.resolve()
         _require(runtime_root.is_dir() and not runtime_root.is_symlink(), "RUNTIME_ROOT_INVALID")
         os.chmod(runtime_root, 0o700)
         run_id = secrets.token_hex(16) if args.action == "prepare-check" else _read_current_run(runtime_root)
         run_parent, state_path, log_path, work_root, lock_path = _paths(runtime_root, run_id)
         repository = args.repository_root.resolve() if args.repository_root is not None else None
+        secret_classification: SecretClassification | None = None
         if args.action in {"prepare-check", "start-job"}:
+            secret_classification = _attest_mapillary_secret_inheritance()
             if (
                 repository is None
                 or args.model is None
@@ -459,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
         _require(run_parent.is_dir(), "RUN_ROOT_MISSING")
 
         if args.action == "prepare-check":
+            print(cast(str, secret_classification))
             print("PHASE3F_IN_POD_PREPARE_CHECK_PASS")
             return 0
         if args.action == "start-job":
@@ -570,6 +633,7 @@ def main(argv: list[str] | None = None) -> int:
                 _terminate_process_group(process.pid)
                 process.wait(timeout=30)
                 raise
+            print(cast(str, secret_classification))
             print("PHASE3F_IN_POD_JOB_STARTED")
             return 0
 

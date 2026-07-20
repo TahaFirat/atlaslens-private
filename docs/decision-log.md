@@ -1,5 +1,28 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F attests exported Mapillary secret inheritance
+
+- Context: In one Pod shell, `test -n "${MAPILLARY_ACCESS_TOKEN:-}"` succeeded,
+  but the immediately launched existing-Pod prepare wrapper reported
+  `MAPILLARY_ACCESS_TOKEN_MISSING`. The test proves a shell variable is set, not
+  that it is exported into the wrapper process environment. Prepare therefore
+  created no current root, and start correctly stopped at
+  `PHASE3F_CURRENT_ROOT_MISSING`; the cloud job never launched.
+- Decision: Require an explicit shell `export MAPILLARY_ACCESS_TOKEN` with no
+  assignment before the wrapper. Add a presence-only `secret-status` subprocess
+  chain and repeat the same attestation before prepare/start. Classify only an
+  inherited `MLY` prefix as `RESOLVED_SECRET`; reject a literal RunPod secret
+  reference and an absent value with their stable safe codes. Carry the exact
+  value only in the explicit cloud-child environment allowlist, never argv,
+  logs, receipts, checkpoints, hashes, lengths, or error text.
+- Alternatives: Read `.env`; accept a shell-local non-exported variable; pass
+  the token as an argument; interpolate it into a command; print a prefix,
+  length, or hash; start the job after a failed prepare.
+- Consequences: Operators receive an unambiguous environment-inheritance gate
+  before any run root or cloud job is created. A failed prepare leaves start
+  fail-closed. This changes no RunPod resource or Mapillary request behavior.
+- Target phase: Product Phase 3F bounded existing-Pod manual runner only.
+
 ## 2026-07-20 - Phase 3F checkpoints Mapillary pages for bounded manual resume
 
 - Context: The Phase 3F acquisition failed in `iter_images` after retry
