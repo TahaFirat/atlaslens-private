@@ -3,13 +3,16 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from atlaslens_api.mapillary_demo.client import RemoteImage
-from atlaslens_api.mapillary_demo.models import GeoPoint, ImageMetadata
+from atlaslens_api.mapillary_demo.models import BoundingBox, GeoPoint, ImageMetadata
 from atlaslens_api.phase3f.cloud_job import (
     MetadataAsset,
     MetadataAudit,
     load_city_areas,
     plan_locked_roles,
+    quarter_bbox,
 )
 from atlaslens_api.phase3f.coverage import (
     CANDIDATE_CITY_REGIONS,
@@ -69,8 +72,22 @@ def test_aoi_config_covers_exact_candidate_pool_with_bounded_tiles() -> None:
 
     assert {area.city for area in areas} == set(CANDIDATE_CITY_REGIONS)
     assert len(areas) == 16
-    assert all(len(area.boxes) == 4 for area in areas)
+    assert all(len(area.boxes) == 16 for area in areas)
     assert all(box.area_square_degrees <= 0.01 for area in areas for box in area.boxes)
+
+
+def test_city_bbox_quarters_have_stable_southwest_first_order() -> None:
+    parent = BoundingBox(west=28.9, south=40.9, east=28.95, north=40.95)
+    cells = quarter_bbox(parent)
+
+    assert [cell.as_query_value() for cell in cells] == [
+        "28.9000000,40.9000000,28.9250000,40.9250000",
+        "28.9250000,40.9000000,28.9500000,40.9250000",
+        "28.9000000,40.9250000,28.9250000,40.9500000",
+        "28.9250000,40.9250000,28.9500000,40.9500000",
+    ]
+    expected_area = pytest.approx(parent.area_square_degrees / 4)
+    assert all(cell.area_square_degrees == expected_area for cell in cells)
 
 
 def test_role_planner_is_deterministic_and_globally_disjoint() -> None:

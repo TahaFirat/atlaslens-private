@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("AcquireOnly", "Status", "Resume", "ComputeOnly", "Cleanup")]
+    [ValidateSet("AcquireOnly", "DiagnoseAcquisition", "Status", "Resume", "ComputeOnly", "Cleanup")]
     [string]$Action,
     [ValidateNotNullOrEmpty()]
     [string]$RuntimeRoot = "D:\AtlasLensRuntime\phase3f-local",
@@ -28,10 +28,12 @@ if ([string]::IsNullOrWhiteSpace($PythonPath)) {
 }
 $resolvedPython = (Resolve-Path -LiteralPath $PythonPath).Path
 
-if ($Action -in @("AcquireOnly", "Resume")) {
+if ($Action -in @("AcquireOnly", "Resume", "DiagnoseAcquisition")) {
     if ([string]::IsNullOrWhiteSpace($env:MAPILLARY_ACCESS_TOKEN)) {
         throw "MAPILLARY_ACCESS_TOKEN_MISSING"
     }
+}
+if ($Action -in @("AcquireOnly", "Resume")) {
     $driveInfo = [IO.DriveInfo]::new($runtimeDrive)
     if ($driveInfo.AvailableFreeSpace -lt 8GB) {
         throw "LOCAL_RUNTIME_FREE_SPACE_BELOW_8_GIB"
@@ -61,6 +63,9 @@ switch ($Action) {
     }
     "Resume" {
         $arguments = @($entrypoint, "resume") + $arguments[1..($arguments.Length - 1)]
+    }
+    "DiagnoseAcquisition" {
+        $arguments = @($entrypoint, "diagnose-acquisition") + $arguments[1..($arguments.Length - 1)]
     }
     "Status" {
         $arguments = @($entrypoint, "status") + $arguments[1..($arguments.Length - 1)]

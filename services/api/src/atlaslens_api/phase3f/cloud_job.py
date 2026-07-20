@@ -84,7 +84,8 @@ MAX_METADATA_ITEMS_PER_CITY: Final = 600
 MAX_WALL_SECONDS: Final = 5 * 60 * 60 + 45 * 60
 ACQUISITION_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-acquisition-checkpoint-v1"
 CLIENT_COUNTER_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-client-counters-v1"
-METADATA_PAGE_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-metadata-pages-v1"
+LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-metadata-pages-v1"
+METADATA_PAGE_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-metadata-pages-v2"
 
 Role = Literal["reference", "calibration", "sealed_holdout", "ood_holdout"]
 
@@ -180,12 +181,46 @@ class CityArea:
         east = self.longitude + self.half_span
         south = self.latitude - self.half_span
         north = self.latitude + self.half_span
-        return (
+        coarse = (
             BoundingBox(west=west, south=south, east=self.longitude, north=self.latitude),
             BoundingBox(west=self.longitude, south=south, east=east, north=self.latitude),
             BoundingBox(west=west, south=self.latitude, east=self.longitude, north=north),
             BoundingBox(west=self.longitude, south=self.latitude, east=east, north=north),
         )
+        return tuple(cell for box in coarse for cell in quarter_bbox(box))
+
+
+def quarter_bbox(box: BoundingBox) -> tuple[BoundingBox, ...]:
+    """Split one bbox in stable southwest, southeast, northwest, northeast order."""
+
+    middle_longitude = (box.west + box.east) / 2
+    middle_latitude = (box.south + box.north) / 2
+    return (
+        BoundingBox(
+            west=box.west,
+            south=box.south,
+            east=middle_longitude,
+            north=middle_latitude,
+        ),
+        BoundingBox(
+            west=middle_longitude,
+            south=box.south,
+            east=box.east,
+            north=middle_latitude,
+        ),
+        BoundingBox(
+            west=box.west,
+            south=middle_latitude,
+            east=middle_longitude,
+            north=box.north,
+        ),
+        BoundingBox(
+            west=middle_longitude,
+            south=middle_latitude,
+            east=box.east,
+            north=box.north,
+        ),
+    )
 
 
 def load_city_areas(path: Path) -> tuple[CityArea, ...]:
@@ -298,6 +333,7 @@ class MetadataAudit:
 class _MetadataPageCheckpoint:
     run_id: str
     areas_sha256: str
+    cell_plan_sha256: str
     city_index: int
     box_index: int
     next_url: str | None
@@ -321,12 +357,27 @@ def _areas_sha256(areas: Sequence[CityArea]) -> str:
     )
 
 
+def _cell_plan_sha256(areas: Sequence[CityArea]) -> str:
+    return _sha256_bytes(
+        _canonical_bytes(
+            [
+                {
+                    "city": area.city,
+                    "ordered_cells": [box.as_query_value() for box in area.boxes],
+                }
+                for area in areas
+            ]
+        )
+    )
+
+
 def _new_metadata_page_checkpoint(
     areas: Sequence[CityArea], run_id: str
 ) -> _MetadataPageCheckpoint:
     return _MetadataPageCheckpoint(
         run_id=run_id,
         areas_sha256=_areas_sha256(areas),
+        cell_plan_sha256=_cell_plan_sha256(areas),
         city_index=0,
         box_index=0,
         next_url=None,
@@ -345,6 +396,7 @@ def _write_metadata_page_checkpoint(
             "schema": METADATA_PAGE_CHECKPOINT_SCHEMA,
             "run_id": state.run_id,
             "areas_sha256": state.areas_sha256,
+            "cell_plan_sha256": state.cell_plan_sha256,
             "city_index": state.city_index,
             "box_index": state.box_index,
             "next_url": state.next_url,
@@ -375,23 +427,33 @@ def _load_metadata_page_checkpoint(
         raise Phase3FCloudJobError("METADATA_PAGE_CHECKPOINT_INVALID") from exc
     _require(isinstance(value, dict), "METADATA_PAGE_CHECKPOINT_INVALID")
     document = cast(dict[str, object], value)
+    common_keys = {
+        "schema",
+        "run_id",
+        "areas_sha256",
+        "city_index",
+        "box_index",
+        "next_url",
+        "visited_page_sha256",
+        "rows_by_city",
+        "secrets_included",
+        "signed_urls_included",
+    }
+    is_legacy = document.get("schema") == LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA
+    expected_keys = common_keys if is_legacy else common_keys | {"cell_plan_sha256"}
     _require(
-        set(document)
-        == {
-            "schema",
-            "run_id",
-            "areas_sha256",
-            "city_index",
-            "box_index",
-            "next_url",
-            "visited_page_sha256",
-            "rows_by_city",
-            "secrets_included",
-            "signed_urls_included",
-        }
-        and document.get("schema") == METADATA_PAGE_CHECKPOINT_SCHEMA
+        set(document) == expected_keys,
+        "METADATA_PAGE_CHECKPOINT_INVALID",
+    )
+    _require(
+        document.get("schema")
+        in {LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA, METADATA_PAGE_CHECKPOINT_SCHEMA}
         and document.get("run_id") == run_id
         and document.get("areas_sha256") == _areas_sha256(areas)
+        and (
+            is_legacy
+            or document.get("cell_plan_sha256") == _cell_plan_sha256(areas)
+        )
         and document.get("secrets_included") is False
         and document.get("signed_urls_included") is False,
         "METADATA_PAGE_CHECKPOINT_INVALID",
@@ -401,13 +463,17 @@ def _load_metadata_page_checkpoint(
     next_url = document.get("next_url")
     visited = document.get("visited_page_sha256")
     raw_rows = document.get("rows_by_city")
+    typed_city_index = city_index if isinstance(city_index, int) else -1
+    maximum_box_index = (
+        len(areas[typed_city_index].boxes) if 0 <= typed_city_index < len(areas) else 0
+    )
     _require(
         isinstance(city_index, int)
         and not isinstance(city_index, bool)
         and 0 <= city_index <= len(areas)
         and isinstance(box_index, int)
         and not isinstance(box_index, bool)
-        and 0 <= box_index <= 4
+        and 0 <= box_index <= maximum_box_index
         and (next_url is None or isinstance(next_url, str))
         and isinstance(visited, list)
         and isinstance(raw_rows, dict),
@@ -462,15 +528,27 @@ def _load_metadata_page_checkpoint(
     for index, city in enumerate(expected_cities):
         if index > cast(int, city_index):
             _require(not parsed[city], "METADATA_PAGE_CHECKPOINT_INVALID")
-    return _MetadataPageCheckpoint(
+    result = _MetadataPageCheckpoint(
         run_id=run_id,
         areas_sha256=_areas_sha256(areas),
+        cell_plan_sha256=_cell_plan_sha256(areas),
         city_index=cast(int, city_index),
         box_index=cast(int, box_index),
         next_url=cast(str | None, next_url),
         visited_page_sha256=tuple(cast(list[str], visited_rows)),
         rows_by_city=parsed,
     )
+    if is_legacy:
+        _require(
+            result.city_index == 0
+            and result.box_index == 0
+            and result.next_url is None
+            and not result.visited_page_sha256
+            and all(not rows for rows in result.rows_by_city.values()),
+            "METADATA_PAGE_CHECKPOINT_PARTITION_MIGRATION_UNSAFE",
+        )
+        _write_metadata_page_checkpoint(path, result)
+    return result
 
 
 def audit_metadata(
@@ -487,6 +565,10 @@ def audit_metadata(
     _require(
         checkpoint.run_id == run_id or run_id is None,
         "METADATA_PAGE_CHECKPOINT_INCOMPATIBLE",
+    )
+    _require(
+        checkpoint.cell_plan_sha256 == _cell_plan_sha256(areas),
+        "METADATA_PAGE_CHECKPOINT_CELL_PLAN_MISMATCH",
     )
     records: list[CityCoverageRecord] = []
     assets_by_city: dict[str, tuple[MetadataAsset, ...]] = {}
@@ -1914,6 +1996,7 @@ __all__ = [
     "audit_metadata",
     "load_city_areas",
     "plan_locked_roles",
+    "quarter_bbox",
     "run_cloud_job",
     "verify_megaloc_artifacts",
 ]

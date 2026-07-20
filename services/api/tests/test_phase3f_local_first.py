@@ -9,8 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
+from atlaslens_api.phase3f import cloud_job as worker
 from atlaslens_api.phase3f import local_first
 from atlaslens_api.phase3f.cloud_job import (
     Phase3FCloudJobError,
@@ -21,7 +23,13 @@ ROOT = Path(__file__).parents[3]
 LAUNCHER = ROOT / "scripts" / "phase3f-local.ps1"
 
 
-def _write_current(runtime_root: Path, run_id: str, stage: str = "ACQUISITION_SEALED") -> None:
+def _write_current(
+    runtime_root: Path,
+    run_id: str,
+    stage: str = "ACQUISITION_SEALED",
+    *,
+    error_code: str | None = None,
+) -> None:
     run_root = runtime_root / run_id
     run_root.mkdir(parents=True)
     (runtime_root / "current.json").write_text(
@@ -34,6 +42,7 @@ def _write_current(runtime_root: Path, run_id: str, stage: str = "ACQUISITION_SE
                 "schema": local_first.LOCAL_STATE_SCHEMA,
                 "run_id": run_id,
                 "stage": stage,
+                "error_code": error_code,
                 "secrets_included": False,
             }
         ),
@@ -107,6 +116,138 @@ def test_vendor_trust_accepts_only_exact_lf_or_crlf_representation(tmp_path: Pat
             max_bytes=128,
         )
     assert error.value.code == "MEGALOC_VENDOR_SHA256_MISMATCH"
+
+
+def _diagnostic_result(name: str, response_class: str) -> dict[str, object]:
+    return {
+        "name": name,
+        "status_code": 200 if response_class == "success" else 503,
+        "response_class": response_class,
+    }
+
+
+def _diagnostic_matrix() -> dict[str, dict[str, object]]:
+    names = (
+        "baseline_auth",
+        "exact_failing_request",
+        "exact_limit_1",
+        "exact_minimal_fields",
+        "reduced_cell_first",
+        "reduced_cell_last",
+        "exact_limit_25",
+        "exact_limit_50",
+        "exact_repeat",
+        "adaptive_confirmation",
+    )
+    results = {name: _diagnostic_result(name, "server_error") for name in names}
+    results["baseline_auth"] = _diagnostic_result("baseline_auth", "success")
+    return results
+
+
+def test_diagnostic_requires_repeated_shape_evidence_before_change() -> None:
+    bbox = _diagnostic_matrix()
+    bbox["reduced_cell_first"] = _diagnostic_result("reduced_cell_first", "success")
+    bbox["reduced_cell_last"] = _diagnostic_result("reduced_cell_last", "success")
+    assert local_first._diagnose_probe_results(bbox) == {
+        "code": "BBOX_PARTITION_REQUIRED",
+        "deterministic_cause": True,
+        "request_change_authorized": True,
+        "change": "deterministic_quarter_cell_partition",
+    }
+
+    page_limit = _diagnostic_matrix()
+    page_limit["exact_limit_50"] = _diagnostic_result("exact_limit_50", "success")
+    page_limit["adaptive_confirmation"] = {
+        **_diagnostic_result("adaptive_confirmation", "success"),
+        "confirmed_limit": 50,
+    }
+    diagnosis = local_first._diagnose_probe_results(page_limit)
+    assert diagnosis["code"] == "PAGE_LIMIT_REDUCTION_REQUIRED"
+    assert diagnosis["safe_page_size"] == 50
+    assert diagnosis["deterministic_cause"] is True
+
+    unresolved = _diagnostic_matrix()
+    assert local_first._diagnose_probe_results(unresolved) == {
+        "code": "PROVIDER_GENERAL_5XX_NOT_REQUEST_SHAPE_ISOLATED",
+        "deterministic_cause": False,
+        "request_change_authorized": False,
+    }
+
+
+def test_diagnose_acquisition_is_ten_retryless_metadata_only_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    run_id = "e" * 32
+    _write_current(
+        runtime_root,
+        run_id,
+        "ACQUISITION_FAILED_RESUMABLE",
+        error_code="MAPILLARY_API_SERVER_RETRY_EXHAUSTED",
+    )
+    aoi_config = ROOT / "config" / "phase3f" / "city-coverage-aoi-v1.json"
+    areas = worker.load_city_areas(aoi_config)
+    checkpoint = worker._new_metadata_page_checkpoint(areas, run_id)
+    work_root = runtime_root / run_id / "acquisition-work"
+    worker._write_metadata_page_checkpoint(work_root / "metadata-pages.json", checkpoint)
+    token = "MLY_fixture-diagnostic-secret"
+    unsafe_body = f"unsafe-response-{token}"
+    unsafe_request_id = "provider-request-private-value"
+    monkeypatch.setenv("MAPILLARY_ACCESS_TOKEN", token)
+    observed: list[httpx.Request] = []
+    real_client = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request)
+        status = 200 if len(observed) == 1 else 503
+        return httpx.Response(
+            status,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "X-FB-Request-ID": unsafe_request_id,
+            },
+            content=unsafe_body.encode(),
+        )
+
+    def client_factory(**kwargs: object) -> httpx.Client:
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(local_first.httpx, "Client", client_factory)
+    result = local_first.diagnose_acquisition(
+        local_first.DiagnoseAcquisitionConfig(
+            runtime_root=runtime_root,
+            aoi_config_path=aoi_config,
+        )
+    )
+
+    assert len(observed) == 10
+    assert all(request.method == "GET" and request.url.path == "/images" for request in observed)
+    assert result["probe_request_count"] == 10
+    assert result["image_download_requests"] == 0
+    assert result["retry_attempts_per_request"] == 0
+    assert result["diagnosis"] == {
+        "code": "PROVIDER_GENERAL_5XX_NOT_REQUEST_SHAPE_ISOLATED",
+        "deterministic_cause": False,
+        "request_change_authorized": False,
+    }
+    receipt_path = (
+        runtime_root / run_id / "diagnostics" / "acquisition-diagnostic.json"
+    )
+    persisted = receipt_path.read_text(encoding="utf-8")
+    assert token not in persisted
+    assert unsafe_body not in persisted
+    assert unsafe_request_id not in persisted
+    receipt = json.loads(persisted)
+    assert receipt["exact_failing_request"] == {
+        "endpoint": "/images",
+        "parameter_names": ["bbox", "fields", "limit"],
+        "checkpoint_city_index": 0,
+        "checkpoint_box_index": 0,
+        "next_url_present": False,
+    }
+    assert all(probe["response_body_retained"] is False for probe in receipt["probes"])
+    assert receipt["secrets_included"] is False
 
 
 def test_compute_validates_sealed_acquisition_before_model_or_gpu(
@@ -265,7 +406,14 @@ def test_launcher_missing_token_stops_before_runtime_or_network(tmp_path: Path) 
 def test_launcher_contract_is_local_only_and_secret_safe() -> None:
     script = LAUNCHER.read_text(encoding="utf-8")
 
-    for action in ("AcquireOnly", "Status", "Resume", "ComputeOnly", "Cleanup"):
+    for action in (
+        "AcquireOnly",
+        "DiagnoseAcquisition",
+        "Status",
+        "Resume",
+        "ComputeOnly",
+        "Cleanup",
+    ):
         assert action in script
     assert "$env:MAPILLARY_ACCESS_TOKEN" in script
     assert "Remove-Item Env:MAPILLARY_ACCESS_TOKEN" in script

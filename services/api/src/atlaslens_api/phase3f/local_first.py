@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -17,8 +18,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, cast
 
+import httpx
+
 from atlaslens_api.mapillary_demo.client import MapillaryClient
-from atlaslens_api.mapillary_demo.models import ClientLimits
+from atlaslens_api.mapillary_demo.models import (
+    MAPILLARY_API_BASE_URL,
+    MAPILLARY_API_FIELDS,
+    BoundingBox,
+    ClientLimits,
+)
 from atlaslens_api.phase3f import cloud_job as worker
 from atlaslens_api.phase3f.acquisition import MAX_REQUESTS, AcquisitionGuard
 from atlaslens_api.phase3f.benchmark import (
@@ -41,6 +49,7 @@ LOCAL_STATE_SCHEMA: Final = "atlaslens-phase3f-local-first-state-v1"
 LOCAL_CURRENT_SCHEMA: Final = "atlaslens-phase3f-local-first-current-v1"
 SEALED_BUNDLE_SCHEMA: Final = "atlaslens-phase3f-sealed-acquisition-v1"
 SEALED_ASSETS_SCHEMA: Final = "atlaslens-phase3f-sealed-assets-v1"
+ACQUISITION_DIAGNOSTIC_SCHEMA: Final = "atlaslens-phase3f-acquisition-diagnostic-v1"
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RUNPOD_SECRET_REFERENCE = re.compile(
@@ -480,6 +489,335 @@ class AcquisitionConfig:
     source_policy_path: Path
     resume: bool = False
     max_wall_seconds: int = LOCAL_MAX_WALL_SECONDS
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnoseAcquisitionConfig:
+    runtime_root: Path
+    aoi_config_path: Path
+    request_limit: int = 10
+    timeout_seconds: float = 20.0
+
+
+@dataclass(frozen=True, slots=True)
+class _ProbeSpec:
+    name: str
+    bbox: BoundingBox
+    fields: tuple[str, ...]
+    limit: int
+
+
+def _response_class(status_code: int) -> str:
+    if 200 <= status_code < 300:
+        return "success"
+    if status_code == 400:
+        return "bad_request"
+    if status_code == 401:
+        return "auth_invalid"
+    if status_code == 403:
+        return "permission_denied"
+    if status_code == 429:
+        return "rate_limited"
+    if 500 <= status_code < 600:
+        return "server_error"
+    return "other_http"
+
+
+def _safe_content_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    media_type = value.split(";", 1)[0].strip().casefold()
+    if re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", media_type):
+        return media_type
+    return "invalid"
+
+
+def _safe_request_id(headers: httpx.Headers) -> dict[str, str] | None:
+    for name in ("x-fb-request-id", "x-request-id", "x-trace-id"):
+        value = headers.get(name)
+        if value is not None and 0 < len(value) <= 512:
+            return {
+                "header_name": name,
+                "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+            }
+    return None
+
+
+def _probe_images(
+    client: httpx.Client,
+    token: str,
+    spec: _ProbeSpec,
+    *,
+    timeout_seconds: float,
+) -> dict[str, object]:
+    _require(1 <= spec.limit <= 100, "DIAGNOSTIC_PROBE_LIMIT_INVALID")
+    _require(
+        bool(spec.fields)
+        and set(spec.fields).issubset(MAPILLARY_API_FIELDS)
+        and "thumb_1024_url" not in spec.fields,
+        "DIAGNOSTIC_PROBE_FIELDS_INVALID",
+    )
+    started = time.perf_counter()
+    status_code: int | None = None
+    response_class = "transport_error"
+    content_type: str | None = None
+    request_id: dict[str, str] | None = None
+    try:
+        with client.stream(
+            "GET",
+            f"{MAPILLARY_API_BASE_URL}/images",
+            params={
+                "bbox": spec.bbox.as_query_value(),
+                "fields": ",".join(spec.fields),
+                "limit": spec.limit,
+            },
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"OAuth {token}",
+                "User-Agent": "AtlasLens-Phase3F-Acquisition-Diagnostic/1",
+            },
+            timeout=timeout_seconds,
+        ) as response:
+            status_code = response.status_code
+            response_class = _response_class(response.status_code)
+            content_type = _safe_content_type(response.headers.get("Content-Type"))
+            request_id = _safe_request_id(response.headers)
+    except httpx.TimeoutException:
+        response_class = "timeout"
+    except (httpx.NetworkError, httpx.RemoteProtocolError):
+        response_class = "transport_error"
+    except httpx.HTTPError:
+        response_class = "http_error"
+    elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
+    return {
+        "name": spec.name,
+        "status_code": status_code,
+        "response_class": response_class,
+        "content_type": content_type,
+        "elapsed_ms": elapsed_ms,
+        "request_id": request_id,
+        "response_body_retained": False,
+    }
+
+
+def _is_success(result: Mapping[str, object]) -> bool:
+    return result.get("response_class") == "success"
+
+
+def _is_server_error(result: Mapping[str, object]) -> bool:
+    return result.get("response_class") == "server_error"
+
+
+def _diagnose_probe_results(results: Mapping[str, Mapping[str, object]]) -> dict[str, object]:
+    baseline = results["baseline_auth"]
+    exact = results["exact_failing_request"]
+    repeat = results["exact_repeat"]
+    if not _is_success(baseline):
+        return {
+            "code": "BASELINE_AUTH_OR_PROVIDER_UNAVAILABLE",
+            "deterministic_cause": False,
+            "request_change_authorized": False,
+        }
+    if _is_success(exact):
+        return {
+            "code": "HISTORICAL_FAILURE_NOT_REPRODUCED",
+            "deterministic_cause": False,
+            "request_change_authorized": False,
+        }
+    if not (_is_server_error(exact) and _is_server_error(repeat)):
+        return {
+            "code": "EXACT_FAILURE_NOT_STABLE_SERVER_ERROR",
+            "deterministic_cause": False,
+            "request_change_authorized": False,
+        }
+    reduced = (results["reduced_cell_first"], results["reduced_cell_last"])
+    if all(_is_success(result) for result in reduced):
+        return {
+            "code": "BBOX_PARTITION_REQUIRED",
+            "deterministic_cause": True,
+            "request_change_authorized": True,
+            "change": "deterministic_quarter_cell_partition",
+        }
+    confirmation = results["adaptive_confirmation"]
+    for size in (50, 25, 1):
+        candidate = results[f"exact_limit_{size}"]
+        if (
+            _is_success(candidate)
+            and confirmation.get("confirmed_limit") == size
+            and _is_success(confirmation)
+        ):
+            return {
+                "code": "PAGE_LIMIT_REDUCTION_REQUIRED",
+                "deterministic_cause": True,
+                "request_change_authorized": True,
+                "safe_page_size": size,
+                "change": "bounded_page_size",
+            }
+    if (
+        _is_success(results["exact_minimal_fields"])
+        and confirmation.get("omitted_field") == "computed_compass_angle"
+        and _is_success(confirmation)
+    ):
+        return {
+            "code": "FIELD_COMPUTED_COMPASS_ANGLE_REJECTED",
+            "deterministic_cause": True,
+            "request_change_authorized": True,
+            "field_to_remove": "computed_compass_angle",
+            "change": "remove_single_rejected_field",
+        }
+    return {
+        "code": "PROVIDER_GENERAL_5XX_NOT_REQUEST_SHAPE_ISOLATED",
+        "deterministic_cause": False,
+        "request_change_authorized": False,
+    }
+
+
+def diagnose_acquisition(config: DiagnoseAcquisitionConfig) -> dict[str, object]:
+    _require(config.request_limit == 10, "DIAGNOSTIC_REQUEST_LIMIT_INVALID")
+    _require(0 < config.timeout_seconds <= 30, "DIAGNOSTIC_TIMEOUT_INVALID")
+    token = _mapillary_token()
+    runtime_root = _safe_existing_directory(
+        _absolute_path(config.runtime_root),
+        "LOCAL_RUNTIME_ROOT_INVALID",
+    )
+    run_id = _current_run(runtime_root)
+    run_root = runtime_root / run_id
+    state = _read_json(
+        _state_path(runtime_root, run_id),
+        max_bytes=1_048_576,
+        code="LOCAL_STATE_INVALID",
+    )
+    _require(
+        state.get("stage") == "ACQUISITION_FAILED_RESUMABLE"
+        and state.get("error_code") == "MAPILLARY_API_SERVER_RETRY_EXHAUSTED",
+        "DIAGNOSTIC_RUN_STATE_INCOMPATIBLE",
+    )
+    areas = worker.load_city_areas(config.aoi_config_path)
+    checkpoint = worker._load_metadata_page_checkpoint(  # noqa: SLF001
+        run_root / "acquisition-work" / "metadata-pages.json",
+        areas=areas,
+        run_id=run_id,
+    )
+    _require(
+        checkpoint.city_index < len(areas)
+        and checkpoint.box_index < len(areas[checkpoint.city_index].boxes)
+        and checkpoint.next_url is None,
+        "DIAGNOSTIC_CHECKPOINT_SHAPE_UNSUPPORTED",
+    )
+    exact_box = areas[checkpoint.city_index].boxes[checkpoint.box_index]
+    reduced_boxes = worker.quarter_bbox(exact_box)
+    full_fields = MAPILLARY_API_FIELDS[:-1]
+    baseline_box = BoundingBox(
+        west=35.4400,
+        south=38.7200,
+        east=35.4410,
+        north=38.7210,
+    )
+    initial_specs = (
+        _ProbeSpec("baseline_auth", baseline_box, ("id",), 1),
+        _ProbeSpec("exact_failing_request", exact_box, full_fields, 100),
+        _ProbeSpec("exact_limit_1", exact_box, full_fields, 1),
+        _ProbeSpec("exact_minimal_fields", exact_box, ("id",), 100),
+        _ProbeSpec("reduced_cell_first", reduced_boxes[0], full_fields, 100),
+        _ProbeSpec("reduced_cell_last", reduced_boxes[-1], full_fields, 100),
+        _ProbeSpec("exact_limit_25", exact_box, full_fields, 25),
+        _ProbeSpec("exact_limit_50", exact_box, full_fields, 50),
+        _ProbeSpec("exact_repeat", exact_box, full_fields, 100),
+    )
+    _require(len(initial_specs) < config.request_limit, "DIAGNOSTIC_REQUEST_LIMIT_INVALID")
+    results: list[dict[str, object]] = []
+    with httpx.Client(follow_redirects=False, trust_env=False) as client:
+        for spec in initial_specs:
+            results.append(
+                _probe_images(
+                    client,
+                    token,
+                    spec,
+                    timeout_seconds=config.timeout_seconds,
+                )
+            )
+        indexed = {cast(str, result["name"]): result for result in results}
+        confirmation_spec: _ProbeSpec
+        confirmation_metadata: dict[str, object]
+        confirmed_limit = next(
+            (
+                size
+                for size in (50, 25, 1)
+                if _is_success(indexed[f"exact_limit_{size}"])
+            ),
+            None,
+        )
+        if confirmed_limit is not None:
+            confirmation_spec = _ProbeSpec(
+                "adaptive_confirmation",
+                exact_box,
+                full_fields,
+                confirmed_limit,
+            )
+            confirmation_metadata = {"confirmed_limit": confirmed_limit}
+        elif _is_success(indexed["exact_minimal_fields"]):
+            confirmation_spec = _ProbeSpec(
+                "adaptive_confirmation",
+                exact_box,
+                tuple(field for field in full_fields if field != "computed_compass_angle"),
+                100,
+            )
+            confirmation_metadata = {"omitted_field": "computed_compass_angle"}
+        else:
+            confirmation_spec = _ProbeSpec(
+                "adaptive_confirmation",
+                exact_box,
+                full_fields,
+                100,
+            )
+            confirmation_metadata = {"control_repeat": True}
+        confirmation = _probe_images(
+            client,
+            token,
+            confirmation_spec,
+            timeout_seconds=config.timeout_seconds,
+        )
+        confirmation.update(confirmation_metadata)
+        results.append(confirmation)
+    _require(len(results) == config.request_limit, "DIAGNOSTIC_REQUEST_COUNT_INVALID")
+    indexed_results = {cast(str, result["name"]): result for result in results}
+    diagnosis = _diagnose_probe_results(indexed_results)
+    receipt = {
+        "schema": ACQUISITION_DIAGNOSTIC_SCHEMA,
+        "run_id": run_id,
+        "historical_error_code": state["error_code"],
+        "exact_failing_request": {
+            "endpoint": "/images",
+            "parameter_names": ["bbox", "fields", "limit"],
+            "checkpoint_city_index": checkpoint.city_index,
+            "checkpoint_box_index": checkpoint.box_index,
+            "next_url_present": False,
+        },
+        "probe_request_count": len(results),
+        "request_limit": config.request_limit,
+        "retry_attempts_per_request": 0,
+        "image_download_requests": 0,
+        "response_bodies_retained": False,
+        "full_urls_retained": False,
+        "authorization_headers_retained": False,
+        "secrets_included": False,
+        "probes": results,
+        "diagnosis": diagnosis,
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    receipt_path = run_root / "diagnostics" / "acquisition-diagnostic.json"
+    _atomic_private_json(receipt_path, receipt)
+    return {
+        "run_id": run_id,
+        "diagnosis": diagnosis,
+        "probe_request_count": len(results),
+        "image_download_requests": 0,
+        "retry_attempts_per_request": 0,
+        "exact_failing_request": receipt["exact_failing_request"],
+        "probes": results,
+        "receipt_path": str(receipt_path),
+        "secrets_included": False,
+    }
 
 
 def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
@@ -944,10 +1282,12 @@ def cleanup(
 __all__ = [
     "AcquisitionConfig",
     "ComputeConfig",
+    "DiagnoseAcquisitionConfig",
     "LOCAL_RUNTIME_CAP_BYTES",
     "LocalFirstError",
     "VerifiedAcquisition",
     "cleanup",
+    "diagnose_acquisition",
     "run_acquisition",
     "run_compute",
     "status",

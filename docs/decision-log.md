@@ -1,5 +1,29 @@
 # Decision log
 
+## 2026-07-20 - Phase 3F quarters Mapillary acquisition cells
+
+- Context: A retryless ten-request live diagnostic reproduced HTTP 500 for the
+  first acquisition request, its exact repeat, limits 1/25/50, and minimal
+  fields. Baseline auth and both tested quarter-sized cells returned HTTP 200.
+  No image request was made. The only changed request dimension that
+  deterministically separated failure from success was bbox size.
+- Decision: Keep token, fields, page size, terminal statuses, and retry policy
+  unchanged. Split each prior Phase 3F cell into four equal cells in stable
+  southwest, southeast, northwest, northeast order, yielding sixteen ordered
+  cells per city. Continue one exact image-ID `seen` set across the ordered
+  cells so boundary overlap retains only the first deterministic occurrence.
+  Bind metadata checkpoint v2 to the exact ordered cell-plan hash. Atomically
+  migrate v1 only when it proves city 0, cell 0, no cursor/page hashes, and zero
+  rows; refuse any progressed v1 checkpoint.
+- Alternatives: Lower the page limit; remove metadata fields; alter retry/token
+  handling; treat all provider 5xx as bbox failures; reinterpret a progressed
+  checkpoint under a new cell plan.
+- Consequences: The named empty local run can resume from its migrated v2
+  checkpoint without replay ambiguity. Base cell requests increase fourfold,
+  but existing request/page caps remain unchanged. This patch itself makes no
+  Mapillary, RunPod, GPU, image, or acquisition call.
+- Target phase: Product Phase 3F bounded local-first acquisition.
+
 ## 2026-07-20 - Phase 3F separates checkpointed acquisition from offline compute
 
 - Context: The bounded existing-Pod job passed preparation and process start but

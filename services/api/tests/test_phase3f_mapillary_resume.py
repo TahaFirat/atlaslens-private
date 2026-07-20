@@ -19,9 +19,12 @@ from atlaslens_api.mapillary_demo.client import MapillaryClient
 from atlaslens_api.mapillary_demo.errors import MapillaryApiError, MapillarySafetyError
 from atlaslens_api.mapillary_demo.models import ClientLimits
 from atlaslens_api.phase3f.cloud_job import (
+    LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA,
+    METADATA_PAGE_CHECKPOINT_SCHEMA,
     CityArea,
     _load_metadata_page_checkpoint,
     _new_metadata_page_checkpoint,
+    _write_metadata_page_checkpoint,
     audit_metadata,
 )
 from atlaslens_api.phase3f.coverage import CoverageInsufficient
@@ -106,7 +109,7 @@ def test_metadata_page_checkpoint_resumes_without_repeating_completed_page(
             )
         return httpx.Response(503, text=f"unsafe {FAKE_TOKEN}")
 
-    limits = ClientLimits(request_cap=4, page_cap=4, retry_cap=0)
+    limits = ClientLimits(request_cap=20, page_cap=20, retry_cap=0)
     with httpx.Client(transport=httpx.MockTransport(first_handler)) as http_client:
         client = MapillaryClient(FAKE_TOKEN, limits=limits, http_client=http_client)
         with pytest.raises(MapillaryApiError, match="mapillary_api_server_retry_exhausted"):
@@ -143,17 +146,96 @@ def test_metadata_page_checkpoint_resumes_without_repeating_completed_page(
                 run_id="a" * 32,
             )
 
-    # The interrupted box resumes at its saved cursor, then the remaining three
+    # The interrupted cell resumes at its saved cursor, then the remaining 15
     # boxes are audited normally. The completed first page is never requested again.
-    assert len(observed) == 4
+    assert len(observed) == 16
     query = parse_qs(observed[0].url.query.decode())
     assert query == {"after": ["cursor-1"]}
     assert all("after" not in parse_qs(request.url.query.decode()) for request in observed[1:])
+    assert [
+        parse_qs(request.url.query.decode())["bbox"][0] for request in observed[1:]
+    ] == [box.as_query_value() for box in area.boxes[1:]]
     document = json.loads(checkpoint_path.read_text(encoding="utf-8"))
     assert [row["mapillary_image_id"] for row in document["rows_by_city"]["Ankara"]] == [
         "image-1",
         "image-2",
     ]
+
+
+def test_boundary_image_ids_are_deduplicated_in_stable_cell_order() -> None:
+    area = CityArea("Ankara", 32.85, 39.93, 0.01)
+    observed_bbox: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = parse_qs(request.url.query.decode())
+        observed_bbox.append(query["bbox"][0])
+        return httpx.Response(200, json={"data": [_row("boundary-image")]})
+
+    limits = ClientLimits(
+        request_cap=20,
+        page_cap=20,
+        metadata_item_cap=20,
+        page_size=1,
+        retry_cap=0,
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MapillaryClient(FAKE_TOKEN, limits=limits, http_client=http_client)
+        images = tuple(
+            client.iter_images(area.boxes, include_thumbnail=False, item_cap=20)
+        )
+
+    assert [image.metadata.mapillary_image_id for image in images] == ["boundary-image"]
+    assert observed_bbox == [box.as_query_value() for box in area.boxes]
+
+
+def test_empty_v1_checkpoint_is_atomically_migrated_to_partition_plan(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "work" / "metadata-pages.json"
+    area = CityArea("Ankara", 32.85, 39.93, 0.01)
+    state = _new_metadata_page_checkpoint((area,), "c" * 32)
+    _write_metadata_page_checkpoint(checkpoint_path, state)
+    legacy = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    legacy["schema"] = LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA
+    del legacy["cell_plan_sha256"]
+    checkpoint_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    migrated = _load_metadata_page_checkpoint(
+        checkpoint_path,
+        areas=(area,),
+        run_id="c" * 32,
+    )
+
+    persisted = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert persisted["schema"] == METADATA_PAGE_CHECKPOINT_SCHEMA
+    assert persisted["cell_plan_sha256"] == migrated.cell_plan_sha256
+    assert migrated.city_index == 0
+    assert migrated.box_index == 0
+    assert all(not rows for rows in migrated.rows_by_city.values())
+
+
+def test_progressed_v1_checkpoint_partition_migration_fails_closed(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "work" / "metadata-pages.json"
+    area = CityArea("Ankara", 32.85, 39.93, 0.01)
+    state = _new_metadata_page_checkpoint((area,), "d" * 32)
+    _write_metadata_page_checkpoint(checkpoint_path, state)
+    legacy = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    legacy["schema"] = LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA
+    legacy["box_index"] = 1
+    del legacy["cell_plan_sha256"]
+    checkpoint_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError,
+        match="METADATA_PAGE_CHECKPOINT_PARTITION_MIGRATION_UNSAFE",
+    ):
+        _load_metadata_page_checkpoint(
+            checkpoint_path,
+            areas=(area,),
+            run_id="d" * 32,
+        )
 
 
 def test_metadata_resume_retains_cursor_loop_guard(tmp_path: Path) -> None:

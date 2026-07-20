@@ -22,6 +22,7 @@ directory:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-local.ps1" -Action AcquireOnly
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-local.ps1" -Action DiagnoseAcquisition
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-local.ps1" -Action Status
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-local.ps1" -Action Resume
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-local.ps1" -Action ComputeOnly
@@ -46,6 +47,17 @@ The sealed acquisition is at
 `D:\AtlasLensRuntime\phase3f-local\<run-id>\sealed-acquisition`; offline
 descriptor, index, benchmark, receipt, and checksum results are at
 `D:\AtlasLensRuntime\phase3f-local\<run-id>\compute-output`.
+
+`DiagnoseAcquisition` is available only for a resumable
+`MAPILLARY_API_SERVER_RETRY_EXHAUSTED` run. It performs exactly ten
+metadata-only `/images` requests with retry zero, retains no response body or
+full URL, hashes allowlisted request IDs, and never downloads imagery. The
+2026-07-20 diagnostic isolated bbox size: exact, repeated, minimal-field and
+reduced-limit requests returned 500 while baseline and two quarter cells
+returned 200. Phase 3F therefore quarters every former cell in stable
+SW/SE/NW/NE order; fields, limit, token, and retry policy are unchanged.
+Checkpoint v2 binds that ordering by hash. Only a completely empty v1
+checkpoint may be atomically migrated; progressed v1 state is refused.
 
 ## Commands
 

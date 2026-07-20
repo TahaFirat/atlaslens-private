@@ -13,7 +13,14 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="atlaslens-phase3f-local-first")
     parser.add_argument(
         "action",
-        choices=("acquire-only", "status", "resume", "compute-only", "cleanup"),
+        choices=(
+            "acquire-only",
+            "diagnose-acquisition",
+            "status",
+            "resume",
+            "compute-only",
+            "cleanup",
+        ),
     )
     parser.add_argument("--repository-root", type=Path, required=True)
     parser.add_argument("--runtime-root", type=Path, required=True)
@@ -43,7 +50,9 @@ def main(argv: list[str] | None = None) -> int:
     from atlaslens_api.phase3f.local_first import (  # noqa: PLC0415
         AcquisitionConfig,
         ComputeConfig,
+        DiagnoseAcquisitionConfig,
         cleanup,
+        diagnose_acquisition,
         run_acquisition,
         run_compute,
         status,
@@ -65,6 +74,15 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     resume=args.action == "resume",
                     max_wall_seconds=args.max_wall_minutes * 60,
+                )
+            )
+        elif args.action == "diagnose-acquisition":
+            result = diagnose_acquisition(
+                DiagnoseAcquisitionConfig(
+                    runtime_root=args.runtime_root,
+                    aoi_config_path=(
+                        repository / "config" / "phase3f" / "city-coverage-aoi-v1.json"
+                    ),
                 )
             )
         elif args.action == "status":
