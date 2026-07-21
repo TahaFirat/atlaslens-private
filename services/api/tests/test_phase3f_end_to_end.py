@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import subprocess
+import tarfile
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -13,13 +14,14 @@ from typing import cast
 
 import pytest
 
-from atlaslens_api.phase3f import local_first, scheduler, training
+from atlaslens_api.phase3f import local_first, pipeline, scheduler, training
 from atlaslens_api.phase3f.splits import SplitAsset
 
 ROOT = Path(__file__).parents[3]
 LAUNCHER = ROOT / "scripts" / "phase3f-end-to-end.ps1"
 SUPERVISOR = ROOT / "scripts" / "phase3f" / "supervisor.py"
 CONTROL = ROOT / "scripts" / "phase3f" / "end_to_end.py"
+LOCAL_TRAINING_SMOKE = ROOT / "scripts" / "phase3f" / "local_training_smoke.py"
 
 
 def _load_supervisor() -> object:
@@ -32,6 +34,16 @@ def _load_supervisor() -> object:
 
 def _load_control() -> ModuleType:
     spec = importlib.util.spec_from_file_location("phase3f_e2e_resume_control", CONTROL)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_local_training_smoke() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "phase3f_local_training_smoke", LOCAL_TRAINING_SMOKE
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -171,6 +183,62 @@ def _closed_operator_receipt(
         max_gpu_hourly_usd=Decimal("0.50"),
         max_wall_minutes=345,
         cleanup_verified=cleanup_verified,
+    )
+
+
+def _priced_live_operator_receipt(module: object, *, run_id: str) -> object:
+    receipt = module.OperatorReceipt(
+        run_id=run_id,
+        attempt_id="b" * 32,
+        run_marker=f"atlaslens-phase3f-{run_id}",
+        pod_id=None,
+        supervisor_pid=1234,
+        stage="preflight",
+        started_at="2026-07-21T17:20:18.968350+00:00",
+        finished_at=None,
+        max_spend_usd=Decimal("3"),
+        soft_stop_usd=Decimal("2.95"),
+        hard_stop_usd=Decimal("2.99"),
+        max_gpu_hourly_usd=Decimal("0.50"),
+        max_wall_minutes=345,
+        cleanup_verified=False,
+    ).update_lifecycle(
+        stage="running",
+        pod_id="receipt-bound-live-pod",
+        pod_bound_at="2026-07-21T17:20:43.274682+00:00",
+    )
+    receipt = receipt.record_rental_attestation(
+        module.PodRentalAttestationDiagnostic(
+            evidence="request_and_on_demand_price_attested",
+            request_interruptible=False,
+            create_http_status=201,
+            selected_gpu_id="NVIDIA L4",
+            selected_uninterruptable_price=Decimal("0.39"),
+            create_cost_per_hr=Decimal("0.39"),
+            price_delta_usd=Decimal("0"),
+            desired_status="RUNNING",
+            cloud_type="SECURE",
+            create_interruptible_present=False,
+            create_interruptible_json_type="missing",
+            get_verification_http_status=200,
+            get_interruptible_present=False,
+            get_interruptible_json_type="missing",
+            pod_inventory_count=1,
+            explicit_false_source=None,
+            create_http_class="success_201",
+            normalized_gpu_path="machine.gpuTypeId",
+            normalized_gpu_count_path="gpuCount",
+            gpu_poll_count=1,
+            gpu_poll_elapsed_seconds=0.5,
+            observed_gpu_id="NVIDIA L4",
+            gpu_count=1,
+            cost_attestation="graphql_uninterruptable_price_match",
+        )
+    )
+    return receipt.update_lifecycle(
+        stage="terminated",
+        finished_at="2026-07-21T18:04:52.723404+00:00",
+        cleanup_verified=True,
     )
 
 
@@ -594,6 +662,114 @@ def test_budget_snapshot_allows_only_one_preserved_post_snapshot_receipt() -> No
         expected_count=1,
         expected_sha256=expected,
     )
+
+
+def test_training_plan_requires_integrity_bound_local_cuda_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _load_control()
+    run_id = "a" * 32
+    readiness_sha256 = "1" * 64
+    sealed_assets_sha256 = "2" * 64
+    repository = tmp_path / "repository"
+    (repository / "services" / "api" / "src").mkdir(parents=True)
+    cloud_runtime = tmp_path / "cloud"
+    cloud = {
+        "run_id": run_id,
+        "dataset_asset_count": 830,
+        "readiness_sha256": readiness_sha256,
+        "sealed_assets_sha256": sealed_assets_sha256,
+        "local_blockers": [],
+        "budget_snapshot": {
+            "actual_billed_usd": "0.8581701778",
+            "conservative_unbilled_estimate_usd": "0.38702361155",
+            "proposed_run_max_usd": "3",
+            "remaining_authorized_usd": "8.75480621065",
+            "projected_total_usd": "4.24519378935",
+        },
+    }
+    monkeypatch.setattr(control, "cloud_plan", lambda *_args: cloud)
+    smoke_path = (
+        repository
+        / ".local"
+        / "phase3f"
+        / "verification"
+        / run_id
+        / "retry-smoke.json"
+    )
+    smoke_path.parent.mkdir(parents=True)
+    smoke = {
+        "schema": "atlaslens-phase3f-local-cuda-smoke-v1",
+        "run_id": run_id,
+        "readiness_sha256": readiness_sha256,
+        "sealed_assets_sha256": sealed_assets_sha256,
+        "training_config_sha256": training.training_config_sha256(
+            seed=20260720, max_epochs=8
+        ),
+        "model_sha256": pipeline.MODEL_SHA256,
+        "local_cuda_smoke_passed": True,
+        "mini_epoch_passed": True,
+        "checkpoint_roundtrip_passed": True,
+        "failure_salvage_passed": True,
+        "locked_holdout_access_count": 0,
+        "nonfinite_loss_count": 0,
+        "model_parameters_changed": True,
+        "network_calls": 0,
+        "runpod_api_calls": 0,
+        "mapillary_api_calls": 0,
+        "cloud_mutations": 0,
+        "production_training_state_advanced": False,
+        "production_configuration_changed": False,
+        "temporary_cleanup_verified": True,
+        "secrets_included": False,
+    }
+    smoke_path.write_bytes(_canonical_bytes(smoke))
+
+    plan = control.training_plan(repository, tmp_path / "runtime", cloud_runtime)
+
+    assert plan["local_cuda_smoke_passed"] is True
+    assert plan["mini_epoch_passed"] is True
+    assert plan["checkpoint_roundtrip_passed"] is True
+    assert plan["failure_salvage_passed"] is True
+    assert plan["locked_holdout_access_count"] == 0
+    assert plan["nonfinite_loss_count"] == 0
+    assert plan["model_parameters_changed"] is True
+    assert plan["local_blockers"] == []
+    assert plan["ready_for_training_retry"] is True
+    assert plan["runpod_api_calls"] == 0
+    assert plan["cloud_mutations"] == 0
+
+    smoke["network_calls"] = 1
+    smoke_path.write_bytes(_canonical_bytes(smoke))
+    blocked = control.training_plan(repository, tmp_path / "runtime", cloud_runtime)
+    assert blocked["local_blockers"] == ["LOCAL_CUDA_SMOKE_INVALID"]
+    assert blocked["ready_for_training_retry"] is False
+
+
+def test_local_cuda_smoke_checkpoint_archive_contains_only_latest_generation(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_local_training_smoke()
+    checkpoint = tmp_path / "checkpoint"
+    old = checkpoint / "generation-00000001-1111111111111111"
+    latest = checkpoint / "generation-00000002-2222222222222222"
+    old.mkdir(parents=True)
+    latest.mkdir()
+    (old / "old.bin").write_bytes(b"old")
+    (latest / "checkpoint-manifest.json").write_bytes(b"latest")
+    (checkpoint / "latest.json").write_bytes(
+        _canonical_bytes({"generation": latest.name})
+    )
+    archive = tmp_path / "latest.tar"
+
+    smoke._tar_latest_checkpoint(checkpoint, archive)
+
+    with tarfile.open(archive, "r:") as tar:
+        names = set(tar.getnames())
+    assert "latest.json" in names
+    assert f"{latest.name}/checkpoint-manifest.json" in names
+    assert all(not name.startswith(old.name) for name in names)
 
 
 @pytest.mark.parametrize(
@@ -1056,6 +1232,67 @@ def test_billing_lag_keeps_local_lifecycle_estimate_nonzero(tmp_path: Path) -> N
     assert reconciliation.actual_billed_usd == Decimal("0")
     assert reconciliation.conservative_unbilled_estimate_usd > Decimal("0.11")
     assert reconciliation.projected_total_usd > Decimal("3.11")
+
+
+def test_post_snapshot_live_attempt_is_added_to_training_plan_budget(
+    tmp_path: Path,
+) -> None:
+    control = _load_control()
+    module = _load_supervisor()
+    run_id = "a" * 32
+    _write_budget_snapshot(tmp_path, run_id=run_id)
+    current = tmp_path / "_operator" / "phase3f-current.json"
+    module.write_operator_receipt(
+        current,
+        _priced_live_operator_receipt(module, run_id=run_id),
+    )
+
+    budget = control._latest_budget_snapshot(tmp_path, run_id)
+
+    assert budget["actual_billed_usd"] == "0.8379813398"
+    assert budget["active_exposure_usd"] == "0"
+    assert budget["billing_lag_attempt_count"] == 1
+    assert budget["billing_lag_compute_estimate_usd"] == "0.28702361155"
+    assert budget["billing_lag_disk_allowance_usd"] == "0.10"
+    assert budget["billing_lag_local_estimate_usd"] == "0.38702361155"
+    assert budget["conservative_unbilled_estimate_usd"] == "0.38702361155"
+    assert budget["proposed_run_max_usd"] == "3"
+    assert budget["projected_total_usd"] == "4.22500495135"
+
+
+def test_provider_increment_covers_post_snapshot_attempt_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    module = _load_supervisor()
+    run_id = "a" * 32
+    _write_budget_snapshot(tmp_path, run_id=run_id)
+    current = tmp_path / "_operator" / "phase3f-current.json"
+    module.write_operator_receipt(
+        current,
+        _priced_live_operator_receipt(module, run_id=run_id),
+    )
+
+    lagging = module._budget_reconciliation(
+        _budget_policy(module),
+        tmp_path,
+        _billing_snapshot(module, balance="9.1620186602"),
+    )
+    assert lagging.billing_lag_attempt_count == 1
+    assert lagging.billing_lag_local_estimate_usd == Decimal("0.38702361155")
+    assert lagging.provider_increment_since_prior_snapshot_usd == Decimal("0")
+    assert lagging.conservative_unbilled_estimate_usd == Decimal("0.38702361155")
+
+    provider_included = module._budget_reconciliation(
+        _budget_policy(module),
+        tmp_path,
+        _billing_snapshot(module, balance="8.77499504865"),
+    )
+    assert provider_included.actual_billed_usd == Decimal("1.22500495135")
+    assert provider_included.provider_increment_since_prior_snapshot_usd == Decimal(
+        "0.38702361155"
+    )
+    assert provider_included.conservative_unbilled_estimate_usd == Decimal("0")
+    assert provider_included.projected_total_usd == Decimal("4.22500495135")
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,8 @@ from typing import cast
 REQUIRED_BRANCH = "feature/phase3f-multiregion-pilot"
 FROZEN_START_HEAD = "17e1a14f2ccc96418a076d451a03fcdf981988bb"
 CURRENT_SCHEMA = "atlaslens-phase3f-local-first-current-v1"
+HISTORICAL_BUDGET_CAP_USD = Decimal("10")
+CLOSED_POD_DISK_ALLOWANCE_USD = Decimal("0.10")
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -744,17 +746,90 @@ def _latest_budget_snapshot(cloud_runtime: Path, run_id: str) -> dict[str, objec
     unbilled = _budget_decimal(row.get("conservative_unbilled_estimate_usd"))
     proposed = _budget_decimal(row.get("proposed_run_max_usd"))
     remaining = _budget_decimal(row.get("remaining_authorized_usd"))
+    from atlaslens_api.phase3f.operator import (  # noqa: PLC0415
+        operator_budget_linkage,
+        read_operator_receipt,
+    )
+
+    pending_by_key: dict[str, Decimal] = {}
+    pending_compute_by_key: dict[str, Decimal] = {}
+    for receipt_path in (
+        *sorted((cloud_runtime / "_operator" / "archive").glob("*.json")),
+        cloud_runtime / "_operator" / "phase3f-current.json",
+    ):
+        if not receipt_path.exists():
+            continue
+        receipt = read_operator_receipt(receipt_path)
+        if not (
+            receipt.cleanup_verified
+            and receipt.stage in {"failed", "terminated"}
+            and receipt.pod_id is not None
+            and receipt.finished_at is not None
+        ):
+            continue
+        try:
+            finished = datetime.fromisoformat(receipt.finished_at).astimezone(UTC)
+            started = datetime.fromisoformat(
+                receipt.pod_bound_at or receipt.started_at
+            ).astimezone(UTC)
+        except ValueError as exc:
+            raise EndToEndError("CLOUD_PLAN_BILLING_LAG_RECEIPT_INVALID") from exc
+        if finished <= _timestamp:
+            continue
+        duration = Decimal(str((finished - started).total_seconds()))
+        _require(
+            Decimal("0") <= duration <= Decimal(receipt.max_wall_minutes * 60),
+            "CLOUD_PLAN_BILLING_LAG_RECEIPT_INVALID",
+        )
+        observed_prices = tuple(
+            price
+            for price in (
+                receipt.selected_uninterruptable_price,
+                receipt.create_cost_per_hr,
+            )
+            if price is not None
+        )
+        hourly = max(observed_prices) if observed_prices else receipt.max_gpu_hourly_usd
+        compute = hourly * duration / Decimal(3600)
+        estimate = min(
+            receipt.max_spend_usd,
+            compute + CLOSED_POD_DISK_ALLOWANCE_USD,
+        )
+        key = operator_budget_linkage(receipt)
+        pending_by_key[key] = max(pending_by_key.get(key, Decimal("0")), estimate)
+        pending_compute_by_key[key] = max(
+            pending_compute_by_key.get(key, Decimal("0")), compute
+        )
+    lag_estimate = sum(pending_by_key.values(), Decimal("0"))
+    lag_compute = sum(pending_compute_by_key.values(), Decimal("0"))
+    corrected_unbilled = unbilled + lag_estimate
+    corrected_historical = actual + corrected_unbilled + active
+    corrected_remaining = max(
+        Decimal("0"), HISTORICAL_BUDGET_CAP_USD - corrected_historical
+    )
+    projected_total = corrected_historical + proposed
     _require(
-        active == 0 and unbilled == 0 and proposed <= remaining,
+        active == 0
+        and proposed <= corrected_remaining
+        and projected_total <= HISTORICAL_BUDGET_CAP_USD,
         "CLOUD_PLAN_BUDGET_BLOCKED",
     )
     return {
         "receipt_id": receipt_id,
         "actual_billed_usd": str(actual),
         "active_exposure_usd": str(active),
-        "conservative_unbilled_estimate_usd": str(unbilled),
+        "conservative_unbilled_estimate_usd": str(corrected_unbilled),
+        "snapshot_conservative_unbilled_estimate_usd": str(unbilled),
+        "billing_lag_attempt_count": len(pending_by_key),
+        "billing_lag_compute_estimate_usd": str(lag_compute),
+        "billing_lag_disk_allowance_usd": str(
+            CLOSED_POD_DISK_ALLOWANCE_USD * len(pending_by_key)
+        ),
+        "billing_lag_local_estimate_usd": str(lag_estimate),
         "proposed_run_max_usd": str(proposed),
-        "remaining_authorized_usd": str(remaining),
+        "snapshot_remaining_authorized_usd": str(remaining),
+        "remaining_authorized_usd": str(corrected_remaining),
+        "projected_total_usd": str(projected_total),
         "source_receipt_count": snapshot_source_count,
         "current_source_receipt_count": source_count,
         "post_snapshot_receipt_count": source_count - cast(int, snapshot_source_count),
@@ -931,6 +1006,7 @@ def training_plan(
     if str(source) not in sys.path:
         sys.path.insert(0, str(source))
     from atlaslens_api.phase3f.training import training_config_sha256  # noqa: PLC0415
+    from atlaslens_api.phase3f.pipeline import MODEL_SHA256  # noqa: PLC0415
     from atlaslens_api.phase3f.training_recovery import (  # noqa: PLC0415
         inspect_local_checkpoint,
     )
@@ -946,6 +1022,50 @@ def training_plan(
     blockers = list(cast(list[str], cloud["local_blockers"]))
     if checkpoint.present and not checkpoint.valid:
         blockers.append(checkpoint.failure_code or "TRAINING_CHECKPOINT_INVALID")
+    smoke_path = (
+        repository.resolve()
+        / ".local"
+        / "phase3f"
+        / "verification"
+        / run_id
+        / "retry-smoke.json"
+    )
+    smoke: dict[str, object] | None = None
+    if smoke_path.is_file() and not smoke_path.is_symlink():
+        smoke = _integrity_json(
+            smoke_path,
+            artifact="retry-smoke.json",
+            missing_code="LOCAL_CUDA_SMOKE_MISSING",
+            invalid_code="LOCAL_CUDA_SMOKE_INVALID",
+            max_bytes=1024 * 1024,
+        )
+        smoke_valid = (
+            smoke.get("schema") == "atlaslens-phase3f-local-cuda-smoke-v1"
+            and smoke.get("run_id") == run_id
+            and smoke.get("readiness_sha256") == cloud["readiness_sha256"]
+            and smoke.get("sealed_assets_sha256") == cloud["sealed_assets_sha256"]
+            and smoke.get("training_config_sha256") == config_sha256
+            and smoke.get("model_sha256") == MODEL_SHA256
+            and smoke.get("local_cuda_smoke_passed") is True
+            and smoke.get("mini_epoch_passed") is True
+            and smoke.get("checkpoint_roundtrip_passed") is True
+            and smoke.get("failure_salvage_passed") is True
+            and smoke.get("locked_holdout_access_count") == 0
+            and smoke.get("nonfinite_loss_count") == 0
+            and smoke.get("model_parameters_changed") is True
+            and smoke.get("network_calls") == 0
+            and smoke.get("runpod_api_calls") == 0
+            and smoke.get("mapillary_api_calls") == 0
+            and smoke.get("cloud_mutations") == 0
+            and smoke.get("production_training_state_advanced") is False
+            and smoke.get("production_configuration_changed") is False
+            and smoke.get("temporary_cleanup_verified") is True
+            and smoke.get("secrets_included") is False
+        )
+        if not smoke_valid:
+            blockers.append("LOCAL_CUDA_SMOKE_INVALID")
+    else:
+        blockers.append("LOCAL_CUDA_SMOKE_MISSING")
 
     latest_failure: dict[str, object] | None = None
     attempts = cloud_runtime.resolve() / "_training" / run_id / "attempts"
@@ -997,6 +1117,24 @@ def training_plan(
                 latest_failure.get("holdout_open_count") if latest_failure else None
             ),
         },
+        "local_cuda_smoke_passed": (
+            smoke.get("local_cuda_smoke_passed") if smoke is not None else False
+        ),
+        "mini_epoch_passed": smoke.get("mini_epoch_passed") if smoke else False,
+        "checkpoint_roundtrip_passed": (
+            smoke.get("checkpoint_roundtrip_passed") if smoke else False
+        ),
+        "failure_salvage_passed": (
+            smoke.get("failure_salvage_passed") if smoke else False
+        ),
+        "locked_holdout_access_count": (
+            smoke.get("locked_holdout_access_count") if smoke else None
+        ),
+        "nonfinite_loss_count": smoke.get("nonfinite_loss_count") if smoke else None,
+        "model_parameters_changed": (
+            smoke.get("model_parameters_changed") if smoke else False
+        ),
+        "local_cuda_smoke": smoke,
         "checkpoint": checkpoint.to_public_dict(),
         "retry_mode": (
             "resume" if checkpoint.valid else "blocked" if checkpoint.present else "fresh"
@@ -1007,6 +1145,20 @@ def training_plan(
         "estimated_maximum_new_cost_usd": str(proposed),
         "budget_projection": {
             "authoritative_snapshot": budget,
+            "actual_billed_usd": (
+                budget.get("actual_billed_usd") if budget is not None else None
+            ),
+            "conservative_unbilled_estimate_usd": (
+                budget.get("conservative_unbilled_estimate_usd")
+                if budget is not None
+                else None
+            ),
+            "proposed_run_max_usd": (
+                budget.get("proposed_run_max_usd") if budget is not None else None
+            ),
+            "projected_total_usd": (
+                budget.get("projected_total_usd") if budget is not None else None
+            ),
             "projected_remaining_authorized_usd_after_retry": projection,
         },
         "local_blockers": blockers,

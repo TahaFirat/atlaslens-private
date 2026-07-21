@@ -1906,3 +1906,22 @@
   become diagnosable, authorized retries can resume without double-counting a
   completed optimizer step, and cleanup remains mandatory.
 - Target phase: Product Phase 3F cloud training pilot.
+
+## 2026-07-21 — Phase 3F paid retries require local CUDA and billing-lag evidence
+
+- Context: The prior L4 attempt ended after 2,628 seconds without retained failure
+  evidence, while the latest provider billing snapshot preceded that attempt and
+  reported zero conservative unbilled cost.
+- Decision: Gate a paid training retry on a hash-bound, network-free local CUDA
+  smoke that exercises training, validation, full-state checkpoint restore, a mini
+  stage completion and real subprocess failure salvage. Reconcile any
+  cleanup-verified attempt finishing after the latest provider snapshot from its
+  receipt-bound timestamps and attested hourly price, then subtract provider billed
+  growth since that snapshot before retaining an unbilled amount.
+- Alternatives: Retry immediately; treat a request payload as compute evidence;
+  leave post-snapshot attempts at zero until provider billing catches up; add the
+  full local estimate without provider-increment deduplication.
+- Consequences: Retry readiness is demonstrated on the production training path,
+  locked holdout and cloud remain untouched, billing lag fails conservatively, and
+  a later provider charge cannot double-count the same attempt.
+- Target phase: Product Phase 3F cloud training pilot.

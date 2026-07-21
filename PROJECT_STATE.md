@@ -5,7 +5,7 @@ phase_status: in_progress
 last_verified_at: 2026-07-21T23:30:00+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: phase3f_remote_failure_salvage_resumable_checkpoint_trainingplan_ready
+product_phase_status: phase3f_local_cuda_retry_validation_and_billing_lag_ready
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -527,6 +527,21 @@ phase_3f_trainingplan_budget: actual_0_8581701778_remaining_9_1418298222_retry_m
 phase_3f_remote_recovery_tests: pass_359_phase3f
 phase_3f_remote_recovery_static: pass_ruff_strict_mypy19_powershell5_diff_secret_scan
 phase_3f_remote_recovery_live_actions: zero_resume_zero_execute_zero_network_zero_runpod_zero_mapillary_zero_cloud_mutation_zero_dataset_write
+phase_3f_local_cuda_smoke: pass_rtx4060_real_forward_loss_amp_backward_optimizer_scheduler_validation
+phase_3f_local_cuda_steps: initial12_new_process_resume3_total15_nonfinite0_parameters_changed
+phase_3f_local_cuda_checkpoint: pass_atomic_hash_full_model_optimizer_scheduler_scaler_rng_epoch_batch_step_restore
+phase_3f_local_cuda_mini_stage: pass_epoch_threshold_checkpoint_second_epoch_start_final_artifact_inventory
+phase_3f_local_cuda_failure_salvage: pass_real_subprocess_exit17_remote_training_nonfinite_loss_checkpoint_valid_redaction_cleanup
+phase_3f_local_cuda_resources: peak_cuda_bytes3521510400_temp_peak_bytes5976783012_temp_cleanup_true
+phase_3f_local_cuda_safety: locked_holdout0_network0_runpod0_mapillary0_cloud_mutations0_production_state_advance_false
+phase_3f_billing_lag_attempt: bound_duration2649_448722s_verified_l4_0_39_compute_0_28702361155_disk_allowance_0_10
+phase_3f_billing_lag_projection: actual_0_8581701778_unbilled_0_38702361155_proposed_3_projected_total_4_24519378935_remaining_after_retry_5_75480621065
+phase_3f_billing_lag_dedup: provider_increment_since_prior_snapshot_subtracted_before_unbilled_floor
+phase_3f_retry_trainingplan: pass_ready_true_blockers0_fresh_epoch0_step0_network0_mutations0
+phase_3f_retry_dataset_hashes: readiness_2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9_sealed_b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1_inventory_f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93
+phase_3f_retry_tests: pass_363_phase3f
+phase_3f_retry_static: pass_ruff_strict_mypy268_powershell5_diff_secret_scan
+phase_3f_retry_live_actions: local_cuda_only_zero_resume_zero_execute_zero_network_zero_runpod_zero_mapillary_zero_cloud_mutation_zero_dataset_write
 phase_3f_next_action: run_exact_resume_ce23_with_explicit_cloud_consent_after_review
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
@@ -582,6 +597,41 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F local CUDA retry validation and billing-lag reconciliation
+
+Status: **OFFLINE RETRY VALIDATION PASSED - LIVE RETRY NOT EXECUTED**.
+
+The production MegaLoc training path completed a real, isolated CUDA smoke on the
+local NVIDIA GeForce RTX 4060 Laptop GPU against the hash-bound 830-asset sealed
+corpus. It performed 12 optimizer steps, validation, an atomic full-state
+checkpoint, a new-process restore, and three additional optimizer steps. Model,
+optimizer, scheduler, AMP scaler, RNG, epoch, batch and step state restored; the
+trainable tensor hash changed, non-finite loss count remained zero, and peak CUDA
+allocation was 3,521,510,400 bytes. The mini-stage path completed threshold fitting,
+checkpoint/resume and final artifact inventory. A real child process then exited 17
+with typed `REMOTE_TRAINING_NONFINITE_LOSS`; progress, metrics, traceback and the
+latest valid checkpoint generation were salvaged with secret/IP redaction. The
+isolated temporary tree peaked at 5,976,783,012 bytes and was fully removed.
+Locked-holdout access, network calls, RunPod/Mapillary calls, cloud mutations and
+production state advancement were all zero.
+
+The last cleanup-verified L4 attempt finished after the latest provider billing
+snapshot. Its receipt-bound duration is 2,649.448722 seconds at the attested USD
+0.39/hour, producing USD 0.28702361155 compute plus the existing USD 0.10 closed-pod
+disk allowance. TrainingPlan therefore reports billed USD 0.8581701778,
+conservative unbilled USD 0.38702361155, proposed retry USD 3 and projected total
+USD 4.24519378935. A later provider increment is subtracted from the prior unbilled
+plus post-snapshot estimate, so the same attempt is not counted twice.
+
+The read-only live TrainingPlan reports `local_blockers=[]`,
+`ready_for_training_retry=true`, `retry_mode=fresh`, epoch/step `0/0`, and zero API
+calls or mutations. Readiness, sealed-assets and checksum-inventory SHA-256 values
+remain respectively `2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9`,
+`b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1`, and
+`f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93`.
+All 363 Phase 3F tests, Ruff, strict mypy over 268 sources, all five PowerShell
+parsers, diff validation and the high-confidence changed-file secret scan pass.
 
 ## Product Phase 3F remote-training failure salvage and resumable checkpoint
 

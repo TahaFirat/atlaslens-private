@@ -133,6 +133,9 @@ class BudgetReconciliation(NamedTuple):
     source_receipt_count: int
     duplicate_billing_record_count: int
     unrecognized_active_billing: bool
+    billing_lag_attempt_count: int
+    billing_lag_local_estimate_usd: Decimal
+    provider_increment_since_prior_snapshot_usd: Decimal
 
 
 class RemoteProcessResult(NamedTuple):
@@ -1134,17 +1137,80 @@ def _closed_operator_estimate(receipt: OperatorReceipt) -> Decimal:
         Decimal("0") <= duration_seconds <= Decimal(receipt.max_wall_minutes * 60),
         "HISTORICAL_RECEIPT_TIME_INVALID",
     )
-    hourly_candidates = [receipt.max_gpu_hourly_usd]
+    hourly_candidates: list[Decimal] = []
     if receipt.selected_uninterruptable_price is not None:
         hourly_candidates.append(receipt.selected_uninterruptable_price)
     if receipt.create_cost_per_hr is not None:
         hourly_candidates.append(receipt.create_cost_per_hr)
-    hourly = max(hourly_candidates)
+    hourly = max(hourly_candidates) if hourly_candidates else receipt.max_gpu_hourly_usd
     compute = hourly * duration_seconds / Decimal(3600)
     return min(
         receipt.max_spend_usd,
         compute + E2E_CLOSED_POD_DISK_ALLOWANCE_USD,
     )
+
+
+def _latest_prior_budget_snapshot(
+    runtime_root: Path,
+) -> tuple[datetime, Decimal, Decimal] | None:
+    root = runtime_root / "_budget" / "reconciliations"
+    if not root.exists():
+        return None
+    _require(root.is_dir() and not root.is_symlink(), "HISTORICAL_BUDGET_RECEIPT_INVALID")
+    candidates: list[tuple[datetime, Decimal, Decimal]] = []
+    for path in sorted(root.glob("*.json")):
+        _require(
+            path.is_file() and not path.is_symlink() and path.stat().st_size <= 1024 * 1024,
+            "HISTORICAL_BUDGET_RECEIPT_INVALID",
+        )
+        try:
+            row = json.loads(path.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SupervisorExecutionError("HISTORICAL_BUDGET_RECEIPT_INVALID") from exc
+        _require(
+            isinstance(row, dict)
+            and row.get("schema") == _BUDGET_RECONCILIATION_SCHEMA,
+            "HISTORICAL_BUDGET_RECEIPT_INVALID",
+        )
+        reconciled_at = row.get("reconciled_at")
+        _require(
+            isinstance(reconciled_at, str),
+            "HISTORICAL_BUDGET_RECEIPT_INVALID",
+        )
+        timestamp = _receipt_datetime(cast(str, reconciled_at))
+        actual = _budget_decimal(
+            row.get("actual_billed_usd"), "HISTORICAL_BUDGET_RECEIPT_INVALID"
+        )
+        unbilled = _budget_decimal(
+            row.get("conservative_unbilled_estimate_usd"),
+            "HISTORICAL_BUDGET_RECEIPT_INVALID",
+        )
+        candidates.append((timestamp, actual, unbilled))
+    return max(candidates, key=lambda item: item[0]) if candidates else None
+
+
+def _post_snapshot_closed_estimate(
+    runtime_root: Path,
+    *,
+    reconciled_at: datetime,
+) -> tuple[Decimal, int]:
+    _supervisor_paths, operator_paths = _receipt_paths(runtime_root)
+    estimates: dict[str, Decimal] = {}
+    for path in operator_paths:
+        receipt = read_operator_receipt(path)
+        if not (
+            receipt.cleanup_verified
+            and receipt.stage in {"failed", "terminated"}
+            and receipt.pod_id is not None
+            and _receipt_datetime(receipt.finished_at) > reconciled_at
+        ):
+            continue
+        key = _operator_receipt_key(receipt)
+        estimates[key] = max(
+            estimates.get(key, Decimal("0")),
+            _closed_operator_estimate(receipt),
+        )
+    return sum(estimates.values(), Decimal("0")), len(estimates)
 
 
 def _historical_budget_evidence(
@@ -1263,6 +1329,22 @@ def _budget_reconciliation(
         active_exposure += E2E_HISTORICAL_BUDGET_USD
     actual_billed = max(local_actual, provider_balance_delta)
     conservative_unbilled = max(Decimal("0"), local_conservative - actual_billed)
+    prior_snapshot = _latest_prior_budget_snapshot(runtime_root)
+    billing_lag_estimate = Decimal("0")
+    billing_lag_attempt_count = 0
+    provider_increment = Decimal("0")
+    if prior_snapshot is not None:
+        prior_at, prior_actual, prior_unbilled = prior_snapshot
+        billing_lag_estimate, billing_lag_attempt_count = _post_snapshot_closed_estimate(
+            runtime_root,
+            reconciled_at=prior_at,
+        )
+        provider_increment = max(Decimal("0"), actual_billed - prior_actual)
+        lag_unbilled = max(
+            Decimal("0"),
+            prior_unbilled + billing_lag_estimate - provider_increment,
+        )
+        conservative_unbilled = max(conservative_unbilled, lag_unbilled)
     historical_and_active = actual_billed + conservative_unbilled + active_exposure
     remaining = max(Decimal("0"), E2E_HISTORICAL_BUDGET_USD - historical_and_active)
     projected = historical_and_active + policy.absolute_usd
@@ -1293,6 +1375,9 @@ def _budget_reconciliation(
         source_receipt_count=source_receipt_count,
         duplicate_billing_record_count=duplicate_billing_records,
         unrecognized_active_billing=unrecognized_active_billing,
+        billing_lag_attempt_count=billing_lag_attempt_count,
+        billing_lag_local_estimate_usd=billing_lag_estimate,
+        provider_increment_since_prior_snapshot_usd=provider_increment,
     )
 
 
@@ -1324,6 +1409,13 @@ def _write_budget_reconciliation(
         ),
         "local_conservative_historical_usd": str(
             reconciliation.local_conservative_historical_usd
+        ),
+        "billing_lag_attempt_count": reconciliation.billing_lag_attempt_count,
+        "billing_lag_local_estimate_usd": str(
+            reconciliation.billing_lag_local_estimate_usd
+        ),
+        "provider_increment_since_prior_snapshot_usd": str(
+            reconciliation.provider_increment_since_prior_snapshot_usd
         ),
     }
     receipt_base: dict[str, object] = {
