@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Preflight", "CloudPlan", "TrainingPlan", "ReconcileLocalReceipts", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
+    [ValidateSet("Preflight", "CloudPlan", "RemoteEnvironmentPlan", "TrainingPlan", "ReconcileLocalReceipts", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
     [string]$Action,
     [ValidateNotNullOrEmpty()]
     [string]$RuntimeRoot = "D:\AtlasLensRuntime\phase3f-local",
@@ -253,6 +253,9 @@ switch ($Action) {
     }
     "CloudPlan" {
         Invoke-Control -ControlAction "cloud-plan"
+    }
+    "RemoteEnvironmentPlan" {
+        Invoke-Control -ControlAction "remote-environment-plan"
     }
     "TrainingPlan" {
         Invoke-Control -ControlAction "training-plan"

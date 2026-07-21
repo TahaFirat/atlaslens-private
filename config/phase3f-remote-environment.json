@@ -1,0 +1,40 @@
+{
+  "schema": "atlaslens-phase3f-remote-environment-contract-v1",
+  "image": "runpod/pytorch@sha256:60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f",
+  "platform": "linux_x86_64",
+  "python_requirement": "==3.12.*",
+  "torch_requirement": "==2.7.1",
+  "torchvision_requirement": "==0.22.1",
+  "cuda_requirement": "12.8",
+  "system_site_packages_required": true,
+  "official_index_url": "https://pypi.org/simple",
+  "bootstrap_timeout_seconds": 600,
+  "requirements_lock": "config/phase3f-training-requirements.lock",
+  "requirements_lock_sha256": "f7737cc780e84aa97f096b552835aa486ebf47f33451ef3f69004d31d4a45a47",
+  "forbidden_locked_distributions": [
+    "torch",
+    "torchvision"
+  ],
+  "checks": [
+    {"name": "base-torch", "module": "torch", "distribution": "torch", "required_version": "2.7.1", "source": "base_image"},
+    {"name": "base-torchvision", "module": "torchvision", "distribution": "torchvision", "required_version": "0.22.1", "source": "base_image"},
+    {"name": "locked-annotated-types", "module": "annotated_types", "distribution": "annotated-types", "required_version": "0.7.0", "source": "locked_project"},
+    {"name": "locked-anyio", "module": "anyio", "distribution": "anyio", "required_version": "4.14.1", "source": "locked_project"},
+    {"name": "locked-certifi", "module": "certifi", "distribution": "certifi", "required_version": "2026.6.17", "source": "locked_project"},
+    {"name": "locked-faiss", "module": "faiss", "distribution": "faiss-cpu", "required_version": "1.14.3", "source": "locked_project"},
+    {"name": "locked-h11", "module": "h11", "distribution": "h11", "required_version": "0.16.0", "source": "locked_project"},
+    {"name": "locked-httpcore", "module": "httpcore", "distribution": "httpcore", "required_version": "1.0.9", "source": "locked_project"},
+    {"name": "locked-httpx", "module": "httpx", "distribution": "httpx", "required_version": "0.28.1", "source": "locked_project"},
+    {"name": "locked-idna", "module": "idna", "distribution": "idna", "required_version": "3.18", "source": "locked_project"},
+    {"name": "locked-numpy", "module": "numpy", "distribution": "numpy", "required_version": "2.2.6", "source": "locked_project"},
+    {"name": "locked-packaging", "module": "packaging", "distribution": "packaging", "required_version": "26.2", "source": "locked_project"},
+    {"name": "locked-pillow", "module": "PIL", "distribution": "pillow", "required_version": "11.3.0", "source": "locked_project"},
+    {"name": "locked-pydantic-core", "module": "pydantic_core", "distribution": "pydantic-core", "required_version": "2.33.2", "source": "locked_project"},
+    {"name": "locked-pydantic", "module": "pydantic", "distribution": "pydantic", "required_version": "2.11.7", "source": "locked_project"},
+    {"name": "locked-safetensors", "module": "safetensors", "distribution": "safetensors", "required_version": "0.5.3", "source": "locked_project"},
+    {"name": "locked-typing-extensions", "module": "typing_extensions", "distribution": "typing-extensions", "required_version": "4.16.0", "source": "locked_project"},
+    {"name": "locked-typing-inspection", "module": "typing_inspection", "distribution": "typing-inspection", "required_version": "0.4.2", "source": "locked_project"},
+    {"name": "production-import-graph", "module": "atlaslens_api.phase3f.training", "distribution": null, "required_version": null, "source": "project_source"},
+    {"name": "megaloc-vendor-import", "module": "megaloc_model", "distribution": null, "required_version": null, "source": "vendor_source"}
+  ]
+}

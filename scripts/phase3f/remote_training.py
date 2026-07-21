@@ -24,6 +24,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--recovery-root", type=Path, required=True)
     parser.add_argument("--deadline-epoch", type=float, required=True)
     parser.add_argument("--timeout-seconds", type=int, required=True)
+    parser.add_argument("--environment-contract", type=Path, required=True)
+    parser.add_argument("--requirements-lock", type=Path, required=True)
+    parser.add_argument("--expected-contract-sha256", required=True)
+    parser.add_argument("--expected-lock-sha256", required=True)
+    parser.add_argument("--environment-receipt", type=Path, required=True)
     return parser
 
 
@@ -82,6 +87,16 @@ def main(argv: list[str] | None = None) -> int:
         str(args.recovery_root),
         "--deadline-epoch",
         str(args.deadline_epoch),
+        "--environment-contract",
+        str(args.environment_contract),
+        "--requirements-lock",
+        str(args.requirements_lock),
+        "--expected-contract-sha256",
+        args.expected_contract_sha256,
+        "--expected-lock-sha256",
+        args.expected_lock_sha256,
+        "--environment-receipt",
+        str(args.environment_receipt),
     ]
     started = time.monotonic()
     timed_out = False
@@ -91,7 +106,19 @@ def main(argv: list[str] | None = None) -> int:
             stdin=subprocess.DEVNULL,
             stdout=stdout,
             stderr=stderr,
-            env={key: value for key, value in os.environ.items() if key != "MAPILLARY_ACCESS_TOKEN"},
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key
+                not in {
+                    "MAPILLARY_ACCESS_TOKEN",
+                    "RUNPOD_API_KEY",
+                    "PYTHONHOME",
+                    "PYTHONPATH",
+                    "VIRTUAL_ENV",
+                    "CONDA_PREFIX",
+                }
+            },
         )
         try:
             return_code = process.wait(timeout=args.timeout_seconds)

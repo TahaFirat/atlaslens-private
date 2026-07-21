@@ -48,6 +48,14 @@ from atlaslens_api.phase3f.runpod import (  # noqa: E402
     RunPodV1Client,
     build_create_payload,
 )
+from atlaslens_api.phase3f.remote_environment import (  # noqa: E402
+    DEPENDENCY_FAILURE_CODES,
+    REMOTE_DEPENDENCY_REPORT_SCHEMA,
+    REMOTE_ENVIRONMENT_RECEIPT_SCHEMA,
+    RemoteEnvironmentError,
+    load_remote_environment_contract,
+    sha256_file as environment_sha256_file,
+)
 from atlaslens_api.phase3f.safety import (  # noqa: E402
     BudgetPolicy,
     Phase3FSafetyError,
@@ -104,6 +112,9 @@ E2E_CLOSED_POD_DISK_ALLOWANCE_USD = Decimal("0.10")
 MAX_HISTORICAL_RECEIPTS = 1_000
 CHECKPOINT_SYNC_SECONDS = 5 * 60
 FAILURE_SALVAGE_SECONDS = 5 * 60
+DEPENDENCY_BOOTSTRAP_SECONDS = 10 * 60
+REMOTE_ENVIRONMENT_CONTRACT = ROOT / "config" / "phase3f-remote-environment.json"
+REMOTE_REQUIREMENTS_LOCK = ROOT / "config" / "phase3f-training-requirements.lock"
 _SUPERVISOR_RECEIPT_SCHEMA = "atlaslens-phase3f-local-supervisor-receipt-v1"
 _BUDGET_RECONCILIATION_SCHEMA = "atlaslens-phase3f-budget-reconciliation-v1"
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -348,6 +359,18 @@ def _verify_local_readiness() -> None:
     _require_model_receipt(model_root / "receipt.json")
 
 
+def _remote_environment_hashes() -> tuple[str, str]:
+    contract_sha256 = environment_sha256_file(REMOTE_ENVIRONMENT_CONTRACT)
+    lock_sha256 = environment_sha256_file(REMOTE_REQUIREMENTS_LOCK)
+    load_remote_environment_contract(
+        REMOTE_ENVIRONMENT_CONTRACT,
+        REMOTE_REQUIREMENTS_LOCK,
+        expected_contract_sha256=contract_sha256,
+        expected_lock_sha256=lock_sha256,
+    )
+    return contract_sha256, lock_sha256
+
+
 def _require_safe_runtime_path(path: Path) -> Path:
     resolved = path.resolve()
     repository = ROOT.resolve()
@@ -495,6 +518,7 @@ def _run_watched(
     started: float,
     periodic: Callable[[], object] | None = None,
     periodic_seconds: int = CHECKPOINT_SYNC_SECONDS,
+    status_event: str = "PHASE3F_CLOUD_JOB_RUNNING",
 ) -> RemoteProcessResult:
     next_status = 0
     next_periodic = periodic_seconds
@@ -513,7 +537,7 @@ def _run_watched(
             elapsed = int(time.monotonic() - started)
             lease.assert_within_limits(elapsed_seconds=elapsed)
             if elapsed >= next_status:
-                _emit("PHASE3F_CLOUD_JOB_RUNNING", elapsed_seconds=elapsed)
+                _emit(status_event, elapsed_seconds=elapsed)
                 next_status = elapsed + 60
             process_elapsed = time.monotonic() - process_started
             if periodic is not None and process_elapsed >= next_periodic:
@@ -646,6 +670,93 @@ def _sync_remote_checkpoint(
         return False
 
 
+def _dependency_failure_evidence(files: tuple[Path, ...]) -> tuple[str, str]:
+    required = {
+        "failure.json",
+        "dependency-report.json",
+        "environment-receipt.json",
+        "bootstrap-stdout.log",
+        "bootstrap-stderr.log",
+        "checksum-inventory.json",
+    }
+    by_name = {path.name: path for path in files}
+    _require(required.issubset(by_name), "REMOTE_DEPENDENCY_SALVAGE_INCOMPLETE")
+    try:
+        failure = json.loads(by_name["failure.json"].read_text(encoding="utf-8"))
+        report = json.loads(
+            by_name["dependency-report.json"].read_text(encoding="utf-8")
+        )
+        receipt = json.loads(
+            by_name["environment-receipt.json"].read_text(encoding="utf-8")
+        )
+        inventory = json.loads(
+            by_name["checksum-inventory.json"].read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SupervisorExecutionError("REMOTE_DEPENDENCY_SALVAGE_INVALID") from exc
+    _require(
+        isinstance(failure, dict)
+        and isinstance(report, dict)
+        and isinstance(receipt, dict)
+        and isinstance(inventory, dict),
+        "REMOTE_DEPENDENCY_SALVAGE_INVALID",
+    )
+    exact = report.get("dependency_failure_code")
+    module = report.get("failed_module")
+    exception_class = report.get("failure_exception_class")
+    _require(
+        report.get("schema") == REMOTE_DEPENDENCY_REPORT_SCHEMA
+        and report.get("outcome") == "failed"
+        and exact in DEPENDENCY_FAILURE_CODES
+        and isinstance(module, str)
+        and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", module))
+        and isinstance(exception_class, str)
+        and bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,127}", exception_class))
+        and report.get("secrets_included") is False
+        and receipt.get("schema") == REMOTE_ENVIRONMENT_RECEIPT_SCHEMA
+        and receipt.get("outcome") == "failed"
+        and receipt.get("dependency_failure_code") == exact
+        and receipt.get("failed_module") == module
+        and receipt.get("secrets_included") is False
+        and failure.get("failure_code") == "REMOTE_TRAINING_DEPENDENCY_FAILED"
+        and failure.get("dependency_failure_code") == exact
+        and failure.get("failed_module") == module
+        and failure.get("secrets_included") is False,
+        "REMOTE_DEPENDENCY_SALVAGE_INVALID",
+    )
+    rows = inventory.get("files")
+    _require(
+        inventory.get("schema")
+        == "atlaslens-phase3f-bootstrap-checksum-inventory-v1"
+        and isinstance(rows, list)
+        and inventory.get("file_count") == len(rows)
+        and inventory.get("secrets_included") is False,
+        "REMOTE_DEPENDENCY_SALVAGE_INVALID",
+    )
+    inventory_names = {row.get("name") for row in rows if isinstance(row, dict)}
+    _require(
+        inventory_names == set(by_name) - {"checksum-inventory.json"},
+        "REMOTE_DEPENDENCY_SALVAGE_INVALID",
+    )
+    for row in rows:
+        _require(isinstance(row, dict), "REMOTE_DEPENDENCY_SALVAGE_INVALID")
+        name = row.get("name")
+        size = row.get("size_bytes")
+        sha256 = row.get("sha256")
+        _require(
+            isinstance(name, str)
+            and name in by_name
+            and isinstance(size, int)
+            and not isinstance(size, bool)
+            and by_name[name].stat().st_size == size
+            and isinstance(sha256, str)
+            and bool(_SHA256.fullmatch(sha256))
+            and sha256_path(by_name[name], max_bytes=1024 * 1024) == sha256,
+            "REMOTE_DEPENDENCY_SALVAGE_INVALID",
+        )
+    return cast(str, exact), cast(str, module)
+
+
 def _salvage_remote_failure(
     ssh: list[str],
     scp: list[str],
@@ -670,6 +781,8 @@ def _salvage_remote_failure(
     checkpoint_present = False
     checkpoint_sha256: str | None = None
     failure_code = "REMOTE_TRAINING_UNKNOWN_FAILURE"
+    dependency_failure_code: str | None = None
+    dependency_failed_module: str | None = None
     salvage_failure_code: str | None = None
     remote_exit_code: int | None = (
         process_result.return_code if process_result.return_code >= 0 else None
@@ -719,20 +832,23 @@ def _salvage_remote_failure(
                 failure_code = candidate
             exit_candidate = failure.get("process_exit_code")
             signal_candidate = failure.get("process_signal")
-            remote_exit_code = (
-                exit_candidate
-                if isinstance(exit_candidate, int)
+            if (
+                isinstance(exit_candidate, int)
                 and not isinstance(exit_candidate, bool)
                 and 0 <= exit_candidate <= 255
-                else None
-            )
-            remote_signal = (
-                signal_candidate
-                if isinstance(signal_candidate, int)
+            ):
+                remote_exit_code = exit_candidate
+            if (
+                isinstance(signal_candidate, int)
                 and not isinstance(signal_candidate, bool)
                 and 1 <= signal_candidate <= 64
-                else None
+            ):
+                remote_signal = signal_candidate
+        if failure_code == "REMOTE_TRAINING_DEPENDENCY_FAILED":
+            dependency_failure_code, dependency_failed_module = (
+                _dependency_failure_evidence(files)
             )
+            failure_code = dependency_failure_code
         checkpoint_synced = _sync_remote_checkpoint(
             ssh,
             scp,
@@ -764,6 +880,7 @@ def _salvage_remote_failure(
         json.JSONDecodeError,
         SupervisorExecutionError,
         TrainingRecoveryError,
+        RemoteEnvironmentError,
     ) as exc:
         if isinstance(exc, SupervisorExecutionError) and exc.code == "REMOTE_TRAINING_SALVAGE_TIMEOUT":
             salvage_failure_code = exc.code
@@ -783,6 +900,8 @@ def _salvage_remote_failure(
                 "checkpoint_present": checkpoint_present,
                 "checkpoint_sha256": checkpoint_sha256,
                 "failure_code": failure_code,
+                "dependency_failure_code": dependency_failure_code,
+                "dependency_failed_module": dependency_failed_module,
                 "salvage_failure_code": salvage_failure_code,
                 "remote_process_exit_code": remote_exit_code,
                 "remote_process_signal": remote_signal,
@@ -820,6 +939,8 @@ def _operation(
     readiness_sha256: str | None = None,
     sealed_assets_sha256: str | None = None,
     config_sha256: str | None = None,
+    environment_contract_sha256: str,
+    dependency_lock_sha256: str,
 ) -> dict[str, object]:
     bound_receipt = read_operator_receipt(operator_receipt_path)
     _require(
@@ -872,15 +993,15 @@ def _operation(
         )
         lease.assert_within_limits(elapsed_seconds=int(time.monotonic() - started))
     _emit("PHASE3F_TRANSFER_VERIFIED", run_id=run_id)
-    dependencies = (
-        "httpx==0.28.1 pydantic==2.11.7 pillow==11.3.0 "
-        "numpy==2.2.6 safetensors==0.5.3 faiss-cpu==1.14.3"
-    )
     deadline = int(time.time() + remote_job_seconds)
+    remote_contract = "/workspace/phase3f-repo/config/phase3f-remote-environment.json"
+    remote_lock = "/workspace/phase3f-repo/config/phase3f-training-requirements.lock"
+    remote_venv = "/workspace/phase3f-venv"
+    remote_python = f"{remote_venv}/bin/python"
     job_command = (
         (
             "ATLASLENS_PHASE3F_CHILD=training_job.py "
-            "python /workspace/phase3f-repo/scripts/phase3f/remote_training.py "
+            f"{remote_python} /workspace/phase3f-repo/scripts/phase3f/remote_training.py "
             "--repository-root /workspace/phase3f-repo "
             f"--run-id {run_id} "
             "--sealed-root /workspace/phase3f-dataset/sealed-acquisition "
@@ -889,13 +1010,19 @@ def _operation(
             "--work-root /workspace/phase3f-work "
             "--output-root /workspace/phase3f-output "
             "--recovery-root /workspace/phase3f-work/recovery "
+            f"--environment-contract {remote_contract} "
+            f"--requirements-lock {remote_lock} "
+            f"--expected-contract-sha256 {environment_contract_sha256} "
+            f"--expected-lock-sha256 {dependency_lock_sha256} "
+            "--environment-receipt /workspace/phase3f-work/recovery/environment-receipt.json "
             f"--deadline-epoch {deadline} "
             f"--timeout-seconds {remote_job_seconds}"
         )
         if training_dataset is not None
         else (
             "timeout --signal=TERM "
-            f"{remote_job_seconds} python /workspace/phase3f-repo/scripts/phase3f/cloud_job.py "
+            f"{remote_job_seconds} {remote_python} "
+            "/workspace/phase3f-repo/scripts/phase3f/cloud_job.py "
             "--repository-root /workspace/phase3f-repo "
             f"--run-id {run_id} "
             "--model /workspace/phase3f-transfer/model.safetensors "
@@ -905,52 +1032,109 @@ def _operation(
             f"--deadline-epoch {deadline}"
         )
     )
-    preparation = [
-        "rm -rf /workspace/phase3f-repo /workspace/phase3f-output /workspace/phase3f-work /workspace/phase3f-dataset",
+    source_preparation = [
+        "rm -rf /workspace/phase3f-repo /workspace/phase3f-output /workspace/phase3f-work "
+        "/workspace/phase3f-dataset /workspace/phase3f-venv",
         "mkdir -p /workspace/phase3f-repo /workspace/phase3f-work/recovery",
         "tar -xf /workspace/phase3f-transfer/source.tar -C /workspace/phase3f-repo",
-        (
-            f"python -m pip install --disable-pip-version-check --no-cache-dir {dependencies} "
-            ">/dev/null 2>/dev/null || (printf '%s\\n' "
-            "'{\"schema\":\"atlaslens-phase3f-remote-training-failure-v1\","
-            "\"failure_code\":\"REMOTE_TRAINING_DEPENDENCY_FAILED\","
-            "\"stdout_tail\":[],\"stderr_tail\":[],\"secrets_included\":false}' "
-            ">/workspace/phase3f-work/recovery/failure.json; exit 91)"
-        ),
     ]
+    bootstrap_command = (
+        "unset MAPILLARY_ACCESS_TOKEN RUNPOD_API_KEY; "
+        f"timeout --kill-after=10s --signal=TERM {DEPENDENCY_BOOTSTRAP_SECONDS + 30} "
+        "python /workspace/phase3f-repo/scripts/phase3f/remote_bootstrap.py "
+        "--repository-root /workspace/phase3f-repo "
+        f"--contract {remote_contract} "
+        f"--requirements-lock {remote_lock} "
+        f"--expected-contract-sha256 {environment_contract_sha256} "
+        f"--expected-lock-sha256 {dependency_lock_sha256} "
+        "--vendor-root /workspace/phase3f-transfer/vendor "
+        f"--venv-root {remote_venv} "
+        "--recovery-root /workspace/phase3f-work/recovery "
+        f"--timeout-seconds {DEPENDENCY_BOOTSTRAP_SECONDS}"
+    )
+    bootstrap_remote_command = " && ".join((*source_preparation, bootstrap_command))
+    training_preparation: list[str] = []
     if training_dataset is not None:
-        preparation.extend(
+        training_preparation.extend(
             (
                 "mkdir -p /workspace/phase3f-dataset",
                 "tar -xf /workspace/phase3f-transfer/sealed-acquisition.tar -C /workspace/phase3f-dataset",
-                "unset MAPILLARY_ACCESS_TOKEN",
+                "unset MAPILLARY_ACCESS_TOKEN RUNPOD_API_KEY",
             )
         )
         if resume_archive is not None:
-            preparation.append(
+            training_preparation.append(
                 "mkdir -p /workspace/phase3f-work/training-checkpoint "
                 "&& tar -xf /workspace/phase3f-transfer/resume-checkpoint.tar "
                 "-C /workspace/phase3f-work/training-checkpoint"
             )
-    prepared = " && ".join(preparation)
+    prepared = " && ".join(training_preparation)
     remote_command = (
-        f"{prepared} && {job_command}; phase3f_rc=$?; "
+        f"{prepared + ' && ' if prepared else ''}{job_command}; phase3f_rc=$?; "
         "if [ $phase3f_rc -eq 0 ]; then "
         "tar -C /workspace -cf /workspace/phase3f-transfer/output.tar phase3f-output; "
         "fi; exit $phase3f_rc"
     )
-    try:
-        _emit("PHASE3F_CLOUD_JOB_STARTED", run_id=run_id)
-        checkpoint_enabled = all(
-            value is not None
-            for value in (
-                checkpoint_store,
-                recovery_attempt_root,
-                readiness_sha256,
-                sealed_assets_sha256,
-                config_sha256,
+    checkpoint_enabled = all(
+        value is not None
+        for value in (
+            checkpoint_store,
+            recovery_attempt_root,
+            readiness_sha256,
+            sealed_assets_sha256,
+            config_sha256,
+        )
+    )
+
+    def salvage_failure(process_result: RemoteProcessResult) -> SalvageResult:
+        return (
+            _salvage_remote_failure(
+                ssh,
+                scp,
+                public_ip=connection.public_ip,
+                remote_transfer=remote_transfer,
+                attempt_root=cast(Path, recovery_attempt_root),
+                checkpoint_store=cast(Path, checkpoint_store),
+                run_id=run_id,
+                readiness_sha256=cast(str, readiness_sha256),
+                sealed_assets_sha256=cast(str, sealed_assets_sha256),
+                config_sha256=cast(str, config_sha256),
+                process_result=process_result,
+                timeout_seconds=min(FAILURE_SALVAGE_SECONDS, max(1.0, remaining())),
+            )
+            if checkpoint_enabled
+            else SalvageResult(
+                True, False, 0, False, None, "REMOTE_TRAINING_UNKNOWN_FAILURE"
             )
         )
+
+    try:
+        _emit(
+            "PHASE3F_REMOTE_BOOTSTRAP_STARTED",
+            run_id=run_id,
+            timeout_seconds=DEPENDENCY_BOOTSTRAP_SECONDS,
+            cloud_mutations=0,
+        )
+        bootstrap_result = _run_watched(
+            [*ssh, "bash", "-lc", shlex.quote(bootstrap_remote_command)],
+            lease=lease,
+            started=started,
+            status_event="PHASE3F_REMOTE_BOOTSTRAP_RUNNING",
+            periodic_seconds=60,
+        )
+        if bootstrap_result is None:
+            bootstrap_result = RemoteProcessResult(0, 0.0)
+        if bootstrap_result.return_code != 0:
+            raise SupervisorExecutionError(
+                salvage_failure(bootstrap_result).failure_code
+            )
+        _emit(
+            "PHASE3F_REMOTE_DEPENDENCIES_READY",
+            run_id=run_id,
+            environment_contract_sha256=environment_contract_sha256,
+            dependency_lock_sha256=dependency_lock_sha256,
+        )
+        _emit("PHASE3F_CLOUD_JOB_STARTED", run_id=run_id)
         partial = (
             cast(Path, recovery_attempt_root).parent / ".checkpoint-sync.partial"
             if checkpoint_enabled
@@ -982,25 +1166,7 @@ def _operation(
         if result is None:  # Backward-compatible test seam for the command runner.
             result = RemoteProcessResult(0, 0.0)
         if result.return_code != 0:
-            salvage = (
-                _salvage_remote_failure(
-                    ssh,
-                    scp,
-                    public_ip=connection.public_ip,
-                    remote_transfer=remote_transfer,
-                    attempt_root=cast(Path, recovery_attempt_root),
-                    checkpoint_store=cast(Path, checkpoint_store),
-                    run_id=run_id,
-                    readiness_sha256=cast(str, readiness_sha256),
-                    sealed_assets_sha256=cast(str, sealed_assets_sha256),
-                    config_sha256=cast(str, config_sha256),
-                    process_result=result,
-                    timeout_seconds=min(FAILURE_SALVAGE_SECONDS, max(1.0, remaining())),
-                )
-                if checkpoint_enabled
-                else SalvageResult(True, False, 0, False, None, "REMOTE_TRAINING_UNKNOWN_FAILURE")
-            )
-            raise SupervisorExecutionError(salvage.failure_code)
+            raise SupervisorExecutionError(salvage_failure(result).failure_code)
         _run_command(
             [
                 *scp,
@@ -1013,7 +1179,7 @@ def _operation(
     finally:
         cleanup = (
             "rm -rf /workspace/phase3f-work /workspace/phase3f-output /workspace/phase3f-dataset "
-            "/workspace/phase3f-repo /workspace/phase3f-transfer"
+            "/workspace/phase3f-repo /workspace/phase3f-transfer /workspace/phase3f-venv"
         )
         try:
             _run_command([*ssh, cleanup], timeout_seconds=min(60.0, max(1.0, remaining())))
@@ -1913,10 +2079,15 @@ def _run_execute(
     readiness_sha256: str | None = None
     sealed_assets_sha256: str | None = None
     config_sha256: str | None = None
+    environment_contract_sha256: str | None = None
+    dependency_lock_sha256: str | None = None
     try:
         _disk_gate()
         head, tracked = _preflight_repository()
         _verify_local_readiness()
+        environment_contract_sha256, dependency_lock_sha256 = (
+            _remote_environment_hashes()
+        )
         if args.sealed_acquisition is not None:
             billing_config = RunPodConfig(
                 image_name=IMAGE,
@@ -1998,7 +2169,11 @@ def _run_execute(
                 args.sealed_acquisition / "sealed-assets.json",
                 max_bytes=64 * 1024 * 1024,
             )
-            config_sha256 = training_config_sha256(seed=20260720, max_epochs=8)
+            config_sha256 = training_config_sha256(
+                seed=20260720,
+                max_epochs=8,
+                environment_contract_sha256=environment_contract_sha256,
+            )
             checkpoint_store = args.runtime_root / "_training" / run_id / "checkpoints"
             recovery_attempt_root = (
                 args.runtime_root / "_training" / run_id / "attempts" / attempt_id
@@ -2110,6 +2285,8 @@ def _run_execute(
                         readiness_sha256=readiness_sha256,
                         sealed_assets_sha256=sealed_assets_sha256,
                         config_sha256=config_sha256,
+                        environment_contract_sha256=environment_contract_sha256,
+                        dependency_lock_sha256=dependency_lock_sha256,
                     ),
                 )
             except (Phase3FSafetyError, RunPodAPIError) as exc:
@@ -2239,6 +2416,7 @@ def _run_execute(
         RunPodAPIError,
         SupervisorExecutionError,
         TrainingRecoveryError,
+        RemoteEnvironmentError,
     ) as exc:
         if owns_operator_receipt:
             cleanup_verified = bool(

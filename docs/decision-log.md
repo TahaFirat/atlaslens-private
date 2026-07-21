@@ -1925,3 +1925,23 @@
   locked holdout and cloud remain untouched, billing lag fails conservatively, and
   a later provider charge cannot double-count the same attempt.
 - Target phase: Product Phase 3F cloud training pilot.
+
+## 2026-07-22 - Phase 3F remote training uses a hash-bound project venv
+
+- Context: The paid RunPod attempt used bare system Python and a best-effort pip
+  predicate that suppressed both output streams, so dependency failure retained no
+  package or exception evidence.
+- Decision: Preserve the digest-pinned image's CUDA Torch/torchvision installation,
+  create one `--system-site-packages` project venv, install only the exact
+  Linux-x86_64 project lock with hashes from the official index, and require the
+  same interpreter to pass typed import/version/vendor/CUDA ABI preflight before
+  dataset extraction, model load or training. Bind checkpoint configuration to the
+  environment contract hash and require complete redacted dependency salvage.
+- Alternatives: Retry the unpinned command; install a second Torch stack; bake or
+  download a new large image before diagnosis; infer a missing package from an
+  empty historical log.
+- Consequences: The image Torch remains authoritative, project dependencies are
+  reproducible and bounded, future failures identify a safe module and exception
+  class before training cost accrues, and Linux/CUDA compatibility still requires
+  the first live bootstrap on the exact image digest.
+- Target phase: Product Phase 3F cloud training pilot.

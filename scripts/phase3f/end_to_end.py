@@ -994,6 +994,86 @@ def cloud_plan(
     }
 
 
+def remote_environment_plan(repository: Path) -> dict[str, object]:
+    """Validate the paid-runtime dependency contract without network or mutation."""
+    resolved = repository.resolve()
+    source = resolved / "services" / "api" / "src"
+    _require(source.is_dir() and not source.is_symlink(), "PHASE3F_SOURCE_ROOT_INVALID")
+    if str(source) not in sys.path:
+        sys.path.insert(0, str(source))
+    from atlaslens_api.phase3f.remote_environment import (  # noqa: PLC0415
+        REMOTE_ENVIRONMENT_PLAN_SCHEMA,
+        evaluate_remote_environment,
+        load_remote_environment_contract,
+        sha256_file,
+    )
+
+    contract_path = resolved / "config" / "phase3f-remote-environment.json"
+    lock_path = resolved / "config" / "phase3f-training-requirements.lock"
+    contract_sha256 = sha256_file(contract_path)
+    lock_sha256 = sha256_file(lock_path)
+    contract = load_remote_environment_contract(
+        contract_path,
+        lock_path,
+        expected_contract_sha256=contract_sha256,
+        expected_lock_sha256=lock_sha256,
+    )
+    local = evaluate_remote_environment(
+        contract,
+        expected_interpreter_class="project_venv",
+        vendor_root=resolved / ".local" / "vendor" / "megaloc",
+        stage="project",
+    )
+    docker = shutil.which("docker")
+    linux_status = "not_verified_cache_absent"
+    if docker is not None:
+        try:
+            inspected = subprocess.run(
+                [docker, "image", "inspect", contract.image],
+                cwd=resolved,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=30,
+            )
+            if inspected.returncode == 0:
+                linux_status = "cached_image_present_live_contract_not_executed"
+        except (OSError, subprocess.TimeoutExpired):
+            linux_status = "not_verified_cache_unavailable"
+    blockers = [] if local.passed else [
+        local.failure_code or "REMOTE_DEPENDENCY_IMPORT_FAILED"
+    ]
+    return {
+        "schema": REMOTE_ENVIRONMENT_PLAN_SCHEMA,
+        "action": "remote-environment-plan",
+        "image": contract.image,
+        "python_requirement": "==3.12.*",
+        "torch_requirement": "==2.7.1",
+        "torchvision_requirement": "==0.22.1",
+        "cuda_requirement": contract.cuda_requirement,
+        "environment_contract_sha256": contract.contract_sha256,
+        "dependency_lock_sha256": contract.requirements_lock_sha256,
+        "module_count": len(contract.checks),
+        "local_dependency_check_count": local.report["check_count"],
+        "all_local_imports_passed": local.passed,
+        "linux_verification_status": linux_status,
+        "bootstrap_required": True,
+        "estimated_bootstrap_timeout_seconds": contract.bootstrap_timeout_seconds,
+        "interpreter_class": "project_venv",
+        "system_site_packages": True,
+        "official_package_index": contract.official_index_url,
+        "model_downloads": 0,
+        "dataset_downloads": 0,
+        "local_blockers": blockers,
+        "ready_for_live_bootstrap": not blockers,
+        "runpod_api_calls": 0,
+        "cloud_mutations": 0,
+        "network_calls": 0,
+        "secrets_included": False,
+    }
+
+
 def training_plan(
     repository: Path,
     runtime_root: Path,
@@ -1011,7 +1091,16 @@ def training_plan(
         inspect_local_checkpoint,
     )
 
-    config_sha256 = training_config_sha256(seed=20260720, max_epochs=8)
+    remote_environment = remote_environment_plan(repository)
+    environment_contract_sha256 = cast(
+        str, remote_environment["environment_contract_sha256"]
+    )
+    config_sha256 = training_config_sha256(
+        seed=20260720,
+        max_epochs=8,
+        environment_contract_sha256=environment_contract_sha256,
+    )
+    smoke_config_sha256 = training_config_sha256(seed=20260720, max_epochs=8)
     checkpoint = inspect_local_checkpoint(
         cloud_runtime.resolve() / "_training" / run_id / "checkpoints",
         expected_run_id=run_id,
@@ -1020,6 +1109,7 @@ def training_plan(
         expected_training_config_sha256=config_sha256,
     )
     blockers = list(cast(list[str], cloud["local_blockers"]))
+    blockers.extend(cast(list[str], remote_environment["local_blockers"]))
     if checkpoint.present and not checkpoint.valid:
         blockers.append(checkpoint.failure_code or "TRAINING_CHECKPOINT_INVALID")
     smoke_path = (
@@ -1044,7 +1134,7 @@ def training_plan(
             and smoke.get("run_id") == run_id
             and smoke.get("readiness_sha256") == cloud["readiness_sha256"]
             and smoke.get("sealed_assets_sha256") == cloud["sealed_assets_sha256"]
-            and smoke.get("training_config_sha256") == config_sha256
+            and smoke.get("training_config_sha256") == smoke_config_sha256
             and smoke.get("model_sha256") == MODEL_SHA256
             and smoke.get("local_cuda_smoke_passed") is True
             and smoke.get("mini_epoch_passed") is True
@@ -1099,6 +1189,10 @@ def training_plan(
         "readiness_sha256": cloud["readiness_sha256"],
         "sealed_assets_sha256": cloud["sealed_assets_sha256"],
         "training_config_sha256": config_sha256,
+        "local_smoke_training_config_sha256": smoke_config_sha256,
+        "environment_contract_sha256": environment_contract_sha256,
+        "dependency_lock_sha256": remote_environment["dependency_lock_sha256"],
+        "remote_environment_plan": remote_environment,
         "failure_forensic": {
             "failure_code": failure_code,
             "evidence_sufficient": latest_failure is not None,
@@ -1235,6 +1329,7 @@ def _parser() -> argparse.ArgumentParser:
             "readiness",
             "resume-plan",
             "cloud-plan",
+            "remote-environment-plan",
             "training-plan",
             "reconcile-local-receipts",
             "status",
@@ -1267,6 +1362,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.runtime_root,
                 args.cloud_runtime_root,
             )
+        elif args.action == "remote-environment-plan":
+            result = remote_environment_plan(args.repository_root)
         elif args.action == "training-plan":
             _require(args.cloud_runtime_root is not None, "CLOUD_RUNTIME_ROOT_MISSING")
             result = training_plan(

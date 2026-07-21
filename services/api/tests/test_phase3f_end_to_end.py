@@ -487,6 +487,7 @@ def test_training_and_operator_contracts_are_real_and_secret_safe() -> None:
     for action in (
         "Preflight",
         "CloudPlan",
+        "RemoteEnvironmentPlan",
         "ReconcileLocalReceipts",
         "Execute",
         "Status",
@@ -690,6 +691,15 @@ def test_training_plan_requires_integrity_bound_local_cuda_smoke(
         },
     }
     monkeypatch.setattr(control, "cloud_plan", lambda *_args: cloud)
+    monkeypatch.setattr(
+        control,
+        "remote_environment_plan",
+        lambda _repository: {
+            "environment_contract_sha256": "3" * 64,
+            "dependency_lock_sha256": "4" * 64,
+            "local_blockers": [],
+        },
+    )
     smoke_path = (
         repository
         / ".local"

@@ -364,10 +364,16 @@ def test_ready_allocation_advances_to_transfer_and_training_start(
         *,
         lease: RunPodLease,
         started: float,
+        status_event: str = "PHASE3F_CLOUD_JOB_RUNNING",
+        **_kwargs: object,
     ) -> None:
         assert lease.pod.pod_id == "phase3f-pod"
         assert started > 0
-        transitions.append("training_started")
+        transitions.append(
+            "bootstrap_started"
+            if status_event == "PHASE3F_REMOTE_BOOTSTRAP_RUNNING"
+            else "training_started"
+        )
         watched.append(arguments)
 
     monkeypatch.setattr(module, "_run_command", fake_run_command)
@@ -387,16 +393,27 @@ def test_ready_allocation_advances_to_transfer_and_training_start(
         operator_receipt_path=receipt_path,
         remote_job_seconds=60,
         training_dataset=tmp_path / "sealed-acquisition.tar",
+        environment_contract_sha256="c" * 64,
+        dependency_lock_sha256="d" * 64,
     )
 
     assert transitions.index("connectivity_ready") < transitions.index("transfer_command")
     assert transitions.index("transfer_command") < transitions.index("training_started")
-    assert len(watched) == 1
-    assert "training_job.py" in " ".join(watched[0])
+    assert len(watched) == 2
+    assert "remote_bootstrap.py" in " ".join(watched[0])
+    assert "training_job.py" in " ".join(watched[1])
+    assert "phase3f-venv/bin/python" in " ".join(watched[1])
     assert result["gpu"] == "NVIDIA L4"
     events = [json.loads(line)["event"] for line in capsys.readouterr().out.splitlines()]
     assert events.index("PHASE3F_SSH_READY") < events.index("PHASE3F_TRANSFER_STARTED")
-    assert events.index("PHASE3F_TRANSFER_VERIFIED") < events.index("PHASE3F_CLOUD_JOB_STARTED")
+    assert events.index("PHASE3F_TRANSFER_VERIFIED") < events.index(
+        "PHASE3F_REMOTE_BOOTSTRAP_STARTED"
+    )
+    assert events.index("PHASE3F_REMOTE_DEPENDENCIES_READY") < events.index(
+        "PHASE3F_CLOUD_JOB_STARTED"
+    )
+    assert events.count("PHASE3F_REMOTE_BOOTSTRAP_STARTED") == 1
+    assert events.count("PHASE3F_REMOTE_DEPENDENCIES_READY") == 1
 
 
 def test_legacy_operator_receipt_remains_readable(tmp_path: Path) -> None:

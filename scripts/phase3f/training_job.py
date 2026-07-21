@@ -10,21 +10,33 @@ import shutil
 import sys
 import traceback
 from pathlib import Path
+from typing import Literal, cast
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="atlaslens-phase3f-training-job")
     parser.add_argument("--repository-root", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--sealed-root", type=Path, required=True)
-    parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--vendor-root", type=Path, required=True)
-    parser.add_argument("--work-root", type=Path, required=True)
-    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--run-id")
+    parser.add_argument("--sealed-root", type=Path)
+    parser.add_argument("--model", type=Path)
+    parser.add_argument("--vendor-root", type=Path)
+    parser.add_argument("--work-root", type=Path)
+    parser.add_argument("--output-root", type=Path)
     parser.add_argument("--recovery-root", type=Path)
-    parser.add_argument("--deadline-epoch", type=float, required=True)
+    parser.add_argument("--deadline-epoch", type=float)
     parser.add_argument("--max-epochs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20260720)
+    parser.add_argument("--dependency-preflight-only", action="store_true")
+    parser.add_argument(
+        "--dependency-preflight-scope",
+        choices=("project", "full"),
+        default="full",
+    )
+    parser.add_argument("--environment-contract", type=Path)
+    parser.add_argument("--requirements-lock", type=Path)
+    parser.add_argument("--expected-contract-sha256")
+    parser.add_argument("--expected-lock-sha256")
+    parser.add_argument("--environment-receipt", type=Path)
     return parser
 
 
@@ -35,6 +47,85 @@ def _safe_code(exc: BaseException) -> str:
     return "PHASE3F_TRAINING_JOB_FAILED"
 
 
+def _dependency_preflight(args: argparse.Namespace) -> int:
+    from atlaslens_api.phase3f.remote_environment import (  # noqa: PLC0415
+        REMOTE_DEPENDENCY_REPORT_SCHEMA,
+        REMOTE_ENVIRONMENT_RECEIPT_SCHEMA,
+        RemoteEnvironmentError,
+        evaluate_remote_environment,
+        load_remote_environment_contract,
+    )
+    from atlaslens_api.phase3f.training_recovery import atomic_json  # noqa: PLC0415
+
+    if any(
+        value is None
+        for value in (
+            args.vendor_root,
+            args.recovery_root,
+            args.environment_contract,
+            args.requirements_lock,
+            args.expected_contract_sha256,
+            args.expected_lock_sha256,
+        )
+    ):
+        print("REMOTE_DEPENDENCY_LOCK_MISMATCH")
+        return 92
+    recovery_root = cast(Path, args.recovery_root)
+    recovery_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        contract = load_remote_environment_contract(
+            cast(Path, args.environment_contract),
+            cast(Path, args.requirements_lock),
+            expected_contract_sha256=cast(str, args.expected_contract_sha256),
+            expected_lock_sha256=cast(str, args.expected_lock_sha256),
+        )
+        preflight_stage: Literal["project", "full"] = (
+            "project" if args.dependency_preflight_scope == "project" else "full"
+        )
+        result = evaluate_remote_environment(
+            contract,
+            expected_interpreter_class="project_venv",
+            vendor_root=cast(Path, args.vendor_root),
+            stage=preflight_stage,
+        )
+        report = result.report
+        receipt = result.environment_receipt
+        failure_code = result.failure_code
+    except RemoteEnvironmentError as exc:
+        failure_code = exc.code
+        report = {
+            "schema": REMOTE_DEPENDENCY_REPORT_SCHEMA,
+            "outcome": "failed",
+            "dependency_failure_code": failure_code,
+            "failed_module": "dependency-lock",
+            "failure_exception_class": type(exc).__name__,
+            "checks": [],
+            "check_count": 0,
+            "secrets_included": False,
+        }
+        receipt = {
+            "schema": REMOTE_ENVIRONMENT_RECEIPT_SCHEMA,
+            "outcome": "failed",
+            "interpreter_class": "project_venv",
+            "dependency_failure_code": failure_code,
+            "failed_module": "dependency-lock",
+            "failure_exception_class": type(exc).__name__,
+            "all_imports_passed": False,
+            "secrets_included": False,
+        }
+    atomic_json(recovery_root / "dependency-report.json", report)
+    atomic_json(recovery_root / "environment-receipt.json", receipt)
+    if failure_code is not None:
+        print(failure_code)
+        return 92
+    print(
+        "PHASE3F_LOCAL_PROJECT_DEPENDENCIES_READY"
+        if args.dependency_preflight_scope == "project"
+        else "PHASE3F_REMOTE_DEPENDENCIES_READY"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     os.environ.pop("MAPILLARY_ACCESS_TOKEN", None)
@@ -43,6 +134,57 @@ def main(argv: list[str] | None = None) -> int:
         print("PHASE3F_SOURCE_ROOT_INVALID")
         return 2
     sys.path.insert(0, str(source))
+    if args.dependency_preflight_only:
+        return _dependency_preflight(args)
+    if any(
+        value is None
+        for value in (
+            args.run_id,
+            args.sealed_root,
+            args.model,
+            args.vendor_root,
+            args.work_root,
+            args.output_root,
+            args.recovery_root,
+            args.environment_contract,
+            args.requirements_lock,
+            args.expected_contract_sha256,
+            args.expected_lock_sha256,
+            args.environment_receipt,
+            args.deadline_epoch,
+        )
+    ):
+        print("REMOTE_DEPENDENCY_LOCK_MISMATCH")
+        return 2
+    from atlaslens_api.phase3f.remote_environment import (  # noqa: PLC0415
+        RemoteEnvironmentError,
+        require_environment_receipt,
+    )
+    try:
+        require_environment_receipt(
+            cast(Path, args.environment_receipt),
+            expected_contract_sha256=cast(str, args.expected_contract_sha256),
+            expected_lock_sha256=cast(str, args.expected_lock_sha256),
+        )
+    except RemoteEnvironmentError as exc:
+        from atlaslens_api.phase3f.training_recovery import atomic_json  # noqa: PLC0415
+
+        atomic_json(
+            cast(Path, args.recovery_root) / "failure.json",
+            {
+                "schema": "atlaslens-phase3f-remote-training-failure-v1",
+                "failure_code": "REMOTE_TRAINING_DEPENDENCY_FAILED",
+                "dependency_failure_code": exc.code,
+                "failed_module": "environment-receipt",
+                "exception_class": type(exc).__name__,
+                "stdout_tail": [],
+                "stderr_tail": [],
+                "training_started": False,
+                "secrets_included": False,
+            },
+        )
+        print(exc.code)
+        return 93
     from atlaslens_api.phase3f.training import (  # noqa: PLC0415
         TrainingJobConfig,
         run_training_job,
@@ -51,16 +193,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = run_training_job(
             TrainingJobConfig(
-                run_id=args.run_id,
-                sealed_root=args.sealed_root,
-                model_path=args.model,
-                vendor_root=args.vendor_root,
-                work_root=args.work_root,
-                output_root=args.output_root,
-                deadline_epoch=args.deadline_epoch,
-                recovery_root=args.recovery_root,
+                run_id=cast(str, args.run_id),
+                sealed_root=cast(Path, args.sealed_root),
+                model_path=cast(Path, args.model),
+                vendor_root=cast(Path, args.vendor_root),
+                work_root=cast(Path, args.work_root),
+                output_root=cast(Path, args.output_root),
+                deadline_epoch=cast(float, args.deadline_epoch),
+                recovery_root=cast(Path, args.recovery_root),
                 seed=args.seed,
                 max_epochs=args.max_epochs,
+                environment_contract_sha256=cast(
+                    str, args.expected_contract_sha256
+                ),
+                environment_receipt_path=cast(Path, args.environment_receipt),
             )
         )
     except Exception as exc:  # sanitized process boundary

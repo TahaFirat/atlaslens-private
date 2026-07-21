@@ -11,6 +11,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import sys
 import tarfile
@@ -129,24 +130,35 @@ def _atomic_json(path: Path, value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def training_config_sha256(*, seed: int, max_epochs: int) -> str:
+def training_config_sha256(
+    *,
+    seed: int,
+    max_epochs: int,
+    environment_contract_sha256: str | None = None,
+) -> str:
     """Hash resume-relevant training semantics without machine-adaptive batch size."""
-    return hashlib.sha256(
-        _canonical_bytes(
-            {
-                "schema": "atlaslens-phase3f-training-config-v1",
-                "seed": seed,
-                "maximum_epochs": max_epochs,
-                "objective": "batch_hard_metric_learning_softplus_cosine_v1",
-                "optimizer": "adamw",
-                "learning_rate": "0.000002",
-                "weight_decay": "0.0001",
-                "scheduler": "constant",
-                "mixed_precision": True,
-                "checkpoint_interval_seconds": CHECKPOINT_INTERVAL_SECONDS,
-                "checkpoint_interval_steps": CHECKPOINT_INTERVAL_STEPS,
-            }
+    if environment_contract_sha256 is not None:
+        _require(
+            bool(re.fullmatch(r"[0-9a-f]{64}", environment_contract_sha256)),
+            "TRAINING_ENVIRONMENT_CONTRACT_INVALID",
         )
+    document: dict[str, object] = {
+        "schema": "atlaslens-phase3f-training-config-v1",
+        "seed": seed,
+        "maximum_epochs": max_epochs,
+        "objective": "batch_hard_metric_learning_softplus_cosine_v1",
+        "optimizer": "adamw",
+        "learning_rate": "0.000002",
+        "weight_decay": "0.0001",
+        "scheduler": "constant",
+        "mixed_precision": True,
+        "checkpoint_interval_seconds": CHECKPOINT_INTERVAL_SECONDS,
+        "checkpoint_interval_steps": CHECKPOINT_INTERVAL_STEPS,
+    }
+    if environment_contract_sha256 is not None:
+        document["environment_contract_sha256"] = environment_contract_sha256
+    return hashlib.sha256(
+        _canonical_bytes(document)
     ).hexdigest()
 
 
@@ -1184,6 +1196,8 @@ class TrainingJobConfig:
     recovery_root: Path | None = None
     seed: int = 20260720
     max_epochs: int = DEFAULT_MAX_EPOCHS
+    environment_contract_sha256: str | None = None
+    environment_receipt_path: Path | None = None
 
 
 def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
@@ -1202,6 +1216,26 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
     _require(not config.output_root.exists(), "TRAINING_OUTPUT_EXISTS")
     config.output_root.mkdir(mode=0o700, parents=True)
     config.work_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if config.environment_contract_sha256 is not None:
+        _require(
+            config.environment_receipt_path is not None,
+            "TRAINING_ENVIRONMENT_RECEIPT_MISSING",
+        )
+        environment_receipt = json.loads(
+            cast(Path, config.environment_receipt_path).read_text(encoding="utf-8")
+        )
+        _require(
+            isinstance(environment_receipt, dict)
+            and environment_receipt.get("contract_sha256")
+            == config.environment_contract_sha256
+            and environment_receipt.get("all_imports_passed") is True
+            and environment_receipt.get("secrets_included") is False,
+            "TRAINING_ENVIRONMENT_RECEIPT_INVALID",
+        )
+        _atomic_json(
+            config.output_root / "environment-receipt.json",
+            environment_receipt,
+        )
     holdout_state_path = config.work_root / "training-checkpoint" / "holdout-state.json"
     if holdout_state_path.exists():
         try:
@@ -1226,6 +1260,7 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
     config_sha256 = training_config_sha256(
         seed=config.seed,
         max_epochs=config.max_epochs,
+        environment_contract_sha256=config.environment_contract_sha256,
     )
     if config.recovery_root is not None:
         _atomic_json(
@@ -1236,6 +1271,7 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
                 "dataset_readiness_sha256": dataset_readiness_sha256,
                 "sealed_assets_sha256": sealed_assets_sha256,
                 "training_config_sha256": config_sha256,
+                "environment_contract_sha256": config.environment_contract_sha256,
                 "seed": config.seed,
                 "maximum_epochs": config.max_epochs,
                 "holdout_open_count": 0,

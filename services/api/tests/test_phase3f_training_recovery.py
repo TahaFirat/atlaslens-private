@@ -361,16 +361,17 @@ def test_nonzero_remote_code_is_not_masked_and_cleanup_still_runs(
             )
 
     commands: list[list[str]] = []
+    watched: list[list[str]] = []
     monkeypatch.setattr(
         module,
         "_run_command",
         lambda arguments, **_kwargs: commands.append(arguments),
     )
-    monkeypatch.setattr(
-        module,
-        "_run_watched",
-        lambda *_args, **_kwargs: module.RemoteProcessResult(1, 10.0),
-    )
+    def fail_bootstrap(arguments: list[str], **_kwargs: object) -> object:
+        watched.append(arguments)
+        return module.RemoteProcessResult(1, 10.0)
+
+    monkeypatch.setattr(module, "_run_watched", fail_bootstrap)
     monkeypatch.setattr(
         module,
         "_salvage_remote_failure",
@@ -397,5 +398,78 @@ def test_nonzero_remote_code_is_not_masked_and_cleanup_still_runs(
             readiness_sha256=READINESS,
             sealed_assets_sha256=SEALED,
             config_sha256=CONFIG,
+            environment_contract_sha256="e" * 64,
+            dependency_lock_sha256="f" * 64,
         )
     assert any("rm -rf /workspace/phase3f-work" in " ".join(row) for row in commands)
+    assert len(watched) == 1
+    assert "remote_bootstrap.py" in " ".join(watched[0])
+    assert "training_job.py" not in " ".join(watched[0])
+
+
+def _dependency_salvage_fixture(root: Path) -> tuple[Path, ...]:
+    documents: dict[str, object] = {
+        "failure.json": {
+            "schema": "atlaslens-phase3f-remote-training-failure-v1",
+            "failure_code": "REMOTE_TRAINING_DEPENDENCY_FAILED",
+            "dependency_failure_code": "REMOTE_DEPENDENCY_MODULE_MISSING",
+            "failed_module": "pydantic",
+            "secrets_included": False,
+        },
+        "dependency-report.json": {
+            "schema": "atlaslens-phase3f-dependency-report-v1",
+            "outcome": "failed",
+            "dependency_failure_code": "REMOTE_DEPENDENCY_MODULE_MISSING",
+            "failed_module": "pydantic",
+            "failure_exception_class": "ModuleNotFoundError",
+            "secrets_included": False,
+        },
+        "environment-receipt.json": {
+            "schema": "atlaslens-phase3f-environment-receipt-v1",
+            "outcome": "failed",
+            "dependency_failure_code": "REMOTE_DEPENDENCY_MODULE_MISSING",
+            "failed_module": "pydantic",
+            "secrets_included": False,
+        },
+    }
+    root.mkdir()
+    for name, value in documents.items():
+        atomic_json(root / name, value)
+    (root / "bootstrap-stdout.log").write_text("", encoding="utf-8")
+    (root / "bootstrap-stderr.log").write_text("", encoding="utf-8")
+    inventory_rows = []
+    for path in sorted(root.iterdir()):
+        inventory_rows.append(
+            {
+                "name": path.name,
+                "size_bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+    atomic_json(
+        root / "checksum-inventory.json",
+        {
+            "schema": "atlaslens-phase3f-bootstrap-checksum-inventory-v1",
+            "files": inventory_rows,
+            "file_count": len(inventory_rows),
+            "secrets_included": False,
+        },
+    )
+    return tuple(root.iterdir())
+
+
+def test_dependency_salvage_requires_report_and_preserves_exact_code(
+    tmp_path: Path,
+) -> None:
+    module = _load_supervisor()
+    files = _dependency_salvage_fixture(tmp_path / "recovery")
+    assert module._dependency_failure_evidence(files) == (
+        "REMOTE_DEPENDENCY_MODULE_MISSING",
+        "pydantic",
+    )
+    incomplete = tuple(path for path in files if path.name != "dependency-report.json")
+    with pytest.raises(
+        module.SupervisorExecutionError,
+        match="REMOTE_DEPENDENCY_SALVAGE_INCOMPLETE",
+    ):
+        module._dependency_failure_evidence(incomplete)
