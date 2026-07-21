@@ -1,21 +1,24 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import inspect
 import json
+import subprocess
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import cast
 
 import pytest
 
-from atlaslens_api.phase3f import scheduler, training
+from atlaslens_api.phase3f import local_first, scheduler, training
 from atlaslens_api.phase3f.splits import SplitAsset
 
 ROOT = Path(__file__).parents[3]
 LAUNCHER = ROOT / "scripts" / "phase3f-end-to-end.ps1"
 SUPERVISOR = ROOT / "scripts" / "phase3f" / "supervisor.py"
+CONTROL = ROOT / "scripts" / "phase3f" / "end_to_end.py"
 
 
 def _load_supervisor() -> object:
@@ -24,6 +27,99 @@ def _load_supervisor() -> object:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_control() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("phase3f_e2e_resume_control", CONTROL)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+
+
+def _ready_document(asset_count: int = 830) -> dict[str, object]:
+    return {
+        "schema": training.TRAINING_READINESS_SCHEMA,
+        "outcome": "READY_FOR_TRAINING",
+        "ready": True,
+        "asset_count": asset_count,
+        "checks": {"fixture_integrity": True},
+        "gpu_started": False,
+        "cloud_mutations": 0,
+        "secrets_included": False,
+    }
+
+
+def _write_resume_runtime(
+    runtime_root: Path,
+    *,
+    asset_count: int = 830,
+    sealed: bool = True,
+) -> tuple[str, Path, dict[str, object]]:
+    run_id = "a" * 32
+    run_root = runtime_root / run_id
+    run_root.mkdir(parents=True)
+    (runtime_root / "current.json").write_bytes(
+        _canonical_bytes({"schema": local_first.LOCAL_CURRENT_SCHEMA, "run_id": run_id})
+    )
+    report = _ready_document(asset_count)
+    report_payload = _canonical_bytes(report)
+    (run_root / "training-readiness.json").write_bytes(report_payload)
+    (run_root / "state.json").write_bytes(
+        _canonical_bytes(
+            {
+                "schema": local_first.LOCAL_STATE_SCHEMA,
+                "run_id": run_id,
+                "stage": "ACQUISITION_SEALED",
+                "asset_count": asset_count,
+                "model_loaded": False,
+                "readiness_report_sha256": hashlib.sha256(report_payload).hexdigest(),
+                "secrets_included": False,
+            }
+        )
+    )
+    sealed_root = run_root / "sealed-acquisition"
+    if sealed:
+        sealed_root.mkdir()
+        (sealed_root / "sealed-assets.json").write_bytes(b"fixture-sealed-assets\n")
+    return run_id, run_root, report
+
+
+def _patch_valid_seal(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_id: str,
+    report: dict[str, object],
+    asset_count: int = 830,
+) -> None:
+    verified = SimpleNamespace(
+        run_id=run_id,
+        split=SimpleNamespace(assets=tuple(range(asset_count))),
+    )
+    monkeypatch.setattr(local_first, "verify_sealed_acquisition", lambda _root: verified)
+    monkeypatch.setattr(training, "training_readiness_document", lambda _sealed: report)
+
+
+def _tree_sha256(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            digest.update(path.relative_to(root).as_posix().encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def _budget_policy(module: object) -> object:
@@ -306,6 +402,301 @@ def test_end_to_end_python_control_has_no_secret_inputs() -> None:
     assert "requests" not in preflight_source
     assert "RunPodV1Client" not in preflight_source
     assert "MapillaryClient" not in preflight_source
+
+
+def test_sealed_ready_resume_is_read_only_and_skips_acquisition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _load_control()
+    runtime = tmp_path / "runtime"
+    run_id, _run_root, report = _write_resume_runtime(runtime)
+    _patch_valid_seal(monkeypatch, run_id=run_id, report=report)
+    before = _tree_sha256(runtime)
+
+    plan = control.resume_plan(ROOT, runtime, tmp_path / "cloud")
+
+    assert plan["asset_count"] == 830
+    assert plan["acquisition_required"] is False
+    assert plan["mapillary_required"] is False
+    assert plan["dataset_write_count"] == 0
+    assert plan["cloud_readiness_transition_count"] == 1
+    assert plan["next_phase"] == "cloud_inventory"
+    assert plan["runpod_api_calls"] == 0
+    assert plan["cloud_mutations"] == 0
+    assert _tree_sha256(runtime) == before
+
+
+def test_repeated_sealed_resume_keeps_hash_and_state_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _load_control()
+    runtime = tmp_path / "runtime"
+    run_id, _run_root, report = _write_resume_runtime(runtime)
+    _patch_valid_seal(monkeypatch, run_id=run_id, report=report)
+    before = _tree_sha256(runtime)
+
+    first = control.resume_plan(ROOT, runtime, tmp_path / "cloud")
+    middle = _tree_sha256(runtime)
+    second = control.resume_plan(ROOT, runtime, tmp_path / "cloud")
+
+    assert first == second
+    assert before == middle == _tree_sha256(runtime)
+    assert first["acquisition_required"] is False
+
+
+def test_resume_missing_seal_is_exact_typed_blocker(tmp_path: Path) -> None:
+    control = _load_control()
+    runtime = tmp_path / "runtime"
+    _write_resume_runtime(runtime, sealed=False)
+
+    with pytest.raises(control.EndToEndError) as error:
+        control.resume_plan(ROOT, runtime, tmp_path / "cloud")
+
+    assert error.value.code == "SEALED_BUNDLE_MISSING"
+    assert error.value.artifact == "sealed-acquisition"
+
+
+def test_resume_seal_hash_mismatch_is_not_wrapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _load_control()
+    runtime = tmp_path / "runtime"
+    _write_resume_runtime(runtime)
+
+    def fail_verification(_root: Path) -> object:
+        raise local_first.LocalFirstError("SEALED_INVENTORY_MISMATCH")
+
+    monkeypatch.setattr(local_first, "verify_sealed_acquisition", fail_verification)
+    with pytest.raises(control.EndToEndError) as error:
+        control.resume_plan(ROOT, runtime, tmp_path / "cloud")
+
+    assert error.value.code == "SEALED_INVENTORY_MISMATCH"
+    assert error.value.artifact == "checksum-inventory.json"
+    assert error.value.field == "sha256"
+
+
+def test_resume_readiness_hash_mismatch_reports_expected_and_actual(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _load_control()
+    runtime = tmp_path / "runtime"
+    run_id, run_root, report = _write_resume_runtime(runtime)
+    _patch_valid_seal(monkeypatch, run_id=run_id, report=report)
+    (run_root / "training-readiness.json").write_bytes(
+        _canonical_bytes({**report, "ready": False})
+    )
+
+    with pytest.raises(control.EndToEndError) as error:
+        control.resume_plan(ROOT, runtime, tmp_path / "cloud")
+
+    assert error.value.code == "TRAINING_READINESS_HASH_MISMATCH"
+    assert error.value.artifact == "training-readiness.json"
+    assert error.value.field == "sha256"
+    assert len(error.value.expected) == 64
+    assert len(error.value.actual) == 64
+
+
+def test_resume_requires_exactly_830_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _load_control()
+    runtime = tmp_path / "runtime"
+    run_id, _run_root, report = _write_resume_runtime(runtime, asset_count=829)
+    _patch_valid_seal(
+        monkeypatch,
+        run_id=run_id,
+        report=report,
+        asset_count=829,
+    )
+
+    with pytest.raises(control.EndToEndError) as error:
+        control.resume_plan(ROOT, runtime, tmp_path / "cloud")
+
+    assert error.value.code == "PHASE3F_DATASET_ASSET_COUNT_MISMATCH"
+    assert error.value.expected == 830
+    assert error.value.actual == 829
+
+
+def test_resume_does_not_restart_running_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _load_control()
+    runtime = tmp_path / "runtime"
+    cloud = tmp_path / "cloud"
+    run_id, _run_root, report = _write_resume_runtime(runtime)
+    _patch_valid_seal(monkeypatch, run_id=run_id, report=report)
+    operator = cloud / "_operator" / "phase3f-current.json"
+    operator.parent.mkdir(parents=True)
+    operator.write_bytes(
+        _canonical_bytes({"run_id": run_id, "stage": "running", "secrets_included": False})
+    )
+
+    plan = control.resume_plan(ROOT, runtime, cloud)
+
+    assert plan["next_phase"] == "training_running"
+    assert plan["cloud_readiness_transition_count"] == 0
+    assert plan["acquisition_required"] is False
+
+
+def test_resume_does_not_restart_completed_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _load_control()
+    runtime = tmp_path / "runtime"
+    cloud = tmp_path / "cloud"
+    run_id, _run_root, report = _write_resume_runtime(runtime)
+    _patch_valid_seal(monkeypatch, run_id=run_id, report=report)
+    receipt = cloud / "_receipts" / "completed.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_bytes(
+        _canonical_bytes(
+            {
+                "schema": "atlaslens-phase3f-local-supervisor-receipt-v1",
+                "run_id": run_id,
+                "outcome": "TRAINING_COMPLETE",
+                "pod_termination_verified": True,
+                "secret_values_included": False,
+            }
+        )
+    )
+
+    plan = control.resume_plan(ROOT, runtime, cloud)
+
+    assert plan["next_phase"] == "training_completed"
+    assert plan["cloud_readiness_transition_count"] == 0
+    assert plan["acquisition_required"] is False
+
+
+def test_genuinely_resumable_acquisition_is_the_only_mapillary_path(tmp_path: Path) -> None:
+    control = _load_control()
+    runtime = tmp_path / "runtime"
+    run_id, run_root, _report = _write_resume_runtime(runtime, sealed=False)
+    state_path = run_root / "state.json"
+    state_path.write_bytes(
+        _canonical_bytes(
+            {
+                "schema": local_first.LOCAL_STATE_SCHEMA,
+                "run_id": run_id,
+                "stage": "ACQUISITION_FAILED_RESUMABLE",
+                "error_code": "MAPILLARY_API_SERVER_RETRY_EXHAUSTED",
+                "model_loaded": False,
+                "secrets_included": False,
+            }
+        )
+    )
+    work = run_root / "acquisition-work"
+    work.mkdir()
+    (work / "metadata-pages.json").write_bytes(
+        _canonical_bytes({"rows_by_city": {"fixture-city": []}})
+    )
+
+    plan = control.resume_plan(ROOT, runtime, tmp_path / "cloud")
+
+    assert plan["next_phase"] == "local_acquisition"
+    assert plan["acquisition_required"] is True
+    assert plan["mapillary_required"] is True
+    assert plan["dataset_write_count"] == 0
+
+
+def test_launcher_preserves_typed_child_failure_and_gates_cloud_before_key() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    execute_flow = launcher[launcher.index('{ $_ -in @("Execute", "Resume") }') :]
+
+    assert 'throw "PHASE3F_LOCAL_ACQUISITION_FAILED"' not in launcher
+    assert "Get-SanitizedChildFailure" in launcher
+    assert "PHASE3F_LOCAL_ACQUISITION_CHILD_FAILED" in launcher
+    assert execute_flow.index('Invoke-Control -ControlAction "resume-plan"') < (
+        execute_flow.index("Invoke-LocalAcquisition")
+    )
+    assert execute_flow.index('Invoke-Control -ControlAction "resume-plan"') < (
+        execute_flow.index("Invoke-CloudTraining")
+    )
+    assert execute_flow.index("Invoke-CloudTraining") < execute_flow.index(
+        'Invoke-Control -ControlAction "status"'
+    )
+
+
+def test_child_error_sanitizer_preserves_code_and_redacts_raw_output() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    function_source = launcher[
+        launcher.index("function Get-SanitizedChildFailure") : launcher.index(
+            "function Throw-SanitizedChildFailure"
+        )
+    ]
+    detail = json.dumps(
+        {
+            "error_code": "SEALED_INVENTORY_MISMATCH",
+            "artifact": "checksum-inventory.json",
+            "field": "sha256",
+            "expected": "a" * 64,
+            "actual": "b" * 64,
+            "raw": "raw-secret-must-not-escape",
+        },
+        separators=(",", ":"),
+    )
+    probe = (
+        function_source
+        + "\n$typed=Get-SanitizedChildFailure -ChildOutput "
+        + "@('raw-secret-must-not-escape','ACQUISITION_ALREADY_SEALED') "
+        + "-FallbackCode 'FALLBACK'; "
+        + f"$detailed=Get-SanitizedChildFailure -ChildOutput @('{detail}') "
+        + "-FallbackCode 'FALLBACK'; "
+        + "[ordered]@{typed=$typed.Code;detail=$detailed.Diagnostic}|ConvertTo-Json -Compress"
+    )
+
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", probe],
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+        timeout=30,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    output = json.loads(completed.stdout)
+    assert output["typed"] == "ACQUISITION_ALREADY_SEALED"
+    assert "SEALED_INVENTORY_MISMATCH" in output["detail"]
+    assert "raw-secret-must-not-escape" not in completed.stdout
+    assert "raw-secret-must-not-escape" not in completed.stderr
+
+
+def test_untyped_control_failure_redacts_raw_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    control = _load_control()
+    secret = "raw-secret-value-must-not-escape"
+
+    def fail(*_args: object) -> dict[str, object]:
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(control, "resume_plan", fail)
+    result = control.main(
+        [
+            "resume-plan",
+            "--repository-root",
+            str(ROOT),
+            "--runtime-root",
+            str(tmp_path / "runtime"),
+            "--cloud-runtime-root",
+            str(tmp_path / "cloud"),
+        ]
+    )
+
+    captured = capsys.readouterr().out
+    assert result == 1
+    assert captured.strip() == "PHASE3F_END_TO_END_FAILED"
+    assert secret not in captured
 
 
 def test_e2e_budget_is_three_usd_with_ten_usd_historical_ceiling(tmp_path: Path) -> None:

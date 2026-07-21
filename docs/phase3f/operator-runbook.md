@@ -8,8 +8,9 @@ printed. The wrapper does not read `.env` or `asda.html`.
 ## One-command acquisition to fine-tuning pipeline
 
 The production operator entry point is `scripts\phase3f-end-to-end.ps1`. It
-preserves the current local run ID, resumes acquisition, validates and seals the
-private corpus, creates immutable train/validation/locked-holdout manifests,
+preserves the current local run ID, resumes acquisition only when the current
+checkpoint is genuinely unsealed, validates the private corpus, creates
+immutable train/validation/locked-holdout manifests,
 measures the pinned pretrained MegaLoc baseline on validation, transfers only
 the sealed corpus/training package, runs real mixed-precision metric-learning
 fine-tuning on one bounded RunPod Pod, retrieves checksummed outputs, terminates
@@ -25,12 +26,21 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\ph
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Cleanup
 ```
 
-`Execute`/`Resume` read the Mapillary token and RunPod key separately with
-`Read-Host -AsSecureString`. The Mapillary token exists only in the local
-acquisition child environment and is cleared before the RunPod key is requested.
-The RunPod key exists only for lifecycle children. Neither value is passed on
-argv or written to state, logs, archives or receipts; both process variables are
-cleared in `finally` blocks and the secure BSTR is zeroed.
+`Resume` first runs a read-only local plan. A checksum-valid sealed corpus with
+exactly 830 assets and a byte-exact recomputed `READY_FOR_TRAINING` report skips
+the Mapillary prompt, acquisition, media resolution, and all dataset writes. A
+running or completed training receipt also returns idempotently without starting
+that phase again. Missing/tampered seal or readiness evidence fails with the
+typed artifact/field blocker before any cloud secret is requested. Only a real
+unsealed acquisition checkpoint requests the Mapillary token.
+
+When acquisition is required, `Execute`/`Resume` read the Mapillary token and
+RunPod key separately with `Read-Host -AsSecureString`. The Mapillary token
+exists only in the local acquisition child environment and is cleared before the
+RunPod key is requested. The RunPod key is requested only after the read-only
+dataset integrity gate and exists only for lifecycle children. Neither value is
+passed on argv or written to state, logs, archives or receipts; both process
+variables are cleared in `finally` blocks and the secure BSTR is zeroed.
 
 The fine-tuning path has a hard USD 3 ceiling per run (`2.95` soft stop,
 `2.99` termination stop) and a fail-closed USD 10 historical ceiling. Before

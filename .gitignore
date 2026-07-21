@@ -36,6 +36,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest-tmp*/
+.pytest-phase3f-*/
 .pytest_tmp*/
 .runtime-investigation/
 .mypy_cache/

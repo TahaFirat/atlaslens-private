@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-21T11:01:30+03:00
+last_verified_at: 2026-07-21T14:59:46+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: exhausted_media_reserves_replenishment_repaired_live_827_preserved
+product_phase_status: phase3f_resume_idempotency_repaired_live_sealed_830_preserved
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -445,7 +445,18 @@ phase_3f_media_replenishment_checkpoint: atomic_hash_chained_additive_v1_idempot
 phase_3f_media_replenishment_isolation: contributor_sequence_group_single_role_spatial_1000m_post_media_exact_phash_gate
 phase_3f_media_replenishment_tests: pass_238_phase3f
 phase_3f_media_replenishment_live_actions: zero_network_zero_mapillary_zero_cdn_zero_runpod_zero_gpu_zero_runtime_mutation
-phase_3f_next_action: run_exact_preflight_then_resume_ce23_with_explicit_cloud_consent_only_after_dataset_ready
+phase_3f_resume_masked_child_error: acquisition_already_sealed
+phase_3f_resume_root_cause: current_json_presence_forced_local_resume_before_seal_readiness_gate
+phase_3f_resume_plan: readonly_idempotent_local_acquisition_cloud_inventory_training_running_training_completed
+phase_3f_resume_live_gate: pass_sealed_830_readiness_recomputed_exact_mapillary0_acquisition0_dataset_writes0_cloud_transition1
+phase_3f_resume_readiness_sha256: 2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9
+phase_3f_resume_sealed_assets_sha256: b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1
+phase_3f_resume_metadata_inventory_sha256: 3ccac5be7232e7d6afb205eba384c4ac6772e2d8a0b463c066dfe4d1fd82d742
+phase_3f_resume_media_inventory_sha256: da189be7feb70643d6579b0cfb61c0a7e7b9878f28ed19b501082f6b59ee7cae
+phase_3f_resume_tests: pass_266_phase3f
+phase_3f_resume_static: pass_ruff_strict_mypy_259_sources_and_control_powershell5_diff_secret_scan
+phase_3f_resume_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_resume_zero_dataset_runtime_mutation
+phase_3f_next_action: run_exact_resume_ce23_with_explicit_cloud_consent
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
 phase_6c_dataset_qa_ui_gate: pass
@@ -538,6 +549,55 @@ true, `gpu_started=false`, and `cloud_mutations=0`; its readiness SHA-256 is
 All 254 Phase 3F tests pass. Ruff, strict mypy on both changed sources, all five
 Phase 3F PowerShell parsers, diff validation, and the high-confidence secret scan
 pass. No network, RunPod/GPU, Resume, dataset, media, or runtime mutation occurred.
+
+## Product Phase 3F idempotent sealed-corpus Resume
+
+Status: **REPAIRED AND LIVE READ-ONLY VERIFIED - RESUME NOT EXECUTED**.
+
+The end-to-end wrapper used only `current.json` presence to choose local Resume,
+so it requested Mapillary before inspecting the completed phase. The local child
+then rejected the existing seal with the exact typed
+`ACQUISITION_ALREADY_SEALED`, but the parent discarded that stdout and emitted
+`PHASE3F_LOCAL_ACQUISITION_FAILED`. The older
+`MEDIA_SPLIT_MINIMUM_UNAVAILABLE` still present in merged local state is historical
+and was not the failing child's returned code.
+
+Resume now computes a read-only phase plan before either secret. It verifies the
+complete checksum inventory and every media hash, requires exactly 830 assets,
+recomputes the canonical readiness document from that verified seal, and requires
+the existing report to match byte-for-byte. A valid sealed run advances to local
+cloud inventory without Mapillary, acquisition, resolver, or dataset writes.
+Running/completed training receipts return idempotently; only a valid unsealed
+checkpoint can request Mapillary. Typed child errors and allowlisted artifact,
+field, count, boolean, and SHA-256 diagnostics survive the wrapper without raw
+child output. RunPod remains unavailable until this gate passes; the existing
+inventory, billing reconciliation, and budget gate still precede all mutation.
+
+The live plan returned `next_phase=cloud_inventory`, acquisition/Mapillary/dataset
+write/RunPod call/cloud mutation counts of zero, and no matching running or
+completed training receipt. The state carries a stale historical readiness pointer
+`3ad9a727b3edbd92c455b7542ba9d2cc742c91b324f09686d20ac01fed6201c1`;
+it was not migrated. The stronger authoritative binding is the byte-exact
+recomputation below.
+
+| Read-only evidence | Before | After |
+|---|---|---|
+| Asset count | 830 | 830 |
+| Readiness SHA-256 | `2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9` | same |
+| Sealed-assets SHA-256 | `b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1` | same |
+| Sealed metadata inventory SHA-256 | `3ccac5be7232e7d6afb205eba384c4ac6772e2d8a0b463c066dfe4d1fd82d742` | same |
+| Sealed media inventory SHA-256 | `da189be7feb70643d6579b0cfb61c0a7e7b9878f28ed19b501082f6b59ee7cae` | same |
+| Bundle checksum inventory SHA-256 | `f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93` | same |
+| Local state/stage | `ACQUISITION_SEALED` | same |
+| `model_loaded` / GPU / cloud mutations | `false` / `false` / `0` | same |
+
+The pre-seal 8,805-row metadata checkpoint is intentionally absent after atomic
+sealing, both before and after this task; the table therefore records the canonical
+inventory of the 830 sealed private metadata sidecars. All 266 Phase 3F tests pass.
+Ruff, strict mypy for 259 source files and the changed control, all five Phase 3F
+PowerShell parsers, diff validation, and the high-confidence secret scan pass. No
+network, Mapillary, RunPod/GPU, Resume/Execute, dataset, media, or live runtime
+mutation occurred.
 
 ## Product Phase 3F exhausted media reserve replenishment
 

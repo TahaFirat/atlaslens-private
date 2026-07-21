@@ -1,5 +1,28 @@
 # Decision log
 
+## 2026-07-21 - Phase 3F Resume is a read-only idempotent phase machine
+
+- Context: The end-to-end wrapper treated any `current.json` as an unfinished
+  acquisition. Resume therefore prompted for Mapillary and called the local child
+  even when the 830-asset corpus was already sealed and training-ready. The child
+  returned `ACQUISITION_ALREADY_SEALED`, but the wrapper replaced that typed code
+  with `PHASE3F_LOCAL_ACQUISITION_FAILED`.
+- Decision: Before requesting either secret, derive the next phase from local
+  state using a read-only seal inventory verification and a byte-exact canonical
+  recomputation of the existing readiness report. Skip completed acquisition and
+  running/completed training. Request Mapillary only for a valid unsealed
+  acquisition checkpoint; request RunPod only after dataset integrity passes.
+  Preserve allowlisted typed child errors and emit only sanitized artifact, field,
+  count, boolean, or SHA-256 diagnostics.
+- Alternatives: Make acquisition itself silently accept an existing seal; always
+  regenerate readiness; clear or migrate the live state; or continue using a
+  generic wrapper error.
+- Consequences: Repeated Resume does not change dataset/state hashes or restart a
+  completed phase. Invalid seal/readiness evidence blocks before cloud inventory,
+  while authenticated inventory, billing reconciliation, and the unchanged budget
+  gate remain the only route to later cloud mutation.
+- Target phase: Product Phase 3F bounded private fine-tuning only.
+
 ## 2026-07-21 - Phase 3F releases closed RunPod reservations after reconciliation
 
 - Context: The historical gate treated every Pod-bearing operator receipt without

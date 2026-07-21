@@ -48,6 +48,85 @@ if ([string]::IsNullOrWhiteSpace($PythonPath)) {
 }
 $resolvedPython = (Resolve-Path -LiteralPath $PythonPath).Path
 
+function Get-SanitizedChildFailure {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$ChildOutput,
+        [Parameter(Mandatory = $true)][string]$FallbackCode
+    )
+    for ($index = $ChildOutput.Count - 1; $index -ge 0; $index--) {
+        $line = [string]$ChildOutput[$index]
+        if ($line -cmatch '^[A-Z][A-Z0-9_]{2,127}$') {
+            return [PSCustomObject]@{ Code = $line; Diagnostic = $null }
+        }
+        try {
+            $document = $line | ConvertFrom-Json -ErrorAction Stop
+            $code = [string]$document.error_code
+            if ($code -cnotmatch '^[A-Z][A-Z0-9_]{2,127}$') {
+                continue
+            }
+            $safe = [ordered]@{ error_code = $code }
+            foreach ($name in @("artifact", "field")) {
+                $value = [string]$document.$name
+                if (-not [string]::IsNullOrWhiteSpace($value) -and $value -cmatch '^[A-Za-z0-9_.-]{1,128}$') {
+                    $safe[$name] = $value
+                }
+            }
+            foreach ($name in @("expected", "actual")) {
+                $value = $document.$name
+                if (
+                    $value -is [bool] -or
+                    $value -is [int] -or
+                    ($value -is [string] -and [string]$value -cmatch '^[a-f0-9]{64}$')
+                ) {
+                    $safe[$name] = $value
+                }
+            }
+            return [PSCustomObject]@{
+                Code = $code
+                Diagnostic = ($safe | ConvertTo-Json -Compress)
+            }
+        }
+        catch {
+            continue
+        }
+    }
+    return [PSCustomObject]@{ Code = $FallbackCode; Diagnostic = $null }
+}
+
+function Throw-SanitizedChildFailure {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$ChildOutput,
+        [Parameter(Mandatory = $true)][string]$FallbackCode
+    )
+    $failure = Get-SanitizedChildFailure `
+        -ChildOutput $ChildOutput `
+        -FallbackCode $FallbackCode
+    if (-not [string]::IsNullOrWhiteSpace([string]$failure.Diagnostic)) {
+        [Console]::Error.WriteLine([string]$failure.Diagnostic)
+    }
+    throw [string]$failure.Code
+}
+
+function Convert-ControlResult {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$ControlOutput,
+        [Parameter(Mandatory = $true)][string]$ExpectedAction
+    )
+    if ($ControlOutput.Count -ne 1) {
+        throw "PHASE3F_CONTROL_OUTPUT_INVALID"
+    }
+    try {
+        $document = $ControlOutput[0] | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "PHASE3F_CONTROL_OUTPUT_INVALID"
+    }
+    if ([string]$document.action -ne $ExpectedAction) {
+        throw "PHASE3F_CONTROL_OUTPUT_INVALID"
+    }
+    return $document
+}
+
 function Invoke-Control {
     param([Parameter(Mandatory = $true)][string]$ControlAction)
     $arguments = @(
@@ -56,13 +135,16 @@ function Invoke-Control {
         "--repository-root", $repoRoot,
         "--runtime-root", $resolvedRuntime
     )
-    if ($ControlAction -eq "status") {
+    if ($ControlAction -in @("resume-plan", "status")) {
         $arguments += @("--cloud-runtime-root", $resolvedCloudRuntime)
     }
-    & $resolvedPython @arguments
+    $controlOutput = @(& $resolvedPython @arguments)
     if ($LASTEXITCODE -ne 0) {
-        throw "PHASE3F_$($ControlAction.ToUpperInvariant())_FAILED"
+        Throw-SanitizedChildFailure `
+            -ChildOutput $controlOutput `
+            -FallbackCode "PHASE3F_$($ControlAction.ToUpperInvariant().Replace('-', '_'))_CHILD_FAILED"
     }
+    return $controlOutput
 }
 
 function Invoke-WithSecureEnvironment {
@@ -103,7 +185,9 @@ function Invoke-LocalAcquisition {
                 -MaxWallMinutes $AcquisitionMaxWallMinutes `
                 -PythonPath $resolvedPython)
             if ($LASTEXITCODE -ne 0) {
-                throw "PHASE3F_LOCAL_ACQUISITION_FAILED"
+                Throw-SanitizedChildFailure `
+                    -ChildOutput $localOutput `
+                    -FallbackCode "PHASE3F_LOCAL_ACQUISITION_CHILD_FAILED"
             }
             if ($localOutput.Count -ne 1) {
                 throw "PHASE3F_LOCAL_ACQUISITION_OUTPUT_INVALID"
@@ -171,28 +255,48 @@ switch ($Action) {
         if ($Action -eq "Resume" -and -not $resumeExisting) {
             throw "PHASE3F_RESUME_STATE_MISSING"
         }
-        $localResult = Invoke-LocalAcquisition -ResumeExisting $resumeExisting
-        if (
-            [string]$localResult.stage -like "PAUSED_*" -or
-            [string]$localResult.stage -in @(
-                "MEDIA_SPLIT_MINIMUM_UNAVAILABLE",
-                "MEDIA_CORPUS_EXHAUSTED",
-                "MEDIA_REPLENISHMENT_LIMIT_REACHED"
-            )
-        ) {
-            $localResult | ConvertTo-Json -Compress -Depth 4
+        $plan = $null
+        if ($resumeExisting) {
+            $planOutput = @(Invoke-Control -ControlAction "resume-plan")
+            $plan = Convert-ControlResult `
+                -ControlOutput $planOutput `
+                -ExpectedAction "resume-plan"
+        }
+
+        $acquisitionRequired = -not $resumeExisting -or $plan.acquisition_required -eq $true
+        if ($acquisitionRequired) {
+            $localResult = Invoke-LocalAcquisition -ResumeExisting $resumeExisting
+            if (
+                [string]$localResult.stage -like "PAUSED_*" -or
+                [string]$localResult.stage -in @(
+                    "MEDIA_SPLIT_MINIMUM_UNAVAILABLE",
+                    "MEDIA_CORPUS_EXHAUSTED",
+                    "MEDIA_REPLENISHMENT_LIMIT_REACHED"
+                )
+            ) {
+                $localResult | ConvertTo-Json -Compress -Depth 4
+                break
+            }
+            $null = Invoke-Control -ControlAction "readiness"
+            $planOutput = @(Invoke-Control -ControlAction "resume-plan")
+            $plan = Convert-ControlResult `
+                -ControlOutput $planOutput `
+                -ExpectedAction "resume-plan"
+        }
+
+        if ([string]$plan.next_phase -in @("training_running", "training_completed")) {
+            $plan | ConvertTo-Json -Compress -Depth 4
             break
         }
-        Invoke-Control -ControlAction "readiness"
-        $current = Get-Content -LiteralPath $currentPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        $runId = [string]$current.run_id
-        if ($runId -notmatch '^[0-9a-f]{32}$') {
-            throw "PHASE3F_CURRENT_RUN_INVALID"
+        if (
+            $plan.acquisition_required -ne $false -or
+            $plan.mapillary_required -ne $false -or
+            [string]$plan.next_phase -ne "cloud_inventory"
+        ) {
+            throw "PHASE3F_RESUME_PLAN_INVALID"
         }
+        $runId = [string]$plan.run_id
         $sealedRoot = Join-Path (Join-Path $resolvedRuntime $runId) "sealed-acquisition"
-        if (-not (Test-Path -LiteralPath $sealedRoot -PathType Container)) {
-            throw "DATASET_NOT_READY_FOR_TRAINING"
-        }
         Invoke-CloudTraining -RunId $runId -SealedRoot $sealedRoot
         Invoke-Control -ControlAction "status"
     }
