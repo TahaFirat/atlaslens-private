@@ -194,6 +194,7 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
         gpu_poll_elapsed_seconds=1.0,
         observed_gpu_id="NVIDIA RTX A5000",
         gpu_count=1,
+        normalized_gpu_count_path="gpuCount",
         cost_attestation="graphql_uninterruptable_price_match",
     )
     pending = PodGPUAttestationProgressDiagnostic(
@@ -233,9 +234,10 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
         expected_run_id=receipt.run_id,
         expected_attempt_id=cast(str, receipt.attempt_id),
         diagnostic=PodGPUAttestationProgressDiagnostic(
-            outcome="attested",
+            outcome="passed",
             failure_code=None,
             normalized_gpu_path="machine.gpuTypeId",
+            normalized_gpu_count_path="gpuCount",
             poll_count=2,
             poll_elapsed_seconds=1.0,
             final_desired_status="RUNNING",
@@ -276,8 +278,9 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
     assert recorded.create_cost_per_hr == Decimal("0.160")
     assert recorded.get_interruptible_json_type == "missing"
     assert recorded.pod_inventory_count == 1
-    assert recorded.gpu_attestation_outcome == "attested"
+    assert recorded.gpu_attestation_outcome == "passed"
     assert recorded.normalized_gpu_path == "machine.gpuTypeId"
+    assert recorded.normalized_gpu_count_path == "gpuCount"
     assert recorded.gpu_poll_count == 2
     assert recorded.observed_gpu_id == "NVIDIA RTX A5000"
     assert recorded.gpu_count == 1
@@ -419,6 +422,7 @@ def test_legacy_operator_receipt_remains_readable(tmp_path: Path) -> None:
         "gpu_attestation_outcome",
         "gpu_attestation_failure_code",
         "normalized_gpu_path",
+        "normalized_gpu_count_path",
         "gpu_poll_count",
         "gpu_poll_elapsed_seconds",
         "final_desired_status",
@@ -461,6 +465,7 @@ def test_previous_v2_operator_receipt_remains_readable(tmp_path: Path) -> None:
         "gpu_attestation_outcome",
         "gpu_attestation_failure_code",
         "normalized_gpu_path",
+        "normalized_gpu_count_path",
         "gpu_poll_count",
         "gpu_poll_elapsed_seconds",
         "final_desired_status",

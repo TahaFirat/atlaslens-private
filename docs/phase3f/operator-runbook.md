@@ -327,9 +327,13 @@ ID is bound, authenticated `GET /pods/{id}` calls use `includeMachine=true` and
 a monotonic deadline of at most 180 seconds with a controlled interval. This is
 GET-only allocation polling, not a create retry. Exact GPU ID evidence is accepted
 only from `gpu.id`, `machine.gpuTypeId`, or `machine.gpuType.id`; assigned count
-comes only from `gpu.count` or `machine.gpuType.count`. All simultaneously present
-paths must agree, and display names or `machine.minPodGpuCount` are not allocation
-evidence. Missing/null machine, GPU or status values remain pending. Allocation
+is normalized from provider responses at top-level `gpuCount`, `gpu.count`, or
+`machine.gpuType.count`. The create request's `gpuCount=1` is not provider
+evidence. Only JSON integer `1` is accepted: booleans, strings and floats are
+`POD_GPU_COUNT_INVALID`; integer values other than one or conflicting recognized
+paths are `POD_GPU_COUNT_MISMATCH`. All simultaneously present non-null paths
+must agree. Display names and `machine.minPodGpuCount` are not allocation
+evidence. Missing/null count paths remain pending. Allocation
 success requires the exact bound ID and run name, `RUNNING`, count one, selected
 GPU ID, valid on-demand price/rental evidence, no proof of `interruptible=true`,
 and account inventory containing only the bound Pod, with zero unexpected Pods,
@@ -338,8 +342,12 @@ Duplicate list rows for the same bound Pod are counted once. If exact bound-Pod
 GET succeeds while the Pod list has not converged, allocation remains pending
 within the same deadline and never creates another Pod. Public IP and port
 mapping are eventual connectivity fields and are not allocation invariants.
-A mismatch terminates immediately; expiration raises
-`POD_GPU_ATTESTATION_TIMEOUT`. Receipt v2 stores
+A mismatch terminates immediately. If every count path remains missing/null,
+expiration raises `POD_GPU_COUNT_ATTESTATION_TIMEOUT`; other incomplete
+allocation evidence retains `POD_GPU_ATTESTATION_TIMEOUT`. Successful allocation
+records `gpu_attestation_outcome=passed`, the normalized GPU-ID path, normalized
+count path/value, then ends allocation polling before connectivity begins.
+Receipt v2 stores
 only allowlisted fields or a hash for mismatching GPU text, plus poll count/time,
 outcome, `receipt_bound_pod_count`, `unexpected_pod_count`, `endpoint_count`,
 `network_volume_count`, `template_count`, and `receipt_bound_match`. It never
@@ -352,7 +360,10 @@ default monotonic deadline is 180 seconds. Polling is every two seconds for the
 first 30 seconds and every five seconds thereafter. Missing, null, empty or
 whitespace `publicIp`, a missing `22/tcp` exposed port mapping, or an SSH probe
 that is not ready remains pending on the same Pod. Each poll rechecks exact GPU
-ID/count, terminal status, cloud type, on-demand price and absence of boolean
+ID and any supplied count; an already attested provider count remains valid when
+a later sparse GET omits all count paths. Invalid or conflicting count evidence
+retains `POD_GPU_COUNT_INVALID` or `POD_GPU_COUNT_MISMATCH`, not a connectivity
+code. Terminal status, cloud type, on-demand price and absence of boolean
 `interruptible=true`. Once a syntactically valid IP and port mapping exist, a
 bounded batch-mode SSH `true` probe must pass before transfer starts. Probe output,
 host keys, IP, port, Pod ID and credentials are never printed. The private operator
@@ -388,7 +399,9 @@ Stop on these operator blockers: `ACTIVE_POD_INVENTORY_NOT_ZERO`,
 `RUNPOD_CREATE_PAYLOAD_INVALID`, `RUNPOD_CREATE_BAD_REQUEST_UNKNOWN`,
 `RUNPOD_AUTH_INVALID`, `RUNPOD_PERMISSION_DENIED`, `RUNPOD_RATE_LIMITED`,
 `RUNPOD_PROVIDER_ERROR`,
-`POD_GPU_ATTESTATION_TIMEOUT`, `POD_GPU_ATTESTATION_POD_MISSING`,
+`POD_GPU_ATTESTATION_TIMEOUT`, `POD_GPU_COUNT_ATTESTATION_TIMEOUT`,
+`POD_GPU_COUNT_INVALID`, `POD_GPU_COUNT_MISMATCH`,
+`POD_GPU_ATTESTATION_POD_MISSING`,
 `POD_CONNECTIVITY_TIMEOUT`, `POD_SSH_READINESS_TIMEOUT`,
 `POD_CONNECTIVITY_POD_MISSING`,
 `projected_cost_exceeds_target`,

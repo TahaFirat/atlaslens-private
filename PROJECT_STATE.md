@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-21T18:27:29+03:00
+last_verified_at: 2026-07-21T19:24:30+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: phase3f_attempt_archive_idempotent_cloudplan_live_readonly_pass_sealed_830_preserved
+product_phase_status: phase3f_runpod_top_level_gpu_count_attested_offline_live_runtime_readonly_preserved
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -495,6 +495,17 @@ phase_3f_attempt_budget_live_values: actual_0_8379813398_active0_unbilled0_propo
 phase_3f_attempt_tests: pass_307_phase3f_parallel_windows_archive_budget_snapshot_stale_pid_and_blocker_priority
 phase_3f_attempt_static: pass_ruff_strict_mypy20_phase3f_and259_api_sources_powershell5_diff_secret_scan
 phase_3f_attempt_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_resume_zero_execute_zero_dataset_receipt_budget_runtime_mutation
+phase_3f_gpu_count_live_failure: pod_gpu_attestation_timeout_poll21_elapsed180_gpu_count_null
+phase_3f_gpu_count_root_cause: parser_omitted_top_level_gpu_count_and_dropped_create_response_count_across_sparse_gets
+phase_3f_gpu_count_paths: gpuCount_gpu_count_machine_gpuType_count_exact_json_integer_one_only
+phase_3f_gpu_count_errors: invalid_type_POD_GPU_COUNT_INVALID_mismatch_POD_GPU_COUNT_MISMATCH_absent_timeout_POD_GPU_COUNT_ATTESTATION_TIMEOUT
+phase_3f_gpu_count_machine: allocation_passed_then_independent_connectivity_deadline
+phase_3f_gpu_count_simulation: pass_live_shape_gpuCount1_machine_gpuTypeId_l4_connectivity_local_blockers0_network0_mutations0
+phase_3f_gpu_count_create_invariant: request_count_not_provider_proof_one_post_max_zero_recreate
+phase_3f_gpu_count_cleanup: historical_receipt_terminated_cleanup_true_inventory_0_0_0_0
+phase_3f_gpu_count_tests: pass_326_phase3f_including_budget_archive_count_connectivity_cleanup_redaction
+phase_3f_gpu_count_static: pass_ruff_strict_mypy20_phase3f_powershell5_diff_and_secret_scan
+phase_3f_gpu_count_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_resume_zero_execute_zero_dataset_receipt_budget_runtime_mutation
 phase_3f_next_action: run_exact_resume_ce23_with_explicit_cloud_consent
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
@@ -550,6 +561,70 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F RunPod top-level GPU-count attestation
+
+Status: **REPAIRED AND OFFLINE VERIFIED - LIVE RESUME NOT EXECUTED**.
+
+The live terminal receipt proves 21 authenticated allocation polls over the full
+180-second monotonic deadline, exact `NVIDIA L4` at `machine.gpuTypeId`,
+`RUNNING`, matching on-demand price, one receipt-bound Pod, and zero unexpected
+Pods/endpoints/network volumes/templates. Its `gpu_count` remained null and the
+old terminal code was `POD_GPU_ATTESTATION_TIMEOUT`. The receipt contains no raw
+provider response body. The HTTP-201 diagnostic established that `gpuCount` was a
+top-level response key, but its historical value cannot be reconstructed from the
+retained receipt alone.
+
+The exact parser defect was `_normalized_gpu`: it read only `gpu.count` and
+`machine.gpuType.count`. It ignored response top-level `gpuCount`, then replaced
+any create-response count observation with each authenticated GET observation.
+Sparse GETs therefore returned telemetry to null even when HTTP 201 had supplied
+provider count evidence.
+
+Provider responses now normalize `gpuCount`, `gpu.count`, and
+`machine.gpuType.count`. Only JSON integer one is accepted. Boolean, string and
+float values are `POD_GPU_COUNT_INVALID`; integer values other than one and
+conflicting paths are `POD_GPU_COUNT_MISMATCH`; all-missing/null count evidence
+remains pending and expires as `POD_GPU_COUNT_ATTESTATION_TIMEOUT`. The create
+request's `gpuCount=1` is never provider proof. A valid HTTP-201 count remains
+attested across later sparse GETs, while any later supplied invalid/mismatching
+count fails immediately.
+
+Allocation now records `gpu_attestation_outcome=passed`, GPU-ID path, normalized
+count path/value and `allocation_attested_at`, then stops allocation polling.
+Connectivity starts with its own monotonic deadline and retains the existing
+IP/port/SSH gates. The receipt schema remains backward-readable for historical v2
+receipts without the new count-path field. No timeout or failure path issues a
+second create.
+
+The sanitized exact-live-shape fixture contains top-level `gpuCount: 1`,
+`machine.gpuTypeId: NVIDIA L4`, no nested count, and no eventual connectivity
+fields. The pure state-machine simulation returns allocation `passed`, normalized
+count path `gpuCount`, next state `connectivity`, `local_blockers=[]`,
+`network_calls=0`, `cloud_mutations=0`, and `create_attempts=0`. Integration
+coverage also proves that sparse allocation/connectivity GETs reuse this provider
+count, allocation and connectivity deadlines are independent, and the one POST is
+never retried.
+
+The live historical receipt remains `terminated` with `cleanup_verified=true`;
+its final independent inventory was already verified as `0/0/0/0`. The sealed
+corpus remains 830 assets at `ACQUISITION_SEALED`, `model_loaded=false`, GPU/cloud
+mutations zero, readiness SHA-256
+`2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9`,
+sealed-assets SHA-256
+`b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1`,
+metadata inventory SHA-256
+`3ccac5be7232e7d6afb205eba384c4ac6772e2d8a0b463c066dfe4d1fd82d742`, and
+media inventory SHA-256
+`da189be7feb70643d6579b0cfb61c0a7e7b9878f28ed19b501082f6b59ee7cae`.
+
+All 326 Phase 3F tests pass, including existing budget/archive, count-shape,
+allocation/connectivity, single-create, receipt-bound cleanup and redaction
+regressions. Ruff passes the complete Phase 3F scope; strict mypy passes all 20
+Phase 3F sources; all five PowerShell parsers, diff validation and the
+high-confidence changed-file secret scan pass. No
+network, RunPod/Mapillary, Resume/Execute, Pod/resource, dataset/runtime,
+receipt/budget-history, budget-limit, push or remote mutation occurred.
 
 ## Product Phase 3F idempotent lifecycle-attempt archive
 

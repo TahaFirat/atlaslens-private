@@ -1,0 +1,16 @@
+{
+  "id": "created-pod",
+  "name": "phase3f-run-001",
+  "containerDiskInGb": 40,
+  "endpointId": null,
+  "networkVolume": null,
+  "volumeInGb": 20,
+  "volumeMountPath": "/workspace",
+  "ports": ["22/tcp"],
+  "gpuCount": 1,
+  "machine": {
+    "gpuTypeId": "NVIDIA L4"
+  },
+  "costPerHr": "0.39",
+  "desiredStatus": "RUNNING"
+}

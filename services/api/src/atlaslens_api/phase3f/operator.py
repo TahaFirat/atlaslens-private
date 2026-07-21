@@ -37,9 +37,12 @@ _RENTAL_EVIDENCE = frozenset(
     {"explicit_interruptible_false", "request_and_on_demand_price_attested"}
 )
 _INTERRUPTIBLE_JSON_TYPES = frozenset({"missing", "null", "string", "boolean"})
-_GPU_ATTESTATION_OUTCOMES = frozenset({"pending", "attested", "failed"})
+_GPU_ATTESTATION_OUTCOMES = frozenset({"pending", "attested", "passed", "failed"})
 _GPU_ATTESTATION_PATHS = frozenset(
     {"gpu.id", "machine.gpuTypeId", "machine.gpuType.id"}
+)
+_GPU_COUNT_ATTESTATION_PATHS = frozenset(
+    {"gpuCount", "gpu.count", "machine.gpuType.count"}
 )
 _GPU_ATTESTATION_STATUSES = frozenset({"RUNNING", "EXITED", "TERMINATED"})
 _GPU_ATTESTATION_COST = "graphql_uninterruptable_price_match"
@@ -118,6 +121,7 @@ class OperatorReceipt:
     gpu_attestation_outcome: str | None = None
     gpu_attestation_failure_code: str | None = None
     normalized_gpu_path: str | None = None
+    normalized_gpu_count_path: str | None = None
     gpu_poll_count: int | None = None
     gpu_poll_elapsed_seconds: float | None = None
     final_desired_status: str | None = None
@@ -344,6 +348,11 @@ class OperatorReceipt:
                 "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
             )
             _require(
+                self.normalized_gpu_count_path is None
+                or self.normalized_gpu_count_path in _GPU_COUNT_ATTESTATION_PATHS,
+                "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+            )
+            _require(
                 isinstance(self.gpu_poll_count, int)
                 and not isinstance(self.gpu_poll_count, bool)
                 and 0 <= self.gpu_poll_count <= 10_000,
@@ -417,7 +426,7 @@ class OperatorReceipt:
                     self.receipt_bound_match is None,
                     "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
                 )
-            if self.gpu_attestation_outcome == "attested":
+            if self.gpu_attestation_outcome in {"attested", "passed"}:
                 legacy_inventory = all(
                     value is None
                     for value in (*post_create_inventory, self.receipt_bound_match)
@@ -435,6 +444,10 @@ class OperatorReceipt:
                     and self.normalized_gpu_path is not None
                     and self.observed_gpu_id == self.expected_gpu_id
                     and self.gpu_count == 1
+                    and (
+                        self.gpu_attestation_outcome == "attested"
+                        or self.normalized_gpu_count_path is not None
+                    )
                     and self.final_desired_status == "RUNNING"
                     and self.cost_attestation == _GPU_ATTESTATION_COST
                     and (legacy_inventory or safe_inventory),
@@ -447,6 +460,7 @@ class OperatorReceipt:
                     for value in (
                         self.gpu_attestation_failure_code,
                         self.normalized_gpu_path,
+                        self.normalized_gpu_count_path,
                         self.gpu_poll_count,
                         self.gpu_poll_elapsed_seconds,
                         self.final_desired_status,
@@ -579,6 +593,7 @@ class OperatorReceipt:
             "gpu_attestation_outcome": self.gpu_attestation_outcome,
             "gpu_attestation_failure_code": self.gpu_attestation_failure_code,
             "normalized_gpu_path": self.normalized_gpu_path,
+            "normalized_gpu_count_path": self.normalized_gpu_count_path,
             "gpu_poll_count": self.gpu_poll_count,
             "gpu_poll_elapsed_seconds": self.gpu_poll_elapsed_seconds,
             "final_desired_status": self.final_desired_status,
@@ -650,6 +665,7 @@ class OperatorReceipt:
             "gpu_attestation_outcome",
             "gpu_attestation_failure_code",
             "normalized_gpu_path",
+            "normalized_gpu_count_path",
             "gpu_poll_count",
             "gpu_poll_elapsed_seconds",
             "final_desired_status",
@@ -678,6 +694,9 @@ class OperatorReceipt:
             "connectivity_elapsed_seconds",
             "ssh_ready",
         }
+        legacy_gpu_attestation_fields = gpu_attestation_fields - {
+            "normalized_gpu_count_path"
+        }
         schema = row.get("schema")
         is_legacy = schema == _LEGACY_OPERATOR_RECEIPT_SCHEMA
         normalized_fields = set(row)
@@ -689,21 +708,17 @@ class OperatorReceipt:
                 and frozenset(normalized_fields)
                 in {
                     frozenset(legacy_expected | evidence_fields),
-                    frozenset(
-                        legacy_expected | evidence_fields | gpu_attestation_fields
-                    ),
-                    frozenset(
-                        legacy_expected
-                        | evidence_fields
-                        | gpu_attestation_fields
-                        | connectivity_fields
-                    ),
-                    frozenset(
-                        legacy_expected
-                        | evidence_fields
-                        | gpu_attestation_fields
-                        | post_create_inventory_fields
-                        | connectivity_fields
+                    *(
+                        frozenset(legacy_expected | evidence_fields | gpu_fields | suffix)
+                        for gpu_fields in (
+                            legacy_gpu_attestation_fields,
+                            gpu_attestation_fields,
+                        )
+                        for suffix in (
+                            set(),
+                            connectivity_fields,
+                            post_create_inventory_fields | connectivity_fields,
+                        )
                     ),
                 }
             ),
@@ -764,6 +779,9 @@ class OperatorReceipt:
             row.get("gpu_attestation_failure_code") if has_gpu_attestation else None
         )
         normalized_gpu_path = row.get("normalized_gpu_path") if has_gpu_attestation else None
+        normalized_gpu_count_path = (
+            row.get("normalized_gpu_count_path") if has_gpu_attestation else None
+        )
         gpu_poll_count = row.get("gpu_poll_count") if has_gpu_attestation else None
         gpu_poll_elapsed_seconds = (
             row.get("gpu_poll_elapsed_seconds") if has_gpu_attestation else None
@@ -823,6 +841,7 @@ class OperatorReceipt:
             gpu_attestation_outcome,
             gpu_attestation_failure_code,
             normalized_gpu_path,
+            normalized_gpu_count_path,
             final_desired_status,
             expected_gpu_id,
             observed_gpu_id,
@@ -951,6 +970,7 @@ class OperatorReceipt:
                 str | None, gpu_attestation_failure_code
             ),
             normalized_gpu_path=cast(str | None, normalized_gpu_path),
+            normalized_gpu_count_path=cast(str | None, normalized_gpu_count_path),
             gpu_poll_count=cast(int | None, gpu_poll_count),
             gpu_poll_elapsed_seconds=cast(
                 float | None, gpu_poll_elapsed_seconds
@@ -1048,6 +1068,7 @@ class OperatorReceipt:
             gpu_attestation_outcome=diagnostic.outcome,
             gpu_attestation_failure_code=diagnostic.failure_code,
             normalized_gpu_path=diagnostic.normalized_gpu_path,
+            normalized_gpu_count_path=diagnostic.normalized_gpu_count_path,
             gpu_poll_count=diagnostic.poll_count,
             gpu_poll_elapsed_seconds=diagnostic.poll_elapsed_seconds,
             final_desired_status=diagnostic.final_desired_status,

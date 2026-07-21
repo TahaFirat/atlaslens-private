@@ -16,6 +16,7 @@ from atlaslens_api.phase3f.runpod import (
     POD_VOLUME_GB,
     REST_BASE_URL,
     GPUOffer,
+    PodAllocationSimulationDiagnostic,
     PodConnection,
     PodConnectivityProgressDiagnostic,
     PodGPUAttestationProgressDiagnostic,
@@ -24,6 +25,7 @@ from atlaslens_api.phase3f.runpod import (
     RunPodCreateError,
     RunPodV1Client,
     build_create_payload,
+    simulate_pod_allocation_state_machine,
     validate_create_payload_contract,
 )
 from atlaslens_api.phase3f.safety import (
@@ -272,6 +274,168 @@ class _FakeClock:
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
         self.now += seconds
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_gpu_path", "expected_count_path"),
+    [
+        (
+            {
+                "desiredStatus": "RUNNING",
+                "gpuCount": 1,
+                "machine": {"gpuTypeId": "NVIDIA L4"},
+            },
+            "machine.gpuTypeId",
+            "gpuCount",
+        ),
+        (
+            {
+                "desiredStatus": "RUNNING",
+                "gpu": {"id": "NVIDIA L4", "count": 1},
+            },
+            "gpu.id",
+            "gpu.count",
+        ),
+        (
+            {
+                "desiredStatus": "RUNNING",
+                "machine": {"gpuType": {"id": "NVIDIA L4", "count": 1}},
+            },
+            "machine.gpuType.id",
+            "machine.gpuType.count",
+        ),
+    ],
+)
+def test_gpu_count_normalizes_all_provider_response_paths(
+    response: dict[str, object],
+    expected_gpu_path: str,
+    expected_count_path: str,
+) -> None:
+    result = simulate_pod_allocation_state_machine(
+        response,
+        expected_gpu_id="NVIDIA L4",
+    )
+
+    assert isinstance(result, PodAllocationSimulationDiagnostic)
+    assert result.gpu_attestation_outcome == "passed"
+    assert result.normalized_gpu_path == expected_gpu_path
+    assert result.normalized_gpu_count_path == expected_count_path
+    assert result.gpu_count == 1
+
+
+def test_gpu_count_accepts_multiple_consistent_response_paths() -> None:
+    result = simulate_pod_allocation_state_machine(
+        {
+            "desiredStatus": "RUNNING",
+            "gpuCount": 1,
+            "gpu": {"id": "NVIDIA L4", "count": 1},
+            "machine": {
+                "gpuTypeId": "NVIDIA L4",
+                "gpuType": {"id": "NVIDIA L4", "count": 1},
+            },
+        },
+        expected_gpu_id="NVIDIA L4",
+    )
+
+    assert result.normalized_gpu_count_path == "gpuCount"
+    assert result.gpu_count == 1
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, "1", 1.0, [], {}],
+)
+def test_gpu_count_rejects_non_json_integer_types(value: object) -> None:
+    with pytest.raises(RunPodAPIError, match="POD_GPU_COUNT_INVALID"):
+        simulate_pod_allocation_state_machine(
+            {
+                "desiredStatus": "RUNNING",
+                "gpuCount": value,
+                "machine": {"gpuTypeId": "NVIDIA L4"},
+            },
+            expected_gpu_id="NVIDIA L4",
+        )
+
+
+@pytest.mark.parametrize("value", [-1, 0, 2])
+def test_gpu_count_rejects_integer_values_other_than_one(value: int) -> None:
+    with pytest.raises(RunPodAPIError, match="POD_GPU_COUNT_MISMATCH"):
+        simulate_pod_allocation_state_machine(
+            {
+                "desiredStatus": "RUNNING",
+                "gpuCount": value,
+                "machine": {"gpuTypeId": "NVIDIA L4"},
+            },
+            expected_gpu_id="NVIDIA L4",
+        )
+
+
+def test_gpu_count_rejects_conflicting_paths() -> None:
+    with pytest.raises(RunPodAPIError, match="POD_GPU_COUNT_MISMATCH"):
+        simulate_pod_allocation_state_machine(
+            {
+                "desiredStatus": "RUNNING",
+                "gpuCount": 1,
+                "gpu": {"id": "NVIDIA L4", "count": 2},
+            },
+            expected_gpu_id="NVIDIA L4",
+        )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"desiredStatus": "RUNNING", "machine": {"gpuTypeId": "NVIDIA L4"}},
+        {
+            "desiredStatus": "RUNNING",
+            "gpuCount": None,
+            "gpu": {"id": "NVIDIA L4", "count": None},
+            "machine": {
+                "gpuTypeId": "NVIDIA L4",
+                "gpuType": {"count": None},
+            },
+        },
+    ],
+)
+def test_gpu_count_missing_or_null_has_specific_pending_terminal_code(
+    response: dict[str, object],
+) -> None:
+    with pytest.raises(
+        RunPodAPIError,
+        match="POD_GPU_COUNT_ATTESTATION_TIMEOUT",
+    ):
+        simulate_pod_allocation_state_machine(
+            response,
+            expected_gpu_id="NVIDIA L4",
+        )
+
+
+def test_exact_live_shape_mutation_free_simulation_reaches_connectivity() -> None:
+    fixture = json.loads(
+        (FIXTURES / "runpod_create_201_top_level_gpu_count.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    public = simulate_pod_allocation_state_machine(
+        fixture,
+        expected_gpu_id="NVIDIA L4",
+    ).to_public_dict()
+
+    assert public == {
+        "gpu_attestation_outcome": "passed",
+        "normalized_gpu_path": "machine.gpuTypeId",
+        "normalized_gpu_count_path": "gpuCount",
+        "gpu_count": 1,
+        "next_state": "connectivity",
+        "local_blockers": [],
+        "network_calls": 0,
+        "cloud_mutations": 0,
+        "create_attempts": 0,
+        "secret_free": True,
+    }
+    assert "created-pod" not in repr(public)
+    assert TOKEN not in repr(public)
 
 
 def test_inventory_lists_only_documented_rest_v1_resources() -> None:
@@ -953,6 +1117,82 @@ def test_sanitized_machine_only_create_fixture_polls_authenticated_gpu_shape(
     assert attestation.gpu_count == 1
 
 
+def test_top_level_create_count_survives_sparse_get_and_starts_connectivity() -> None:
+    create_fixture = json.loads(
+        (FIXTURES / "runpod_create_201_top_level_gpu_count.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    create_fixture["machine"] = {"gpuTypeId": "NVIDIA RTX A5000"}
+    create_fixture["costPerHr"] = "0.45"
+    post_calls = 0
+    exact_get_calls = 0
+    clock = _FakeClock()
+
+    def sparse_get(*, ip_ready: bool) -> dict[str, object]:
+        payload = _attested_pod_payload(gpu_shape="machine.gpuTypeId")
+        payload["machine"] = {"gpuTypeId": "NVIDIA RTX A5000"}
+        payload["publicIp"] = "192.0.2.10" if ip_ready else None
+        payload["portMappings"] = {"22": 10341} if ip_ready else None
+        return payload
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls, exact_get_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            post_calls += 1
+            return httpx.Response(201, json=create_fixture)
+        if request.url.path.endswith("/pods/created-pod"):
+            exact_get_calls += 1
+            return httpx.Response(
+                200,
+                json=sparse_get(ip_ready=exact_get_calls >= 3),
+            )
+        if request.url.path.endswith("/pods"):
+            return httpx.Response(
+                200,
+                json=[{"id": "created-pod", "name": "phase3f-run-001"}],
+            )
+        return httpx.Response(200, json=[])
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        attestation_timeout_seconds=1,
+        connectivity_timeout_seconds=10,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    ) as client:
+        pod = client.create_pod(_request())
+        create_diagnostic = client.last_create_response_diagnostic
+        allocation = client.last_gpu_attestation_progress
+        attestation = client.last_rental_attestation
+        connection = client.await_pod_connectivity(
+            pod,
+            _request(),
+            ssh_probe=lambda _connection, _timeout: True,
+        )
+        connectivity = client.last_connectivity_progress
+
+    assert post_calls == 1
+    assert exact_get_calls == 3
+    assert clock.now == 2
+    assert create_diagnostic is not None
+    assert "gpuCount" in create_diagnostic.top_level_keys
+    assert attestation is not None
+    assert attestation.gpu_count == 1
+    assert attestation.normalized_gpu_count_path == "gpuCount"
+    assert allocation is not None
+    assert allocation.outcome == "passed"
+    assert allocation.normalized_gpu_count_path == "gpuCount"
+    assert allocation.gpu_count == 1
+    assert connectivity is not None
+    assert connectivity.outcome == "ready"
+    assert connection.gpu_display_name == "RTX A5000"
+
+
 def test_progress_callback_failure_preserves_receipt_bound_cleanup_carrier() -> None:
     pod_present = False
     deleted: list[str] = []
@@ -1003,7 +1243,7 @@ def test_progress_callback_failure_preserves_receipt_bound_cleanup_carrier() -> 
     ("get_overrides", "expected_code"),
     [
         ({"gpu_type_id": "NVIDIA L4"}, "pod_gpu_attestation_gpu_mismatch"),
-        ({"gpu_count": 2}, "pod_gpu_attestation_gpu_count_mismatch"),
+        ({"gpu_count": 2}, "POD_GPU_COUNT_MISMATCH"),
         ({"cost_per_hr": "0.46"}, "pod_gpu_attestation_price_mismatch"),
         ({"interruptible": True}, "pod_interruptible_true"),
         ({"interruptible": 0}, "pod_interruptible_type_invalid"),
@@ -1183,7 +1423,10 @@ def test_gpu_attestation_timeout_is_bounded_and_never_retries_create() -> None:
         sleep=clock.sleep,
     ) as client:
         session = SinglePodSession(client)
-        with pytest.raises(RunPodCreateError, match="POD_GPU_ATTESTATION_TIMEOUT"):
+        with pytest.raises(
+            RunPodCreateError,
+            match="POD_GPU_COUNT_ATTESTATION_TIMEOUT",
+        ):
             session.execute(_request(), lambda _lease: None)
         progress = client.last_gpu_attestation_progress
 
@@ -1618,7 +1861,7 @@ def test_post_create_inventory_accepts_only_receipt_bound_pod_and_nested_fields(
     assert bound == [pod]
     assert post_calls == 1
     assert progress is not None
-    assert progress.outcome == "attested"
+    assert progress.outcome == "passed"
     assert progress.receipt_bound_pod_count == 1
     assert progress.unexpected_pod_count == 0
     assert progress.endpoint_count == 0
