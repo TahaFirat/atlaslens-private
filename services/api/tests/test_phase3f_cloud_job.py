@@ -9,17 +9,25 @@ import pytest
 
 from atlaslens_api.mapillary_demo.client import RemoteImage
 from atlaslens_api.mapillary_demo.models import BoundingBox, GeoPoint, ImageMetadata
+from atlaslens_api.phase3f import cloud_job as worker
 from atlaslens_api.phase3f.acquisition import AcquisitionGuard
 from atlaslens_api.phase3f.cloud_job import (
+    MEDIA_PLAN_REVISION_SCHEMA,
+    MEDIA_REPLENISHMENT_MAX_ROUNDS,
+    MEDIA_REPLENISHMENT_MAX_TOTAL,
+    MediaSplitPlan,
     MetadataAsset,
     MetadataAudit,
     PlannedAsset,
+    acquire_replenished_media,
     finalize_media_split,
     finalize_provenance_aggregate,
     load_city_areas,
+    load_media_plan_revision,
     plan_locked_roles,
     plan_metadata_split,
     quarter_bbox,
+    replenish_media_reserves,
 )
 from atlaslens_api.phase3f.coverage import (
     CANDIDATE_CITY_REGIONS,
@@ -163,6 +171,49 @@ def _sized_audit(
     return MetadataAudit(selection, assets_by_city, request_count=64, rejected_item_count=0)
 
 
+def _write_task_ledger(
+    path: Path,
+    plan: tuple[PlannedAsset, ...],
+    states: dict[str, str],
+    *,
+    run_id: str,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "atlaslens-phase3f-media-task-ledger-v2",
+                "run_id": run_id,
+                "tasks": [
+                    {
+                        "image_id": item.metadata.image_id,
+                        "city": item.metadata.city,
+                        "role": item.role,
+                        "state": states.get(item.metadata.image_id, "REJECTED"),
+                    }
+                    for item in plan
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _media_deficit(city: str, role: str, deficit: int) -> dict[str, object]:
+    return {
+        "failed_constraints": [
+            {
+                "constraint": "media_city_role_minimum_after_decode_and_dedup",
+                "city": city,
+                "role": role,
+                "required_records": 75,
+                "available_records": 75 - deficit,
+                "deficit_records": deficit,
+            }
+        ]
+    }
+
+
 def test_aoi_config_covers_exact_candidate_pool_with_bounded_tiles() -> None:
     areas = load_city_areas(AOI_CONFIG)
 
@@ -213,9 +264,7 @@ def test_role_planner_is_deterministic_and_globally_disjoint() -> None:
     assert first == second
     assert len(first) == 6 * 125 + 2 * 40
     counts = {
-        (city, role): sum(
-            item.metadata.city == city and item.role == role for item in first
-        )
+        (city, role): sum(item.metadata.city == city and item.role == role for item in first)
         for city in (*in_domain, *ood)
         for role in ("reference", "calibration", "sealed_holdout", "ood_holdout")
     }
@@ -319,9 +368,7 @@ def test_shared_sequence_connects_contributors_into_one_split_role() -> None:
 
     assert plan.ready is True
     linked_roles = {
-        item.role
-        for item in plan.download_assets
-        if item.metadata.creator_id in linked_creators
+        item.role for item in plan.download_assets if item.metadata.creator_id in linked_creators
     }
     assert len(linked_roles) == 1
 
@@ -341,9 +388,7 @@ def test_media_failures_and_cross_role_duplicates_are_replaced_from_reserves() -
     downloaded = tuple(
         _split_asset(
             item,
-            duplicate=duplicate_source
-            if item.metadata.image_id == duplicate_target_id
-            else None,
+            duplicate=duplicate_source if item.metadata.image_id == duplicate_target_id else None,
         )
         for item in plan.download_assets
         if item.metadata.image_id != omitted_id
@@ -356,12 +401,323 @@ def test_media_failures_and_cross_role_duplicates_are_replaced_from_reserves() -
     leakage = audit_leakage(media.assets, spatial_exclusion_meters=1_000.0)
     assert leakage.passed is True
     duplicate_roles = {
-        item.role
-        for item in media.assets
-        if item.content_sha256 == duplicate_source.content_sha256
+        item.role for item in media.assets if item.content_sha256 == duplicate_source.content_sha256
     }
     assert len(duplicate_roles) == 1
     assert all(item.parent_or_tile_id != omitted_id for item in media.assets)
+
+
+def test_three_missing_media_selects_deterministic_unused_same_bucket_reserves(
+    tmp_path: Path,
+) -> None:
+    audit = _sized_audit(in_domain_sizes=(100, 40, 40), ood_sizes=(50,))
+    base_plan = plan_metadata_split(audit)
+    assert base_plan.ready is True
+    city = _TEST_IN_DOMAIN[0]
+    target_primary = [
+        item
+        for item in base_plan.primary
+        if item.metadata.city == city and item.role == "reference"
+    ]
+    omitted = {item.metadata.image_id for item in target_primary[-3:]}
+    omitted.update(
+        item.metadata.image_id
+        for item in base_plan.reserves
+        if item.metadata.city == city and item.role == "reference"
+    )
+    accepted_ids = {
+        item.metadata.image_id
+        for item in base_plan.download_assets
+        if item.metadata.image_id not in omitted
+    }
+    states = {
+        item.metadata.image_id: (
+            "ACCEPTED" if item.metadata.image_id in accepted_ids else "REJECTED"
+        )
+        for item in base_plan.download_assets
+    }
+    run_id = "e" * 32
+    ledger = tmp_path / "media-task-ledger.json"
+    revision = tmp_path / "media-plan-revisions.json"
+    _write_task_ledger(ledger, base_plan.download_assets, states, run_id=run_id)
+    ledger_before = ledger.read_bytes()
+    state = load_media_plan_revision(audit, base_plan, revision, run_id=run_id)
+
+    first, report = replenish_media_reserves(
+        audit,
+        state,
+        _media_deficit(city, "reference", 3),
+        run_id=run_id,
+        ledger_path=ledger,
+        revision_path=revision,
+    )
+
+    assert report["action"] == "ACQUIRE_INCREMENTAL_RESERVES"
+    assert report["selected_this_round"] == 12
+    assert first.plan.revision == 1
+    assert first.plan.incremental_reserve_count == 12
+    incremental = first.plan.reserves[len(base_plan.reserves) :]
+    assert all(item.metadata.city == city and item.role == "reference" for item in incremental)
+    assert not ({item.metadata.image_id for item in incremental} & set(states))
+    assert ledger.read_bytes() == ledger_before
+    document = json.loads(revision.read_text())
+    assert document["schema"] == MEDIA_PLAN_REVISION_SCHEMA
+    assert document["revision"] == 1
+    assert document["total_added"] == 12
+    assert document["bounds"]["max_rounds"] == MEDIA_REPLENISHMENT_MAX_ROUNDS
+    assert document["bounds"]["max_total_candidates"] == MEDIA_REPLENISHMENT_MAX_TOTAL
+
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second_ledger = second_root / "media-task-ledger.json"
+    second_revision = second_root / "media-plan-revisions.json"
+    _write_task_ledger(second_ledger, base_plan.download_assets, states, run_id=run_id)
+    repeated, repeated_report = replenish_media_reserves(
+        audit,
+        load_media_plan_revision(audit, base_plan, second_revision, run_id=run_id),
+        _media_deficit(city, "reference", 3),
+        run_id=run_id,
+        ledger_path=second_ledger,
+        revision_path=second_revision,
+    )
+    assert repeated_report["selected_this_round"] == 12
+    assert [item.metadata.image_id for item in repeated.plan.reserves] == [
+        item.metadata.image_id for item in first.plan.reserves
+    ]
+
+    roles_by_contributor: dict[str, set[str]] = {}
+    roles_by_sequence: dict[str, set[str]] = {}
+    for item in first.plan.download_assets:
+        assert item.metadata.creator_id is not None
+        assert item.metadata.sequence_id is not None
+        roles_by_contributor.setdefault(item.metadata.creator_id, set()).add(item.role)
+        roles_by_sequence.setdefault(item.metadata.sequence_id, set()).add(item.role)
+    assert all(len(roles) == 1 for roles in roles_by_contributor.values())
+    assert all(len(roles) == 1 for roles in roles_by_sequence.values())
+
+
+def test_failed_first_replenishment_round_adds_disjoint_second_round(
+    tmp_path: Path,
+) -> None:
+    audit = _sized_audit(in_domain_sizes=(100, 40, 40), ood_sizes=(50,))
+    base_plan = plan_metadata_split(audit)
+    city = _TEST_IN_DOMAIN[0]
+    target = [
+        item
+        for item in base_plan.primary
+        if item.metadata.city == city and item.role == "reference"
+    ]
+    accepted_ids = {item.metadata.image_id for item in base_plan.download_assets} - {
+        item.metadata.image_id for item in target[-3:]
+    }
+    states = {
+        item.metadata.image_id: (
+            "ACCEPTED" if item.metadata.image_id in accepted_ids else "REJECTED"
+        )
+        for item in base_plan.download_assets
+    }
+    run_id = "f" * 32
+    ledger = tmp_path / "media-task-ledger.json"
+    revision = tmp_path / "media-plan-revisions.json"
+    _write_task_ledger(ledger, base_plan.download_assets, states, run_id=run_id)
+    first, _report = replenish_media_reserves(
+        audit,
+        load_media_plan_revision(audit, base_plan, revision, run_id=run_id),
+        _media_deficit(city, "reference", 3),
+        run_id=run_id,
+        ledger_path=ledger,
+        revision_path=revision,
+    )
+    first_ids = {item.metadata.image_id for item in first.plan.reserves[len(base_plan.reserves) :]}
+    failed_states = dict(states)
+    failed_states.update({image_id: "REJECTED" for image_id in first_ids})
+    _write_task_ledger(ledger, first.plan.download_assets, failed_states, run_id=run_id)
+
+    second, report = replenish_media_reserves(
+        audit,
+        load_media_plan_revision(audit, base_plan, revision, run_id=run_id),
+        _media_deficit(city, "reference", 3),
+        run_id=run_id,
+        ledger_path=ledger,
+        revision_path=revision,
+    )
+    all_incremental = second.plan.reserves[len(base_plan.reserves) :]
+    second_ids = {
+        item.metadata.image_id
+        for item in all_incremental
+        if item.metadata.image_id not in first_ids
+    }
+    assert report["action"] == "ACQUIRE_INCREMENTAL_RESERVES"
+    assert second.plan.revision == 2
+    assert first_ids
+    assert second_ids
+    assert first_ids.isdisjoint(second_ids)
+
+
+def test_acquisition_loop_automatically_completes_on_second_replenishment_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audit = _sized_audit(in_domain_sizes=(100, 40, 40), ood_sizes=(50,))
+    base_plan = plan_metadata_split(audit)
+    city = _TEST_IN_DOMAIN[0]
+    target = [
+        item
+        for item in base_plan.primary
+        if item.metadata.city == city and item.role == "reference"
+    ]
+    states = {item.metadata.image_id: "ACCEPTED" for item in base_plan.download_assets}
+    for item in target[-3:]:
+        states[item.metadata.image_id] = "REJECTED"
+    for item in base_plan.reserves:
+        if item.metadata.city == city and item.role == "reference":
+            states[item.metadata.image_id] = "REJECTED"
+    run_id = "3" * 32
+    checkpoint = tmp_path / "acquisition-checkpoint.json"
+    ledger = tmp_path / "media-task-ledger.json"
+    revision = tmp_path / "media-plan-revisions.json"
+    _write_task_ledger(ledger, base_plan.download_assets, states, run_id=run_id)
+    calls = 0
+
+    def fake_acquire(
+        _client: object,
+        _areas: object,
+        planned: tuple[PlannedAsset, ...],
+        *_args: object,
+        **_kwargs: object,
+    ) -> tuple[tuple[SplitAsset, ...], dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            new_ids = [
+                item.metadata.image_id for item in planned if item.metadata.image_id not in states
+            ]
+            states.update({image_id: "REJECTED" for image_id in new_ids})
+            states.update({image_id: "ACCEPTED" for image_id in new_ids[:2]})
+        elif calls == 3:
+            new_ids = [
+                item.metadata.image_id for item in planned if item.metadata.image_id not in states
+            ]
+            states.update({image_id: "REJECTED" for image_id in new_ids})
+            if new_ids:
+                states[new_ids[0]] = "ACCEPTED"
+        _write_task_ledger(ledger, planned, states, run_id=run_id)
+        return (), {"media_status": "MEDIA_SPLIT_MINIMUM_UNAVAILABLE"}
+
+    def fake_finalize(
+        _plan: object,
+        _assets: object,
+    ) -> MediaSplitPlan:
+        if calls == 1:
+            return MediaSplitPlan((), _media_deficit(city, "reference", 3))
+        if calls == 2:
+            return MediaSplitPlan((), _media_deficit(city, "reference", 1))
+        return MediaSplitPlan((), {"ready": True})
+
+    monkeypatch.setattr(worker, "acquire_planned_assets", fake_acquire)
+    monkeypatch.setattr(worker, "finalize_media_split", fake_finalize)
+
+    _assets, _provenance, media_plan, report = acquire_replenished_media(
+        object(),  # type: ignore[arg-type]
+        (),
+        audit,
+        base_plan,
+        tmp_path / "media",
+        run_id,
+        AcquisitionGuard(),
+        checkpoint,
+        revision,
+    )
+
+    assert calls == 3
+    assert media_plan.ready is True
+    assert report is not None
+    assert report["revision"] == 2
+    assert json.loads(revision.read_text())["revision"] == 2
+
+
+def test_media_replenishment_reports_true_corpus_exhaustion(tmp_path: Path) -> None:
+    audit = _sized_audit(in_domain_sizes=(85, 25, 25), ood_sizes=(40,))
+    base_plan = plan_metadata_split(audit)
+    assert base_plan.ready is True
+    assert {item.metadata.image_id for item in base_plan.download_assets} == {
+        item.image_id for rows in audit.assets_by_city.values() for item in rows
+    }
+    city = _TEST_IN_DOMAIN[0]
+    target = next(
+        item
+        for item in base_plan.primary
+        if item.metadata.city == city and item.role == "reference"
+    )
+    states = {item.metadata.image_id: "ACCEPTED" for item in base_plan.download_assets}
+    states[target.metadata.image_id] = "REJECTED"
+    run_id = "1" * 32
+    ledger = tmp_path / "media-task-ledger.json"
+    revision = tmp_path / "media-plan-revisions.json"
+    _write_task_ledger(ledger, base_plan.download_assets, states, run_id=run_id)
+
+    unchanged, report = replenish_media_reserves(
+        audit,
+        load_media_plan_revision(audit, base_plan, revision, run_id=run_id),
+        _media_deficit(city, "reference", 1),
+        run_id=run_id,
+        ledger_path=ledger,
+        revision_path=revision,
+    )
+
+    assert unchanged.plan == base_plan
+    assert report["action"] == "MEDIA_CORPUS_EXHAUSTED"
+    selectable = report["selectable_unused"]
+    assert isinstance(selectable, list)
+    assert selectable[0]["selectable_unused_records"] == 0
+
+
+def test_replenishment_does_not_mutate_existing_827_accepted_ledger(
+    tmp_path: Path,
+) -> None:
+    audit = _sized_audit(in_domain_sizes=(100, 40, 40), ood_sizes=(50,))
+    base_plan = plan_metadata_split(audit)
+    city = _TEST_IN_DOMAIN[0]
+    states = {
+        item.metadata.image_id: ("ACCEPTED" if index < 827 else "REJECTED")
+        for index, item in enumerate(base_plan.download_assets)
+    }
+    target_rows = [
+        item
+        for item in base_plan.download_assets
+        if item.metadata.city == city and item.role == "reference"
+    ]
+    for item in target_rows[-3:]:
+        states[item.metadata.image_id] = "REJECTED"
+    accepted_now = sum(state == "ACCEPTED" for state in states.values())
+    for item in base_plan.download_assets:
+        if accepted_now >= 827:
+            break
+        if states[item.metadata.image_id] == "REJECTED" and item not in target_rows:
+            states[item.metadata.image_id] = "ACCEPTED"
+            accepted_now += 1
+    assert accepted_now == 827
+    run_id = "2" * 32
+    ledger = tmp_path / "media-task-ledger.json"
+    revision = tmp_path / "media-plan-revisions.json"
+    _write_task_ledger(ledger, base_plan.download_assets, states, run_id=run_id)
+    before = hashlib.sha256(ledger.read_bytes()).hexdigest()
+
+    revised, _report = replenish_media_reserves(
+        audit,
+        load_media_plan_revision(audit, base_plan, revision, run_id=run_id),
+        _media_deficit(city, "reference", 3),
+        run_id=run_id,
+        ledger_path=ledger,
+        revision_path=revision,
+    )
+
+    assert hashlib.sha256(ledger.read_bytes()).hexdigest() == before
+    assert sum(state == "ACCEPTED" for state in states.values()) == 827
+    assert not (
+        {item.metadata.image_id for item in revised.plan.download_assets}
+        - {item.metadata.image_id for item in base_plan.download_assets}
+    ) & set(states)
 
 
 def test_provenance_aggregate_is_rebound_to_selected_assets_only(tmp_path: Path) -> None:
@@ -394,9 +750,7 @@ def test_pipeline_records_post_download_dataset_not_ready_as_terminal(
     pipeline.lock_selection(audit.selection)
     pipeline.complete_acquisition(AcquisitionGuard())
 
-    pipeline.finalize_dataset_not_ready(
-        reason_code="MEDIA_SPLIT_MINIMUM_UNAVAILABLE"
-    )
+    pipeline.finalize_dataset_not_ready(reason_code="MEDIA_SPLIT_MINIMUM_UNAVAILABLE")
 
     resumed = Phase3FPipeline.resume(state)
     assert resumed.stage is PipelineStage.COVERAGE_INSUFFICIENT

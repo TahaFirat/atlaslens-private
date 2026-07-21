@@ -1,5 +1,36 @@
 # Decision log
 
+## 2026-07-21 - Phase 3F media reserves are replenished from the locked metadata pool
+
+- Context: The direct image resolver completed all usable tasks in the original
+  830-primary/200-reserve media plan but stopped at 827 accepted files. Raw ledger
+  counts showed a three-record `İzmir/reference` gap. The post-media readiness gate
+  also correctly collapsed eleven legacy İstanbul pHash neighbours, producing
+  component deficits of eleven İstanbul reference and three İzmir reference. The
+  locked 8,805-row metadata corpus still contained hundreds of unused, compatible
+  records; lowering minima or treating 827 raw files as ready would be false.
+- Decision: Add an additive, atomically written and hash-chained media plan revision.
+  Count compatible unfinished ledger tasks first, then select only residual capacity
+  from never-planned metadata in the failed city/role bucket. Require a single split
+  role per transitive contributor/sequence isolation group, retain the one-kilometre
+  reference/holdout boundary, and leave exact/pHash acceptance to the existing
+  post-download gates. Exclude every ID already present in the task ledger. Limit
+  selection to 16 candidates per deficit per round, 128 total, and three rounds;
+  automatically continue after item download/decode/duplicate loss.
+- Alternatives: Lower the 830/minimum gates; redownload the 827 accepted assets;
+  reassign existing splits; query Mapillary for more metadata; select arbitrary
+  same-city rows without isolation groups; or require a new operator prompt after
+  every depleted reserve batch.
+- Consequences: The current corpus has 91 selectable unused İstanbul reference and
+  369 İzmir reference records. Existing pending tasks reduce first-round new capacity
+  to one plus three; the deterministic first revision records 16 candidates while
+  downloading only until component readiness is restored. Resume can recover across
+  checkpoint boundaries without redownloading accepted media. Genuine pool exhaustion
+  emits `MEDIA_CORPUS_EXHAUSTED`; bounded-policy exhaustion is distinct. RunPod remains
+  unreachable until the final 830-component leakage-safe split seals.
+- Target phase: Product Phase 3F bounded local-first acquisition and private
+  fine-tuning only.
+
 ## 2026-07-20 - Phase 3F media URL resolution uses the direct image contract
 
 - Context: The earlier media state-machine repair retained the collection-based

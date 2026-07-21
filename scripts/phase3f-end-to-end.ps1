@@ -174,7 +174,11 @@ switch ($Action) {
         $localResult = Invoke-LocalAcquisition -ResumeExisting $resumeExisting
         if (
             [string]$localResult.stage -like "PAUSED_*" -or
-            [string]$localResult.stage -eq "MEDIA_SPLIT_MINIMUM_UNAVAILABLE"
+            [string]$localResult.stage -in @(
+                "MEDIA_SPLIT_MINIMUM_UNAVAILABLE",
+                "MEDIA_CORPUS_EXHAUSTED",
+                "MEDIA_REPLENISHMENT_LIMIT_REACHED"
+            )
         ) {
             $localResult | ConvertTo-Json -Compress -Depth 4
             break

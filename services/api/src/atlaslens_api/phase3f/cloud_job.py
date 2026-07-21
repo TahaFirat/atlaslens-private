@@ -122,6 +122,11 @@ MEDIA_RATE_LIMIT_COOLDOWN_SECONDS: Final = 60
 MEDIA_RATE_LIMIT_COOLDOWN_MAX_SECONDS: Final = 15 * 60
 MEDIA_RATE_LIMIT_TASK_ATTEMPT_CAP: Final = 2
 MEDIA_SIGNED_URL_REFRESH_CAP: Final = 1
+MEDIA_PLAN_REVISION_SCHEMA: Final = "atlaslens-phase3f-media-plan-revisions-v1"
+MEDIA_REPLENISHMENT_MAX_ROUNDS: Final = 3
+MEDIA_REPLENISHMENT_MAX_TOTAL: Final = 128
+MEDIA_REPLENISHMENT_MAX_PER_DEFICIT: Final = 16
+MEDIA_REPLENISHMENT_PER_DEFICIT_PER_ROUND: Final = 4
 _LEGACY_MEDIA_RESOLVER_RETRY_CODES: Final = frozenset(
     {
         "mapillary_api_server_retry_exhausted",
@@ -362,6 +367,8 @@ class MetadataSplitPlan:
     primary: tuple[PlannedAsset, ...]
     reserves: tuple[PlannedAsset, ...]
     readiness: Mapping[str, object]
+    revision: int = 0
+    incremental_reserve_count: int = 0
 
     @property
     def ready(self) -> bool:
@@ -380,6 +387,14 @@ class MediaSplitPlan:
     @property
     def ready(self) -> bool:
         return bool(self.readiness.get("ready"))
+
+
+@dataclass(frozen=True, slots=True)
+class MediaPlanRevisionState:
+    plan: MetadataSplitPlan
+    compatible_plan_sha256: tuple[str, ...]
+    target_counts: Mapping[tuple[str, Role], int]
+    total_added: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1754,6 +1769,540 @@ def plan_locked_roles(audit: MetadataAudit) -> tuple[PlannedAsset, ...]:
     return plan.primary
 
 
+def _metadata_by_image_id(audit: MetadataAudit) -> dict[str, MetadataAsset]:
+    selected_cities = {record.city for record in (*audit.selection.in_domain, *audit.selection.ood)}
+    result: dict[str, MetadataAsset] = {}
+    for city in sorted(selected_cities):
+        for asset in audit.assets_by_city[city]:
+            _require(asset.image_id not in result, "METADATA_IMAGE_ID_DUPLICATE")
+            result[asset.image_id] = asset
+    return result
+
+
+def _metadata_group_by_image_id(audit: MetadataAudit) -> dict[str, str]:
+    return {
+        asset.image_id: group_sha256
+        for group_sha256, assets in _metadata_isolation_groups(audit)
+        for asset in assets
+    }
+
+
+def _media_plan_isolation_valid(audit: MetadataAudit, plan: MetadataSplitPlan) -> bool:
+    group_by_image_id = _metadata_group_by_image_id(audit)
+    roles_by_group: dict[str, set[Role]] = defaultdict(set)
+    for item in plan.download_assets:
+        group_sha256 = group_by_image_id.get(item.metadata.image_id)
+        if group_sha256 is None:
+            return False
+        roles_by_group[group_sha256].add(item.role)
+    if any(len(roles) > 1 for roles in roles_by_group.values()):
+        return False
+    references: dict[str, list[MetadataAsset]] = defaultdict(list)
+    holdouts: dict[str, list[MetadataAsset]] = defaultdict(list)
+    for item in plan.download_assets:
+        if item.role == "reference":
+            references[item.metadata.city].append(item.metadata)
+        elif item.role == "sealed_holdout":
+            holdouts[item.metadata.city].append(item.metadata)
+    return all(
+        _distance_m(reference, holdout) >= SPATIAL_EXCLUSION_METERS
+        for city, city_references in references.items()
+        for reference in city_references
+        for holdout in holdouts[city]
+    )
+
+
+def _media_revision_document(
+    *,
+    run_id: str,
+    base_plan_sha256: str,
+    current_plan_sha256: str,
+    rounds: Sequence[Mapping[str, object]],
+    target_counts: Mapping[tuple[str, Role], int],
+) -> dict[str, object]:
+    total_added = sum(len(cast(list[object], row.get("candidates", []))) for row in rounds)
+    return {
+        "schema": MEDIA_PLAN_REVISION_SCHEMA,
+        "run_id": run_id,
+        "base_plan_sha256": base_plan_sha256,
+        "current_plan_sha256": current_plan_sha256,
+        "revision": len(rounds),
+        "total_added": total_added,
+        "target_counts": [
+            {"city": city, "role": role, "required_accepted": required}
+            for (city, role), required in sorted(target_counts.items())
+        ],
+        "rounds": list(rounds),
+        "bounds": {
+            "max_rounds": MEDIA_REPLENISHMENT_MAX_ROUNDS,
+            "max_total_candidates": MEDIA_REPLENISHMENT_MAX_TOTAL,
+            "max_candidates_per_deficit_per_round": MEDIA_REPLENISHMENT_MAX_PER_DEFICIT,
+            "selected_candidates_per_deficit_per_round": (
+                MEDIA_REPLENISHMENT_PER_DEFICIT_PER_ROUND
+            ),
+        },
+        "minimums_lowered": False,
+        "signed_urls_included": False,
+        "secrets_included": False,
+    }
+
+
+def load_media_plan_revision(
+    audit: MetadataAudit,
+    base_plan: MetadataSplitPlan,
+    path: Path,
+    *,
+    run_id: str,
+) -> MediaPlanRevisionState:
+    """Load an additive, plan-bound reserve revision without touching media."""
+
+    _require(base_plan.ready, "METADATA_SPLIT_NOT_READY")
+    base_sha256 = _planned_acquisition_sha256(base_plan.download_assets)
+    if not path.exists():
+        return MediaPlanRevisionState(base_plan, (base_sha256,), {}, 0)
+    _require(
+        path.is_file() and not path.is_symlink() and path.stat().st_size <= 4 * 1024 * 1024,
+        "MEDIA_PLAN_REVISION_INVALID",
+    )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Phase3FCloudJobError("MEDIA_PLAN_REVISION_INVALID") from exc
+    _require(isinstance(value, dict), "MEDIA_PLAN_REVISION_INVALID")
+    document = cast(dict[str, object], value)
+    rounds_value = document.get("rounds")
+    targets_value = document.get("target_counts")
+    bounds_value = document.get("bounds")
+    _require(
+        document.get("schema") == MEDIA_PLAN_REVISION_SCHEMA
+        and document.get("run_id") == run_id
+        and document.get("base_plan_sha256") == base_sha256
+        and isinstance(rounds_value, list)
+        and isinstance(targets_value, list)
+        and isinstance(bounds_value, dict),
+        "MEDIA_PLAN_REVISION_INCOMPATIBLE",
+    )
+    bounds = cast(dict[str, object], bounds_value)
+    _require(
+        bounds.get("max_rounds") == MEDIA_REPLENISHMENT_MAX_ROUNDS
+        and bounds.get("max_total_candidates") == MEDIA_REPLENISHMENT_MAX_TOTAL
+        and bounds.get("max_candidates_per_deficit_per_round")
+        == MEDIA_REPLENISHMENT_MAX_PER_DEFICIT
+        and bounds.get("selected_candidates_per_deficit_per_round")
+        == MEDIA_REPLENISHMENT_PER_DEFICIT_PER_ROUND,
+        "MEDIA_PLAN_REVISION_INVALID",
+    )
+    rounds = cast(list[object], rounds_value)
+    _require(
+        len(rounds) <= MEDIA_REPLENISHMENT_MAX_ROUNDS and document.get("revision") == len(rounds),
+        "MEDIA_PLAN_REVISION_INVALID",
+    )
+    metadata_by_id = _metadata_by_image_id(audit)
+    group_by_id = _metadata_group_by_image_id(audit)
+    base_ids = {item.metadata.image_id for item in base_plan.download_assets}
+    incremental: list[PlannedAsset] = []
+    compatible = [base_sha256]
+    previous_sha256 = base_sha256
+    seen_ids = set(base_ids)
+    normalized_rounds: list[Mapping[str, object]] = []
+    for revision, raw_round in enumerate(rounds, start=1):
+        _require(isinstance(raw_round, dict), "MEDIA_PLAN_REVISION_INVALID")
+        round_row = cast(dict[str, object], raw_round)
+        candidates_value = round_row.get("candidates")
+        deficits_value = round_row.get("deficits")
+        _require(
+            round_row.get("revision") == revision
+            and round_row.get("prior_plan_sha256") == previous_sha256
+            and isinstance(candidates_value, list)
+            and isinstance(deficits_value, list)
+            and bool(candidates_value),
+            "MEDIA_PLAN_REVISION_INVALID",
+        )
+        round_deficits: dict[tuple[str, Role], int] = {}
+        for raw_deficit in cast(list[object], deficits_value):
+            _require(isinstance(raw_deficit, dict), "MEDIA_PLAN_REVISION_INVALID")
+            deficit_row = cast(dict[str, object], raw_deficit)
+            city = deficit_row.get("city")
+            role = deficit_row.get("role")
+            deficit = deficit_row.get("records")
+            _require(
+                isinstance(city, str)
+                and role in _ROLE_ORDER
+                and isinstance(deficit, int)
+                and not isinstance(deficit, bool)
+                and deficit > 0
+                and (city, cast(Role, role)) not in round_deficits,
+                "MEDIA_PLAN_REVISION_INVALID",
+            )
+            round_deficits[(cast(str, city), cast(Role, role))] = cast(int, deficit)
+        round_deficit = sum(round_deficits.values())
+        _require(
+            len(cast(list[object], candidates_value))
+            <= round_deficit * MEDIA_REPLENISHMENT_MAX_PER_DEFICIT,
+            "MEDIA_PLAN_REVISION_INVALID",
+        )
+        candidate_counts: Counter[tuple[str, Role]] = Counter()
+        for raw_candidate in cast(list[object], candidates_value):
+            _require(isinstance(raw_candidate, dict), "MEDIA_PLAN_REVISION_INVALID")
+            candidate = cast(dict[str, object], raw_candidate)
+            image_id = candidate.get("image_id")
+            city = candidate.get("city")
+            role = candidate.get("role")
+            group_sha256 = candidate.get("isolation_group_sha256")
+            _require(
+                isinstance(image_id, str)
+                and image_id in metadata_by_id
+                and image_id not in seen_ids
+                and isinstance(city, str)
+                and metadata_by_id[image_id].city == city
+                and role in _ROLE_ORDER
+                and (city, cast(Role, role)) in round_deficits
+                and isinstance(group_sha256, str)
+                and group_by_id.get(image_id) == group_sha256,
+                "MEDIA_PLAN_REVISION_INVALID",
+            )
+            typed_image_id = cast(str, image_id)
+            typed_bucket = (cast(str, city), cast(Role, role))
+            candidate_counts[typed_bucket] += 1
+            _require(
+                candidate_counts[typed_bucket]
+                <= round_deficits[typed_bucket] * MEDIA_REPLENISHMENT_MAX_PER_DEFICIT,
+                "MEDIA_PLAN_REVISION_INVALID",
+            )
+            seen_ids.add(typed_image_id)
+            incremental.append(PlannedAsset(metadata_by_id[typed_image_id], cast(Role, role)))
+        revised = MetadataSplitPlan(
+            base_plan.primary,
+            base_plan.reserves + tuple(incremental),
+            base_plan.readiness,
+            revision,
+            len(incremental),
+        )
+        previous_sha256 = _planned_acquisition_sha256(revised.download_assets)
+        _require(
+            round_row.get("plan_sha256") == previous_sha256,
+            "MEDIA_PLAN_REVISION_INVALID",
+        )
+        compatible.append(previous_sha256)
+        normalized_rounds.append(round_row)
+    _require(
+        len(incremental) <= MEDIA_REPLENISHMENT_MAX_TOTAL
+        and document.get("total_added") == len(incremental)
+        and document.get("current_plan_sha256") == previous_sha256,
+        "MEDIA_PLAN_REVISION_INVALID",
+    )
+    target_counts: dict[tuple[str, Role], int] = {}
+    base_target_counts = _media_target_counts(base_plan.download_assets, len(base_plan.primary))
+    for raw_target in cast(list[object], targets_value):
+        _require(isinstance(raw_target, dict), "MEDIA_PLAN_REVISION_INVALID")
+        target = cast(dict[str, object], raw_target)
+        city = target.get("city")
+        role = target.get("role")
+        required = target.get("required_accepted")
+        _require(
+            isinstance(city, str)
+            and role in _ROLE_ORDER
+            and isinstance(required, int)
+            and not isinstance(required, bool)
+            and required > 0
+            and (city, cast(Role, role)) not in target_counts
+            and (city, cast(Role, role)) in base_target_counts
+            and base_target_counts[(city, cast(Role, role))]
+            <= required
+            <= base_target_counts[(city, cast(Role, role))]
+            + MEDIA_REPLENISHMENT_MAX_TOTAL,
+            "MEDIA_PLAN_REVISION_INVALID",
+        )
+        target_counts[(cast(str, city), cast(Role, role))] = cast(int, required)
+    _require(
+        {(item.metadata.city, item.role) for item in incremental} <= set(target_counts),
+        "MEDIA_PLAN_REVISION_INVALID",
+    )
+    plan = MetadataSplitPlan(
+        base_plan.primary,
+        base_plan.reserves + tuple(incremental),
+        base_plan.readiness,
+        len(normalized_rounds),
+        len(incremental),
+    )
+    _require(_media_plan_isolation_valid(audit, plan), "MEDIA_PLAN_REVISION_LEAKAGE")
+    return MediaPlanRevisionState(
+        plan,
+        tuple(compatible),
+        target_counts,
+        len(incremental),
+    )
+
+
+def _read_media_task_inventory(
+    path: Path,
+    *,
+    run_id: str,
+) -> tuple[set[str], Counter[tuple[str, Role]], Counter[tuple[str, Role]]]:
+    _require(
+        path.is_file() and not path.is_symlink() and path.stat().st_size <= 16 * 1024 * 1024,
+        "MEDIA_TASK_LEDGER_INVALID",
+    )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Phase3FCloudJobError("MEDIA_TASK_LEDGER_INVALID") from exc
+    _require(
+        isinstance(value, dict)
+        and value.get("schema") == MEDIA_TASK_LEDGER_SCHEMA
+        and value.get("run_id") == run_id
+        and isinstance(value.get("tasks"), list),
+        "MEDIA_TASK_LEDGER_INVALID",
+    )
+    image_ids: set[str] = set()
+    accepted: Counter[tuple[str, Role]] = Counter()
+    actionable: Counter[tuple[str, Role]] = Counter()
+    for raw in cast(list[object], value["tasks"]):
+        _require(isinstance(raw, dict), "MEDIA_TASK_LEDGER_INVALID")
+        row = cast(dict[str, object], raw)
+        image_id = row.get("image_id")
+        city = row.get("city")
+        role = row.get("role")
+        state = row.get("state")
+        _require(
+            isinstance(image_id, str)
+            and image_id not in image_ids
+            and isinstance(city, str)
+            and role in _ROLE_ORDER
+            and state in _MEDIA_TASK_STATES,
+            "MEDIA_TASK_LEDGER_INVALID",
+        )
+        image_ids.add(cast(str, image_id))
+        bucket = (cast(str, city), cast(Role, role))
+        if state == "ACCEPTED":
+            accepted[bucket] += 1
+        elif state not in {"REJECTED", "QUARANTINED"}:
+            actionable[bucket] += 1
+    return image_ids, accepted, actionable
+
+
+def replenish_media_reserves(
+    audit: MetadataAudit,
+    state: MediaPlanRevisionState,
+    media_readiness: Mapping[str, object],
+    *,
+    run_id: str,
+    ledger_path: Path,
+    revision_path: Path,
+) -> tuple[MediaPlanRevisionState, dict[str, object]]:
+    """Append one deterministic bounded reserve round from unused metadata."""
+
+    ledger_ids, accepted, actionable = _read_media_task_inventory(ledger_path, run_id=run_id)
+    failed_value = media_readiness.get("failed_constraints")
+    _require(isinstance(failed_value, list), "MEDIA_READINESS_INVALID")
+    deficits: dict[tuple[str, Role], int] = {}
+    for raw in cast(list[object], failed_value):
+        _require(isinstance(raw, dict), "MEDIA_READINESS_INVALID")
+        row = cast(dict[str, object], raw)
+        if row.get("constraint") != "media_city_role_minimum_after_decode_and_dedup":
+            continue
+        city = row.get("city")
+        role = row.get("role")
+        deficit = row.get("deficit_records")
+        _require(
+            isinstance(city, str)
+            and role in _ROLE_ORDER
+            and isinstance(deficit, int)
+            and not isinstance(deficit, bool)
+            and deficit > 0,
+            "MEDIA_READINESS_INVALID",
+        )
+        deficits[(cast(str, city), cast(Role, role))] = cast(int, deficit)
+    _require(bool(deficits), "MEDIA_READINESS_INVALID")
+    targets = dict(state.target_counts)
+    for bucket, deficit in deficits.items():
+        targets[bucket] = max(targets.get(bucket, 0), accepted[bucket] + deficit)
+    current_ids = {item.metadata.image_id for item in state.plan.download_assets}
+    missing_from_ledger = Counter(
+        (item.metadata.city, item.role)
+        for item in state.plan.download_assets
+        if item.metadata.image_id not in ledger_ids
+    )
+    capacity_needed = {
+        bucket: max(
+            0,
+            targets[bucket] - accepted[bucket] - actionable[bucket] - missing_from_ledger[bucket],
+        )
+        for bucket in deficits
+    }
+    metadata_by_id = _metadata_by_image_id(audit)
+    group_by_id = _metadata_group_by_image_id(audit)
+    roles_by_group: dict[str, set[Role]] = defaultdict(set)
+    for item in state.plan.download_assets:
+        group_sha256 = group_by_id.get(item.metadata.image_id)
+        _require(group_sha256 is not None, "MEDIA_PLAN_REVISION_LEAKAGE")
+        roles_by_group[cast(str, group_sha256)].add(item.role)
+    excluded_ids = ledger_ids | current_ids
+    selected: list[tuple[PlannedAsset, str]] = []
+    selectable_rows: list[dict[str, object]] = []
+    remaining_total = MEDIA_REPLENISHMENT_MAX_TOTAL - state.total_added
+    for bucket in sorted(capacity_needed, key=lambda item: _stable_key(*item)):
+        city, role = bucket
+        candidates: list[tuple[str, MetadataAsset, str]] = []
+        for image_id, asset in metadata_by_id.items():
+            if image_id in excluded_ids or asset.city != city:
+                continue
+            group_sha256 = group_by_id.get(image_id)
+            if group_sha256 is None or roles_by_group[group_sha256] - {role}:
+                continue
+            if role == "reference" and any(
+                item.metadata.city == city
+                and item.role == "sealed_holdout"
+                and _distance_m(asset, item.metadata) < SPATIAL_EXCLUSION_METERS
+                for item in state.plan.download_assets
+            ):
+                continue
+            if role == "sealed_holdout" and any(
+                item.metadata.city == city
+                and item.role == "reference"
+                and _distance_m(asset, item.metadata) < SPATIAL_EXCLUSION_METERS
+                for item in state.plan.download_assets
+            ):
+                continue
+            candidates.append(
+                (
+                    _stable_key(
+                        _planned_acquisition_sha256(state.plan.download_assets),
+                        str(state.plan.revision + 1),
+                        city,
+                        role,
+                        image_id,
+                    ),
+                    asset,
+                    group_sha256,
+                )
+            )
+        candidates.sort(key=lambda item: item[0])
+        selectable_rows.append(
+            {
+                "city": city,
+                "role": role,
+                "deficit_records": deficits[bucket],
+                "capacity_needed": capacity_needed[bucket],
+                "selectable_unused_records": len(candidates),
+            }
+        )
+        desired = min(
+            capacity_needed[bucket] * MEDIA_REPLENISHMENT_PER_DEFICIT_PER_ROUND,
+            capacity_needed[bucket] * MEDIA_REPLENISHMENT_MAX_PER_DEFICIT,
+            remaining_total,
+        )
+        if desired <= 0:
+            continue
+        diverse: list[tuple[str, MetadataAsset, str]] = []
+        deferred: list[tuple[str, MetadataAsset, str]] = []
+        round_groups: set[str] = set()
+        for candidate in candidates:
+            if candidate[2] in round_groups:
+                deferred.append(candidate)
+            else:
+                diverse.append(candidate)
+                round_groups.add(candidate[2])
+        for _key, asset, group_sha256 in (diverse + deferred)[:desired]:
+            selected.append((PlannedAsset(asset, role), group_sha256))
+            excluded_ids.add(asset.image_id)
+            roles_by_group[group_sha256].add(role)
+            remaining_total -= 1
+    existing_rounds: list[Mapping[str, object]] = []
+    if revision_path.exists():
+        existing_value = json.loads(revision_path.read_text(encoding="utf-8"))
+        _require(
+            isinstance(existing_value, dict) and isinstance(existing_value.get("rounds"), list),
+            "MEDIA_PLAN_REVISION_INVALID",
+        )
+        existing_rounds = [
+            cast(Mapping[str, object], row) for row in cast(list[object], existing_value["rounds"])
+        ]
+    at_round_limit = state.plan.revision >= MEDIA_REPLENISHMENT_MAX_ROUNDS
+    at_total_limit = state.total_added >= MEDIA_REPLENISHMENT_MAX_TOTAL
+    if at_round_limit or at_total_limit:
+        selected = []
+    prior_sha256 = _planned_acquisition_sha256(state.plan.download_assets)
+    plan = state.plan
+    compatible = state.compatible_plan_sha256
+    if selected:
+        revision = state.plan.revision + 1
+        plan = MetadataSplitPlan(
+            state.plan.primary,
+            state.plan.reserves + tuple(item for item, _group in selected),
+            state.plan.readiness,
+            revision,
+            state.total_added + len(selected),
+        )
+        _require(_media_plan_isolation_valid(audit, plan), "MEDIA_PLAN_REVISION_LEAKAGE")
+        plan_sha256 = _planned_acquisition_sha256(plan.download_assets)
+        existing_rounds.append(
+            {
+                "revision": revision,
+                "prior_plan_sha256": prior_sha256,
+                "plan_sha256": plan_sha256,
+                "deficits": [
+                    {"city": city, "role": role, "records": deficit}
+                    for (city, role), deficit in sorted(deficits.items())
+                ],
+                "selectable_unused": selectable_rows,
+                "candidates": [
+                    {
+                        "image_id": item.metadata.image_id,
+                        "city": item.metadata.city,
+                        "role": item.role,
+                        "isolation_group_sha256": group_sha256,
+                    }
+                    for item, group_sha256 in selected
+                ],
+            }
+        )
+        compatible = (*compatible, plan_sha256)
+    current_sha256 = _planned_acquisition_sha256(plan.download_assets)
+    base_sha256 = state.compatible_plan_sha256[0]
+    _atomic_private_json(
+        revision_path,
+        _media_revision_document(
+            run_id=run_id,
+            base_plan_sha256=base_sha256,
+            current_plan_sha256=current_sha256,
+            rounds=existing_rounds,
+            target_counts=targets,
+        ),
+    )
+    revised_state = MediaPlanRevisionState(
+        plan,
+        compatible,
+        targets,
+        plan.incremental_reserve_count,
+    )
+    selectable_total = sum(cast(int, row["selectable_unused_records"]) for row in selectable_rows)
+    if selected:
+        action = "ACQUIRE_INCREMENTAL_RESERVES"
+    elif any(missing_from_ledger[bucket] + actionable[bucket] for bucket in deficits):
+        action = "ACQUIRE_EXISTING_RESERVES"
+    elif selectable_total == 0:
+        action = "MEDIA_CORPUS_EXHAUSTED"
+    else:
+        action = "MEDIA_REPLENISHMENT_LIMIT_REACHED"
+    return revised_state, {
+        "schema": "atlaslens-phase3f-media-replenishment-status-v1",
+        "action": action,
+        "revision": plan.revision,
+        "rounds_remaining": MEDIA_REPLENISHMENT_MAX_ROUNDS - plan.revision,
+        "total_added": plan.incremental_reserve_count,
+        "total_remaining": MEDIA_REPLENISHMENT_MAX_TOTAL - plan.incremental_reserve_count,
+        "selected_this_round": len(selected),
+        "selectable_unused": selectable_rows,
+        "target_counts": [
+            {"city": city, "role": role, "required_accepted": required}
+            for (city, role), required in sorted(targets.items())
+        ],
+        "minimums_lowered": False,
+        "secrets_included": False,
+    }
+
+
 def _verify_canonical_vendor_text(
     path: Path,
     *,
@@ -1981,6 +2530,7 @@ def _load_media_task_ledger(
     planned: Sequence[PlannedAsset],
     primary_count: int,
     completed: Mapping[str, _CheckpointAsset],
+    compatible_plan_sha256: Sequence[str] = (),
 ) -> _MediaTaskLedger:
     migrate_legacy_resolver = False
     if not path.exists():
@@ -2001,10 +2551,12 @@ def _load_media_task_ledger(
         _require(isinstance(value, dict), "MEDIA_TASK_LEDGER_INVALID")
         document = cast(dict[str, object], value)
         resolver_contract = document.get("resolver_contract_version")
+        current_plan_sha256 = _planned_acquisition_sha256(planned)
+        accepted_plan_sha256 = set(compatible_plan_sha256) | {current_plan_sha256}
         _require(
             document.get("schema") == MEDIA_TASK_LEDGER_SCHEMA
             and document.get("run_id") == run_id
-            and document.get("planned_sha256") == _planned_acquisition_sha256(planned)
+            and document.get("planned_sha256") in accepted_plan_sha256
             and document.get("primary_count") == primary_count,
             "MEDIA_TASK_LEDGER_INCOMPATIBLE",
         )
@@ -2083,7 +2635,10 @@ def _load_media_task_ledger(
                 url_refresh_count=cast(int, refresh_count),
                 reason_code=cast(str | None, reason_code),
             )
-        _require(set(tasks) == set(expected.tasks), "MEDIA_TASK_LEDGER_INVALID")
+        _require(set(tasks) <= set(expected.tasks), "MEDIA_TASK_LEDGER_INVALID")
+        for image_id, expected_task in expected.tasks.items():
+            if image_id not in tasks:
+                tasks[image_id] = expected_task
         circuit = document.get("provider_circuit")
         _require(isinstance(circuit, dict), "MEDIA_TASK_LEDGER_INVALID")
         circuit_row = cast(dict[str, object], circuit)
@@ -2222,6 +2777,7 @@ def _load_acquisition_checkpoint(
     planned: Sequence[PlannedAsset],
     media_root: Path,
     run_id: str,
+    compatible_plan_sha256: Sequence[str] = (),
 ) -> tuple[dict[str, _CheckpointAsset], AcquisitionGuard, tuple[int, int, int]]:
     if not path.exists():
         _require(
@@ -2240,10 +2796,11 @@ def _load_acquisition_checkpoint(
         raise Phase3FCloudJobError("ACQUISITION_CHECKPOINT_INVALID") from exc
     _require(isinstance(value, dict), "ACQUISITION_CHECKPOINT_INVALID")
     document = cast(dict[str, object], value)
+    current_plan_sha256 = _planned_acquisition_sha256(planned)
     _require(
         document.get("schema") == ACQUISITION_CHECKPOINT_SCHEMA
         and document.get("run_id") == run_id
-        and document.get("planned_sha256") == _planned_acquisition_sha256(planned),
+        and document.get("planned_sha256") in (set(compatible_plan_sha256) | {current_plan_sha256}),
         "ACQUISITION_CHECKPOINT_INCOMPATIBLE",
     )
     rows = document.get("completed")
@@ -2461,6 +3018,7 @@ def _load_media_failures(
     *,
     run_id: str,
     planned: Sequence[PlannedAsset],
+    compatible_plan_sha256: Sequence[str] = (),
 ) -> dict[str, str]:
     if not path.exists():
         return {}
@@ -2476,7 +3034,8 @@ def _load_media_failures(
         isinstance(value, dict)
         and value.get("schema") == "atlaslens-phase3f-media-failures-v1"
         and value.get("run_id") == run_id
-        and value.get("planned_sha256") == _planned_acquisition_sha256(planned),
+        and value.get("planned_sha256")
+        in (set(compatible_plan_sha256) | {_planned_acquisition_sha256(planned)}),
         "MEDIA_FAILURE_CHECKPOINT_INVALID",
     )
     rows = value.get("failures")
@@ -2637,6 +3196,8 @@ def acquire_planned_assets(
     allow_item_failures: bool = False,
     primary_count: int | None = None,
     now_utc: Callable[[], datetime] | None = None,
+    compatible_plan_sha256: Sequence[str] = (),
+    target_count_overrides: Mapping[tuple[str, Role], int] | None = None,
 ) -> tuple[tuple[SplitAsset, ...], dict[str, object]]:
     _require(0 < max_media_bytes <= MAX_MEDIA_BYTES, "MEDIA_CAP_INVALID")
     selected_primary_count = len(planned) if primary_count is None else primary_count
@@ -2665,7 +3226,11 @@ def acquire_planned_assets(
     recovered_partial_count = _recover_media_partials(media_root)
     if checkpoint_path is not None:
         checkpoint_assets, restored_guard, historical_counts = _load_acquisition_checkpoint(
-            checkpoint_path, planned=planned, media_root=media_root, run_id=run_id
+            checkpoint_path,
+            planned=planned,
+            media_root=media_root,
+            run_id=run_id,
+            compatible_plan_sha256=compatible_plan_sha256,
         )
         if restore_client_counts:
             client.add_historical_counts(
@@ -2685,12 +3250,14 @@ def acquire_planned_assets(
         planned=planned,
         primary_count=selected_primary_count,
         completed=checkpoint_assets,
+        compatible_plan_sha256=compatible_plan_sha256,
     )
     if media_failure_path is not None and media_failure_path.exists():
         media_failures = _load_media_failures(
             media_failure_path,
             run_id=run_id,
             planned=planned,
+            compatible_plan_sha256=compatible_plan_sha256,
         )
         for image_id, reason in media_failures.items():
             task = ledger.tasks[image_id]
@@ -2710,6 +3277,15 @@ def acquire_planned_assets(
 
     persist_ledger()
     targets = _media_target_counts(planned, selected_primary_count)
+    for bucket, required in (target_count_overrides or {}).items():
+        _require(
+            bucket in targets
+            and isinstance(required, int)
+            and not isinstance(required, bool)
+            and targets[bucket] <= required <= targets[bucket] + MEDIA_REPLENISHMENT_MAX_TOTAL,
+            "MEDIA_TARGET_OVERRIDE_INVALID",
+        )
+        targets[bucket] = required
     if _media_retry_is_blocked(ledger, now):
         status = cast(str, ledger.pause_state)
     else:
@@ -3167,6 +3743,9 @@ def finalize_media_split(
         "stage": "media_split_readiness",
         "ready": not failed_constraints,
         "metadata_plan_sha256": plan.readiness.get("metadata_plan_sha256"),
+        "media_plan_sha256": _planned_acquisition_sha256(plan.download_assets),
+        "media_plan_revision": plan.revision,
+        "incremental_reserve_count": plan.incremental_reserve_count,
         "download_candidate_count": len(plan.download_assets),
         "downloaded_usable_count": len(available),
         "selected_primary_count": len(selected),
@@ -3196,6 +3775,116 @@ def finalize_media_split(
         "secrets_included": False,
     }
     return MediaSplitPlan(tuple(selected) if not failed_constraints else (), readiness)
+
+
+def acquire_replenished_media(
+    client: MapillaryClient,
+    areas: Sequence[CityArea],
+    audit: MetadataAudit,
+    base_plan: MetadataSplitPlan,
+    media_root: Path,
+    run_id: str,
+    guard: AcquisitionGuard,
+    checkpoint_path: Path,
+    revision_path: Path,
+    *,
+    restore_client_counts: bool = False,
+    max_media_bytes: int = MAX_MEDIA_BYTES,
+    checkpoint_observer: Callable[[], None] | None = None,
+    allow_item_failures: bool = True,
+) -> tuple[
+    tuple[SplitAsset, ...],
+    dict[str, object],
+    MediaSplitPlan,
+    dict[str, object] | None,
+]:
+    """Acquire, replenish from unused metadata, and stop only at a bounded gate."""
+
+    revision_state = load_media_plan_revision(
+        audit,
+        base_plan,
+        revision_path,
+        run_id=run_id,
+    )
+    replenishment: dict[str, object] | None = None
+    activated_existing_targets = False
+    while True:
+        assets, provenance = acquire_planned_assets(
+            client,
+            areas,
+            revision_state.plan.download_assets,
+            media_root,
+            run_id,
+            guard,
+            checkpoint_path,
+            restore_client_counts=restore_client_counts,
+            max_media_bytes=max_media_bytes,
+            checkpoint_observer=checkpoint_observer,
+            allow_item_failures=allow_item_failures,
+            primary_count=len(revision_state.plan.primary),
+            compatible_plan_sha256=revision_state.compatible_plan_sha256,
+            target_count_overrides=revision_state.target_counts,
+        )
+        media_status = provenance.get("media_status")
+        _require(isinstance(media_status, str), "MEDIA_ACQUISITION_STATUS_INVALID")
+        if cast(str, media_status).startswith("PAUSED_"):
+            return (
+                assets,
+                provenance,
+                MediaSplitPlan(
+                    (),
+                    {
+                        "schema": "atlaslens-phase3f-training-readiness-v2",
+                        "stage": media_status,
+                        "ready": False,
+                        "gpu_started": False,
+                        "cloud_mutations": 0,
+                        "secrets_included": False,
+                    },
+                ),
+                replenishment,
+            )
+        media_plan = finalize_media_split(revision_state.plan, assets)
+        if media_plan.ready:
+            return assets, provenance, media_plan, replenishment
+        next_state, replenishment = replenish_media_reserves(
+            audit,
+            revision_state,
+            media_plan.readiness,
+            run_id=run_id,
+            ledger_path=checkpoint_path.with_name("media-task-ledger.json"),
+            revision_path=revision_path,
+        )
+        action = replenishment.get("action")
+        _require(isinstance(action, str), "MEDIA_REPLENISHMENT_STATUS_INVALID")
+        if action == "ACQUIRE_EXISTING_RESERVES":
+            _require(
+                not activated_existing_targets,
+                "MEDIA_REPLENISHMENT_NO_PROGRESS",
+            )
+            activated_existing_targets = True
+            revision_state = next_state
+            continue
+        if action == "ACQUIRE_INCREMENTAL_RESERVES":
+            activated_existing_targets = False
+            revision_state = next_state
+            continue
+        failure_readiness = {
+            **media_plan.readiness,
+            "stage": (
+                "media_corpus_exhausted"
+                if action == "MEDIA_CORPUS_EXHAUSTED"
+                else "media_replenishment_limit_reached"
+            ),
+            "ready": False,
+            "reason_code": action,
+            "replenishment": replenishment,
+            "next_automatic_action": "STOP_AND_REPORT_STRUCTURED_MEDIA_DEFICIT",
+            "gpu_started": False,
+            "cloud_mutations": 0,
+            "secrets_included": False,
+        }
+        return assets, provenance, MediaSplitPlan((), failure_readiness), replenishment
 
 
 def finalize_provenance_aggregate(
@@ -3574,6 +4263,7 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
     checkpoints = config.work_root / "descriptor-checkpoints"
     state_path = config.output_root / "pipeline-state.json"
     acquisition_checkpoint = config.work_root / "acquisition-checkpoint.json"
+    media_revision_checkpoint = config.work_root / "media-plan-revisions.json"
     client_counter_checkpoint = config.work_root / "client-counters.json"
     metadata_page_checkpoint = config.work_root / "metadata-pages.json"
     _require(
@@ -3718,18 +4408,18 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                 )
                 cleanup_private_work = True
                 return execution
-            planned = split_plan.download_assets
-            assets, provenance = acquire_planned_assets(
+            assets, provenance, media_plan, replenishment = acquire_replenished_media(
                 client,
                 areas,
-                planned,
+                audit,
+                split_plan,
                 media_root,
                 config.run_id,
                 guard,
                 acquisition_checkpoint,
+                media_revision_checkpoint,
                 restore_client_counts=False,
                 allow_item_failures=True,
-                primary_count=len(split_plan.primary),
             )
             _require(client.request_count <= MAX_REQUESTS, "REQUEST_CAP_EXCEEDED")
             media_status = provenance.get("media_status")
@@ -3741,6 +4431,7 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                     "stage": media_status,
                     "media_task_counts": provenance.get("media_task_counts"),
                     "retry_not_before": provenance.get("retry_not_before"),
+                    "replenishment": replenishment,
                     "model_loaded": False,
                     "gpu_used": False,
                     "cloud_mutations": 0,
@@ -3749,18 +4440,22 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
                 _atomic_json(config.output_root / "execution-receipt.json", receipt)
                 return receipt
             pipeline.complete_acquisition(guard)
-            media_plan = finalize_media_split(split_plan, assets)
             _atomic_json(
                 config.output_root / "training-readiness.json",
                 media_plan.readiness,
             )
             if not media_plan.ready:
-                pipeline.finalize_dataset_not_ready(reason_code="MEDIA_SPLIT_MINIMUM_UNAVAILABLE")
+                reason_code = media_plan.readiness.get(
+                    "reason_code", "MEDIA_SPLIT_MINIMUM_UNAVAILABLE"
+                )
+                _require(isinstance(reason_code, str), "MEDIA_READINESS_INVALID")
+                pipeline.finalize_dataset_not_ready(reason_code=cast(str, reason_code))
                 execution = {
                     "schema": "atlaslens-phase3f-cloud-execution-v1",
                     "run_id": config.run_id,
                     "outcome": "COVERAGE_INSUFFICIENT",
-                    "reason_code": "MEDIA_SPLIT_MINIMUM_UNAVAILABLE",
+                    "reason_code": cast(str, reason_code),
+                    "replenishment": replenishment,
                     "readiness_reported": True,
                     "started_at": started.isoformat(),
                     "finished_at": datetime.now(UTC).isoformat(),
@@ -3906,6 +4601,8 @@ def run_cloud_job(config: CloudJobConfig) -> dict[str, object]:
             shutil.rmtree(checkpoints)
         if cleanup_private_work and acquisition_checkpoint.exists():
             acquisition_checkpoint.unlink()
+        if cleanup_private_work and media_revision_checkpoint.exists():
+            media_revision_checkpoint.unlink()
         if cleanup_private_work and client_counter_checkpoint.exists():
             client_counter_checkpoint.unlink()
         if cleanup_private_work and metadata_page_checkpoint.exists():
@@ -3919,15 +4616,19 @@ __all__ = [
     "MetadataAudit",
     "MetadataSplitPlan",
     "MediaSplitPlan",
+    "MediaPlanRevisionState",
     "Phase3FCloudJobError",
     "PlannedAsset",
     "acquire_planned_assets",
+    "acquire_replenished_media",
     "audit_metadata",
     "finalize_media_split",
     "finalize_provenance_aggregate",
+    "load_media_plan_revision",
     "load_city_areas",
     "plan_locked_roles",
     "plan_metadata_split",
+    "replenish_media_reserves",
     "quarter_bbox",
     "run_cloud_job",
     "verify_megaloc_artifacts",

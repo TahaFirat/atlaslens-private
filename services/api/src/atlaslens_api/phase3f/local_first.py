@@ -898,6 +898,7 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
     metadata_path = work_root / "metadata-pages.json"
     counters_path = work_root / "client-counters.json"
     acquisition_path = work_root / "acquisition-checkpoint.json"
+    media_revision_path = work_root / "media-plan-revisions.json"
     scheduler_path = work_root / "acquisition-scheduler-v4.json"
     media_root = work_root / "private-media"
     if config.resume:
@@ -1107,21 +1108,21 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
                     "readiness_report": str(readiness_path),
                     "secrets_included": False,
                 }
-            planned = split_plan.download_assets
             guard = AcquisitionGuard()
-            assets, provenance = worker.acquire_planned_assets(
+            assets, provenance, media_plan, replenishment = worker.acquire_replenished_media(
                 client,
                 areas,
-                planned,
+                audit,
+                split_plan,
                 media_root,
                 run_id,
                 guard,
                 acquisition_path,
+                media_revision_path,
                 restore_client_counts=False,
                 max_media_bytes=LOCAL_MEDIA_CAP_BYTES,
                 checkpoint_observer=record_media_checkpoint,
                 allow_item_failures=True,
-                primary_count=len(split_plan.primary),
             )
             media_status = provenance.get("media_status")
             media_counts = provenance.get("media_task_counts")
@@ -1157,6 +1158,7 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
                     reserve=safe_counts.get("reserve"),
                     media_bytes=safe_counts.get("media_bytes"),
                     retry_not_before=safe_counts.get("retry_not_before"),
+                    replenishment=replenishment,
                     model_loaded=False,
                     gpu_used=False,
                 )
@@ -1166,18 +1168,22 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
                     **safe_counts,
                     "model_loaded": False,
                     "gpu_used": False,
+                    "replenishment": replenishment,
                     "secrets_included": False,
                 }
-            media_plan = worker.finalize_media_split(split_plan, assets)
             worker._atomic_private_json(  # noqa: SLF001
                 readiness_path, media_plan.readiness
             )
             if not media_plan.ready:
+                reason_code = media_plan.readiness.get(
+                    "reason_code", "MEDIA_SPLIT_MINIMUM_UNAVAILABLE"
+                )
+                _require(isinstance(reason_code, str), "MEDIA_READINESS_INVALID")
                 _write_state(
                     runtime_root,
                     run_id,
-                    "MEDIA_SPLIT_MINIMUM_UNAVAILABLE",
-                    error_code="MEDIA_SPLIT_MINIMUM_UNAVAILABLE",
+                    cast(str, reason_code),
+                    error_code=cast(str, reason_code),
                     asset_count=len(assets),
                     accepted=media_counts.get("accepted"),
                     rejected=media_counts.get("rejected"),
@@ -1187,14 +1193,16 @@ def run_acquisition(config: AcquisitionConfig) -> dict[str, object]:
                     media_bytes=media_counts.get("media_bytes"),
                     retry_not_before=None,
                     readiness_report_sha256=worker._sha256_path(readiness_path),  # noqa: SLF001
+                    replenishment=replenishment,
                     model_loaded=False,
                     gpu_used=False,
                 )
                 return {
                     "run_id": run_id,
-                    "stage": "MEDIA_SPLIT_MINIMUM_UNAVAILABLE",
+                    "stage": cast(str, reason_code),
                     "asset_count": len(assets),
                     "readiness_report": str(readiness_path),
+                    "replenishment": replenishment,
                     "secrets_included": False,
                 }
             assets = media_plan.assets

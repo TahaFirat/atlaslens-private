@@ -19,6 +19,7 @@ from atlaslens_api.mapillary_demo.errors import (
     MapillaryTokenError,
 )
 from atlaslens_api.mapillary_demo.models import GeoPoint, ImageMetadata
+from atlaslens_api.phase3f import cloud_job as worker
 from atlaslens_api.phase3f.acquisition import AcquisitionGuard
 from atlaslens_api.phase3f.cloud_job import (
     MEDIA_CIRCUIT_FAILURE_THRESHOLD,
@@ -535,6 +536,67 @@ def test_direct_resolver_migration_preserves_33_accepted_and_plan_hash(
     assert sum(row["state"] == "ACCEPTED" for row in migrated["tasks"]) == 33
 
 
+def test_additive_plan_download_loss_uses_next_reserve_and_resume_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    base = _planned(3, 0)
+    first_client = _FakeClient(base)
+    first_assets, first_provenance = _acquire(tmp_path, base, 3, first_client)
+    assert len(first_assets) == 3
+    assert first_provenance["media_status"] == "MEDIA_READY"
+    checkpoint_path = tmp_path / "work" / "acquisition-checkpoint.json"
+    original_checkpoint = json.loads(checkpoint_path.read_text())
+    original_completed = tuple(original_checkpoint["completed"])
+
+    expanded = _planned(3, 3)
+    failed_new_id = expanded[3].metadata.image_id
+    replacement_id = expanded[4].metadata.image_id
+    second_client = _FakeClient(
+        expanded,
+        events={failed_new_id: [b"decode-failure"]},
+    )
+    second_assets, second_provenance = acquire_planned_assets(
+        cast(MapillaryClient, second_client),
+        (CityArea("TestCity", 30.0, 40.0, 0.01),),
+        expanded,
+        tmp_path / "work" / "private-media",
+        "a" * 32,
+        AcquisitionGuard(),
+        checkpoint_path,
+        restore_client_counts=False,
+        allow_item_failures=True,
+        primary_count=3,
+        compatible_plan_sha256=(worker._planned_acquisition_sha256(base),),  # noqa: SLF001
+        target_count_overrides={("TestCity", "reference"): 4},
+    )
+
+    assert len(second_assets) == 4
+    assert second_provenance["media_status"] == "MEDIA_READY"
+    assert second_client.downloaded == [failed_new_id, replacement_id]
+    assert not ({item.metadata.image_id for item in base} & set(second_client.downloaded))
+    migrated_checkpoint = json.loads(checkpoint_path.read_text())
+    assert tuple(migrated_checkpoint["completed"][:3]) == original_completed
+
+    resumed_client = _FakeClient(expanded)
+    resumed_assets, resumed_provenance = acquire_planned_assets(
+        cast(MapillaryClient, resumed_client),
+        (CityArea("TestCity", 30.0, 40.0, 0.01),),
+        expanded,
+        tmp_path / "work" / "private-media",
+        "a" * 32,
+        AcquisitionGuard(),
+        checkpoint_path,
+        restore_client_counts=False,
+        allow_item_failures=True,
+        primary_count=3,
+        compatible_plan_sha256=(worker._planned_acquisition_sha256(base),),  # noqa: SLF001
+        target_count_overrides={("TestCity", "reference"): 4},
+    )
+    assert len(resumed_assets) == 4
+    assert resumed_provenance["media_status"] == "MEDIA_READY"
+    assert resumed_client.downloaded == []
+
+
 def test_reserve_exhaustion_is_structured_not_generic(tmp_path: Path) -> None:
     planned = _planned(1, 0)
     client = _FakeClient(
@@ -630,4 +692,6 @@ def test_runpod_launcher_is_after_media_pause_gate() -> None:
     gate = source.index('$localResult.stage -like "PAUSED_*"')
     cloud_call = source.index("Invoke-CloudTraining -RunId")
     assert gate < cloud_call
-    assert 'stage -eq "MEDIA_SPLIT_MINIMUM_UNAVAILABLE"' in source
+    assert '"MEDIA_SPLIT_MINIMUM_UNAVAILABLE"' in source
+    assert '"MEDIA_CORPUS_EXHAUSTED"' in source
+    assert '"MEDIA_REPLENISHMENT_LIMIT_REACHED"' in source

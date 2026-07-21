@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-20T23:36:47+03:00
+last_verified_at: 2026-07-21T11:01:30+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: direct_media_resolver_repaired_live_metadata_complete_media_33_preserved
+product_phase_status: exhausted_media_reserves_replenishment_repaired_live_827_preserved
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -429,6 +429,15 @@ phase_3f_media_resolver_error_policy: terminal_auth_item_404_410_bounded_429_ite
 phase_3f_media_resolver_tests: pass_232_phase3f_54_mapillary_connector
 phase_3f_media_resolver_static: pass_ruff_strict_mypy_259_sources
 phase_3f_media_resolver_live_actions: zero_network_zero_mapillary_zero_cdn_zero_runpod_zero_gpu_zero_runtime_mutation
+phase_3f_media_replenishment_runtime: run_ce23_metadata_8805_accepted_827_not_sealed
+phase_3f_media_replenishment_raw_deficit: izmir_reference_72_of_75_missing3
+phase_3f_media_replenishment_component_deficit: istanbul_reference_64_of_75_missing11_izmir_reference_72_of_75_missing3
+phase_3f_media_replenishment_selectable_unused: istanbul_reference91_izmir_reference369_total460
+phase_3f_media_replenishment_first_revision: incremental16_istanbul4_izmir12_total_cap128_round_cap3_per_deficit_cap16
+phase_3f_media_replenishment_checkpoint: atomic_hash_chained_additive_v1_idempotent_existing_tasks_excluded
+phase_3f_media_replenishment_isolation: contributor_sequence_group_single_role_spatial_1000m_post_media_exact_phash_gate
+phase_3f_media_replenishment_tests: pass_238_phase3f
+phase_3f_media_replenishment_live_actions: zero_network_zero_mapillary_zero_cdn_zero_runpod_zero_gpu_zero_runtime_mutation
 phase_3f_next_action: run_exact_preflight_then_resume_ce23_with_explicit_cloud_consent_only_after_dataset_ready
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
@@ -484,6 +493,52 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F exhausted media reserve replenishment
+
+Status: **REPAIRED AND VERIFIED OFFLINE - LIVE RESUME NOT EXECUTED**.
+
+The live ledger has 827 accepted media rows against the 830 raw primary target;
+the raw missing bucket is `İzmir/reference`, 72 available for 75 required.
+Post-decode/pHash readiness is stricter: the 827 exact SHA values form only 816
+pHash components, so the actual component deficits are
+`İstanbul/reference=11` (64/75) and `İzmir/reference=3` (72/75). Isolation is
+otherwise clean: contributor, sequence, exact hash, cross-role pHash, parent,
+capture-run, and one-kilometre spatial violations are all zero.
+
+Phase 3F now loads an additive hash-chained `media-plan-revisions.json` checkpoint
+and first counts unfinished tasks already present in the ledger. It then selects
+only the remaining capacity from previously unplanned metadata in the exact
+city/role bucket. Candidate isolation groups may belong only to that role, and
+reference/holdout candidates must retain the one-kilometre boundary. Every ledger
+image ID is excluded. Selection is deterministic, diversity-first by isolation
+group, capped at 16 candidates per missing record per round, 128 candidates total,
+and three rounds. Download/decode/duplicate loss automatically triggers the next
+round. True exhaustion reports `MEDIA_CORPUS_EXHAUSTED`; a safety-bound exhaustion
+reports `MEDIA_REPLENISHMENT_LIMIT_REACHED`. Neither can pass the RunPod gate.
+
+The exact live offline feasibility result is 91 selectable unused
+`İstanbul/reference` records and 369 selectable unused `İzmir/reference` records,
+460 total. Ten original pending İstanbul reserves reduce new capacity to one
+İstanbul plus three İzmir records. Revision one therefore plans only 16 bounded
+candidates: four İstanbul and twelve İzmir. It retains 112 candidate slots and two
+rounds for deterministic recovery. The original base plan hash remains
+`1577817b2a99d765144bad97c9ec344516b3723b809e399e2f3b745b705953df`; the
+offline-projected revision-one hash is
+`39d3589236d479f6decb0d4b9db008ed34551481613c5afa4c93eba220a95147`.
+
+The current 827 accepted files remain untouched at 124,101,802 bytes. Their
+canonical relative-path/size/content inventory SHA-256 is
+`39a3480226a63122b8308155d8ada1b1abd8d20a578e2d7e8a3649873ee031b4`.
+The metadata SHA-256 remains
+`5d2b98964ee4238959901baf609f00797c62f32fe20308cfcd30578025914f39`.
+No part file exists, and no runtime revision was eagerly written.
+
+All 238 Phase 3F tests pass, including deterministic three-record replenishment,
+first-round decode loss, automatic second-round completion, true exhaustion,
+isolation, preservation of an existing 827-row ledger, additive checkpoint
+migration, repeat Resume idempotency, and the pre-seal RunPod gate. No network,
+Mapillary, CDN, RunPod/GPU, Resume, or live runtime mutation occurred.
 
 ## Product Phase 3F direct Mapillary media resolver
 
