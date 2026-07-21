@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-21T19:24:30+03:00
+last_verified_at: 2026-07-21T20:12:26+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: phase3f_runpod_top_level_gpu_count_attested_offline_live_runtime_readonly_preserved
+product_phase_status: phase3f_archive_codec_unified_live_local_receipts_reconciled_cloudplan_ready
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -506,6 +506,17 @@ phase_3f_gpu_count_cleanup: historical_receipt_terminated_cleanup_true_inventory
 phase_3f_gpu_count_tests: pass_326_phase3f_including_budget_archive_count_connectivity_cleanup_redaction
 phase_3f_gpu_count_static: pass_ruff_strict_mypy20_phase3f_powershell5_diff_and_secret_scan
 phase_3f_gpu_count_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_resume_zero_execute_zero_dataset_receipt_budget_runtime_mutation
+phase_3f_archive_name_mismatch: legacy_writer_attempt_05253cd0446d09b1cf2cae8a94e8494b_current_validator_f9f7b5bd11e98f0744ceb486f82b971e
+phase_3f_archive_name_root_cause: nullable_gpu_count_field_changed_legacy_to_dict_semantic_attempt_identity
+phase_3f_archive_codec: v2_double_dash_run_attempt_failed_or_terminated_fixed_sha16_exact_json
+phase_3f_archive_legacy: run_only_and_unversioned_compound_immutable_single_parser
+phase_3f_archive_reconciliation: live_current1_to0_archive8_to9_partial0_conflict0_duplicate_budget0
+phase_3f_archive_second_reconciliation: no_op_state_sha256_9400f269d4d5ef7e74ac502feb8a5f6288df180ba84edfbd1425af8bfe7d6e9e
+phase_3f_archive_index: v2_count9_chain_bf560b496ae037dc3f1e3f9fc65bf0be07817e8321245b9b5c1225b187775869
+phase_3f_archive_cloudplan: pass_blockers0_active0_unclean0_partial0_ready_inventory_and_create_true
+phase_3f_archive_tests: pass_341_phase3f
+phase_3f_archive_static: pass_ruff_strict_mypy20_powershell5_diff_secret_scan
+phase_3f_archive_live_actions: local_operator_receipt_reconciliation_only_zero_network_zero_runpod_zero_mapillary_zero_cloud_mutation_zero_dataset_write
 phase_3f_next_action: run_exact_resume_ce23_with_explicit_cloud_consent
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
@@ -561,6 +572,68 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F canonical archive codec and live local reconciliation
+
+Status: **REPAIRED, LIVE LOCALLY RECONCILED AND CLOUDPLAN READY - RESUME NOT EXECUTED**.
+
+The exact failing archive was the immutable unversioned compound receipt ending
+in attempt segment `05253cd0446d09b1cf2cae8a94e8494b`, terminal stage
+`terminated`, and content prefix `1690a5c8cf564239`. Its receipt predates explicit
+attempt IDs. The writer derived that synthetic attempt from the then-current
+`OperatorReceipt.to_dict()` projection. Adding nullable
+`normalized_gpu_count_path` changed the later projection, so the validator
+derived `f9f7b5bd11e98f0744ceb486f82b971e` from the unchanged receipt. Run ID,
+stage, suffix, case and content prefix all matched; only the schema-dependent
+synthetic attempt segment drifted. The next read-only CloudPlan failed before a
+new archive write. The cleanup-verified current receipt remained present, no new
+archive/partial was created by that failed invocation, and no secret was asked.
+
+New writer output has one strict grammar:
+`v2--<lowercase-32hex-run>--<lowercase-32hex-attempt>--<failed|terminated>--<lowercase-16hex-content-prefix>.json`.
+The production formatter/parser pair is shared by the writer, scanner,
+validator and indexer. It rejects traversal, alternate separators, Unicode,
+case, stage, suffix and fixed-prefix drift and round-trips byte-exactly. Existing
+`<run_id>.json` and historical unversioned compound receipts remain immutable
+legacy entries. Compound legacy names keep their historical filename attempt
+identity while run, terminal stage and raw content prefix are still validated.
+Nullable receipt fields are omitted from legacy semantic identity so later
+additive schemas cannot recreate this drift.
+
+After all Phase 3F tests and static gates passed, the explicitly authorized
+local-only `ReconcileLocalReceipts` action ran against the real `_operator`
+state. It requested no secret and reported RunPod/Mapillary calls, cloud
+mutations and dataset writes all zero. Current receipt count changed from one to
+zero; archive count changed from eight to nine; partial, conflict, active,
+unclean, parse-failure, content-identity-mismatch and duplicate-budget-linkage
+counts are all zero. The moved receipt retained SHA-256
+`78e4c1771e5e09f27723518222813f68c3c3614794895348457fa34b5403ee86`
+under its canonical v2 name. The new v2 index has nine entries and chain head
+`bf560b496ae037dc3f1e3f9fc65bf0be07817e8321245b9b5c1225b187775869`.
+
+A second real reconciliation was a byte-level no-op: before/after operator state
+SHA-256 were both
+`9400f269d4d5ef7e74ac502feb8a5f6288df180ba84edfbd1425af8bfe7d6e9e`,
+`changed=false`, archive remained nine, current/partial remained zero, and the
+stored index already matched. The subsequent real read-only CloudPlan returned
+`local_blockers=[]`, conflicts/active/unclean/partials/index mismatches zero,
+`ready_for_live_inventory=true`, `ready_for_create_after_live_gates=true`, 830
+dataset assets, zero secret prompts, zero RunPod calls and zero cloud mutations.
+Its preserved budget snapshot is actual billed USD `0.8379813398`, active and
+conservative unbilled exposure zero, proposed maximum USD `3`, and remaining
+authorized USD `9.1620186602`.
+
+The sealed dataset stayed `ACQUISITION_SEALED`, `model_loaded=false`,
+`gpu_started=false`, and cloud mutations zero. Before/after readiness,
+sealed-assets and checksum-inventory SHA-256 values remained respectively
+`2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9`,
+`b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1`,
+and `f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93`.
+All 341 Phase 3F tests pass. Ruff passes the complete Phase 3F scope; strict
+mypy passes all 20 Phase 3F production/control sources; all five PowerShell
+parsers, diff validation and the changed-file high-confidence secret scan pass.
+No Resume/Execute, network, RunPod/Mapillary, Pod/resource, corpus, budget-limit,
+receipt-history deletion, push or remote mutation occurred.
 
 ## Product Phase 3F RunPod top-level GPU-count attestation
 

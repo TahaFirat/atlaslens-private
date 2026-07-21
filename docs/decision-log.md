@@ -1,5 +1,31 @@
 # Decision log
 
+## 2026-07-21 - Phase 3F uses one versioned archive-name codec
+
+- Context: The first compound archive writer derived a synthetic legacy attempt
+  ID from `OperatorReceipt.to_dict()`. Adding a backward-compatible nullable GPU
+  count field changed that projection, so the unchanged archived bytes retained
+  attempt segment `05253cd0...` while the later validator derived
+  `f9f7b5bd...` and raised `OPERATOR_ARCHIVE_NAME_MISMATCH` before any cloud
+  secret or API call.
+- Decision: New immutable archives use the single strict codec
+  `v2--<run_id>--<attempt_id>--<terminal_stage>--<sha256-prefix>.json` with
+  lowercase 32-hex IDs, `failed|terminated`, a fixed 16-hex content prefix and
+  exact `.json`. Writer, parser, scanner, validator and indexer share the codec.
+  Existing `<run_id>.json` and unversioned compound files remain byte-immutable
+  legacy entries; the latter retain their filename attempt identity while run,
+  terminal stage and content hash are still verified. Legacy semantic identity
+  omits nullable fields so future additive schemas do not drift it.
+- Consequences: `ReconcileLocalReceipts` is the only local transactional repair
+  action. It requests no secret, makes no network call, archives a clean terminal
+  current receipt, recovers valid receipt partials, content-addresses invalid
+  partials into quarantine, rebuilds the deterministic v2 hash-chain index and
+  is a byte-level no-op when repeated. Missing/stale indexes and recoverable
+  partials block `CloudPlan` until reconciliation. No receipt history is
+  overwritten, no budget limit changes, and live inventory/billing still precede
+  any cloud mutation.
+- Target phase: Product Phase 3F bounded private fine-tuning only.
+
 ## 2026-07-21 - Phase 3F archives cloud lifecycle attempts independently
 
 - Context: A second terminated, cleanup-verified lifecycle for the same sealed
@@ -27,8 +53,9 @@
   one attempt may be active. Clean terminal receipts no longer block a retry;
   active, stale, cleanup-unverified, invalid-lock, and invalid-archive states
   remain typed blockers. Byte-identical retries are idempotent, semantic legacy
-  duplicates remain preserved and indexed, content-prefix collisions extend the
-  immutable name, and Windows lock/release races are bounded. A local failure
+  duplicates remain preserved and indexed. The later versioned codec fails
+  closed on the fixed-prefix collision instead of overwriting, and Windows
+  lock/release races are bounded. A local failure
   after current-receipt creation but before create entry is cleanup-verified;
   once create is entered, real receipt-bound termination and restored inventory
   remain mandatory. Resume treats active stages as running only while their

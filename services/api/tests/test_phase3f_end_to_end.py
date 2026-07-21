@@ -419,6 +419,7 @@ def test_training_and_operator_contracts_are_real_and_secret_safe() -> None:
     for action in (
         "Preflight",
         "CloudPlan",
+        "ReconcileLocalReceipts",
         "Execute",
         "Status",
         "Resume",
@@ -532,6 +533,7 @@ def test_cloud_plan_simulates_all_local_gates_without_runtime_mutation(
             duration_seconds=121,
         ),
     )
+    reconciliation = control.reconcile_local_receipts(cloud)
     runtime_before = _tree_sha256(runtime)
     cloud_before = _tree_sha256(cloud)
 
@@ -543,6 +545,11 @@ def test_cloud_plan_simulates_all_local_gates_without_runtime_mutation(
     assert plan["archive_conflicts"] == 0
     assert plan["active_local_receipts"] == 0
     assert plan["unclean_local_receipts"] == 0
+    assert plan["recoverable_partial_file_count"] == 0
+    assert plan["filename_parse_failure_count"] == 0
+    assert plan["filename_content_identity_mismatch_count"] == 0
+    assert plan["index_hash_chain_mismatch_count"] == 0
+    assert plan["duplicate_budget_linkage_count"] == 0
     assert plan["dataset_asset_count"] == 830
     assert plan["archive_receipt_count"] == 2
     assert plan["legacy_attempt_count"] == 2
@@ -553,6 +560,11 @@ def test_cloud_plan_simulates_all_local_gates_without_runtime_mutation(
     assert plan["runpod_api_calls"] == 0
     assert plan["cloud_mutations"] == 0
     assert plan["live_inventory_required"] is True
+    assert reconciliation["before_current_receipt_count"] == 1
+    assert reconciliation["after_current_receipt_count"] == 0
+    assert reconciliation["secret_prompt_count"] == 0
+    assert reconciliation["runpod_api_calls"] == 0
+    assert reconciliation["cloud_mutations"] == 0
     assert cast(dict[str, object], plan["budget_snapshot"])[
         "post_snapshot_receipt_count"
     ] == 1

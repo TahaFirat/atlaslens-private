@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Preflight", "CloudPlan", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
+    [ValidateSet("Preflight", "CloudPlan", "ReconcileLocalReceipts", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
     [string]$Action,
     [ValidateNotNullOrEmpty()]
     [string]$RuntimeRoot = "D:\AtlasLensRuntime\phase3f-local",
@@ -135,7 +135,7 @@ function Invoke-Control {
         "--repository-root", $repoRoot,
         "--runtime-root", $resolvedRuntime
     )
-    if ($ControlAction -in @("resume-plan", "cloud-plan", "status")) {
+    if ($ControlAction -in @("resume-plan", "cloud-plan", "reconcile-local-receipts", "status")) {
         $arguments += @("--cloud-runtime-root", $resolvedCloudRuntime)
     }
     $controlOutput = @(& $resolvedPython @arguments)
@@ -250,6 +250,9 @@ switch ($Action) {
     }
     "CloudPlan" {
         Invoke-Control -ControlAction "cloud-plan"
+    }
+    "ReconcileLocalReceipts" {
+        Invoke-Control -ControlAction "reconcile-local-receipts"
     }
     { $_ -in @("Execute", "Resume") } {
         $null = Invoke-Control -ControlAction "preflight"

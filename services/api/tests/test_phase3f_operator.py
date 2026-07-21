@@ -22,9 +22,13 @@ from atlaslens_api.phase3f.operator import (
     OperatorReceipt,
     Phase3FOperatorError,
     archive_completed_operator_receipt,
+    format_archive_name,
     inspect_operator_inventory,
+    operator_archive_index_matches,
+    parse_archive_name,
     prepare_operator_attempt,
     read_operator_receipt,
+    reconcile_local_operator_receipts,
     reconcile_operator_archive_index,
     require_startable_receipt,
     terminate_receipt_bound_pod,
@@ -535,7 +539,7 @@ def test_completed_receipt_is_archived_without_fake_termination(tmp_path: Path) 
 
     assert archived is not None
     assert archived.name.startswith(
-        f"{completed.run_id}-{completed.attempt_id}-terminated-"
+        f"v2--{completed.run_id}--{completed.attempt_id}--terminated--"
     )
     assert read_operator_receipt(archived) == completed
     assert not path.exists()
@@ -636,12 +640,15 @@ def test_content_prefix_collision_never_overwrites_existing_receipt(
     assert first is not None
     first_bytes = first.read_bytes()
     write_operator_receipt(current, second_receipt)
-    second = archive_completed_operator_receipt(current)
+    with pytest.raises(
+        Phase3FOperatorError,
+        match="OPERATOR_RECEIPT_CONTENT_HASH_COLLISION",
+    ):
+        archive_completed_operator_receipt(current)
 
-    assert second is not None and second != first
     assert first.read_bytes() == first_bytes
     assert read_operator_receipt(first) == first_receipt
-    assert read_operator_receipt(second) == second_receipt
+    assert read_operator_receipt(current) == second_receipt
 
 
 def test_archive_index_recovers_from_crash_partial_without_receipt_mutation(
@@ -772,6 +779,172 @@ def test_archive_names_are_lowercase_and_refuse_case_ambiguous_legacy_name(
     write_operator_receipt(ambiguous, _terminal_attempt(2))
     with pytest.raises(Phase3FOperatorError, match="OPERATOR_ARCHIVE_NAME_INVALID"):
         reconcile_operator_archive_index(current.parent)
+
+
+def test_archive_codec_round_trip_uses_versioned_fixed_grammar() -> None:
+    receipt = _terminal_attempt(1)
+
+    name = format_archive_name(receipt)
+    identity = parse_archive_name(name)
+
+    assert name == name.lower()
+    assert identity.version == "v2"
+    assert identity.run_id == receipt.run_id
+    assert identity.attempt_id == receipt.attempt_id
+    assert identity.terminal_stage == "terminated"
+    assert identity.receipt_content_sha256_prefix is not None
+    assert len(identity.receipt_content_sha256_prefix) == 16
+
+
+def test_real_failing_archive_name_is_typed_as_immutable_legacy_compound() -> None:
+    name = (
+        "ce23d58c42bf76e6de0b0117725e3ea7-"
+        "05253cd0446d09b1cf2cae8a94e8494b-terminated-1690a5c8cf564239.json"
+    )
+
+    identity = parse_archive_name(name)
+
+    assert identity.version == "legacy_v1_compound"
+    assert identity.attempt_id == "05253cd0446d09b1cf2cae8a94e8494b"
+    assert identity.receipt_content_sha256_prefix == "1690a5c8cf564239"
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "v2--" + "a" * 32 + "--" + "b" * 32 + "--running--" + "c" * 16 + ".json",
+        "v2--" + "a" * 32 + "--" + "b" * 32 + "--terminated--" + "c" * 15 + ".json",
+        "v2--" + "A" * 32 + "--" + "b" * 32 + "--terminated--" + "c" * 16 + ".json",
+        "../receipt.json",
+        "archive\\receipt.json",
+        "v2--receipt-ı.json",
+    ),
+)
+def test_archive_codec_rejects_stage_case_separator_hash_and_unicode_drift(
+    name: str,
+) -> None:
+    with pytest.raises(Phase3FOperatorError, match="OPERATOR_ARCHIVE_NAME_INVALID"):
+        parse_archive_name(name)
+
+
+def test_legacy_run_and_compound_names_share_the_canonical_parser(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "_operator"
+    archive = root / "archive"
+    archive.mkdir(parents=True)
+    receipt = _terminal_attempt(1)
+    payload = receipt.to_dict()
+    del payload["attempt_id"]
+    raw = (
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    legacy_run = archive / f"{receipt.run_id}.json"
+    legacy_run.write_bytes(raw)
+
+    first_index = reconcile_operator_archive_index(root, write=True)
+    legacy_run.rename(
+        archive
+        / (
+            f"{receipt.run_id}-{'c' * 32}-terminated-{digest[:16]}.json"
+        )
+    )
+    second_index = reconcile_operator_archive_index(root, write=True)
+
+    assert first_index["legacy_attempt_count"] == 1
+    assert second_index["legacy_attempt_count"] == 1
+    assert second_index["entries"][0]["attempt_identity_source"] == "legacy_v1_filename"
+    assert operator_archive_index_matches(root, second_index)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("run", "d" * 32),
+        ("attempt", "e" * 32),
+        ("stage", "failed"),
+        ("sha", "0" * 16),
+    ),
+)
+def test_canonical_filename_content_identity_mismatch_fails_typed(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+) -> None:
+    root = tmp_path / "_operator"
+    archive = root / "archive"
+    archive.mkdir(parents=True)
+    receipt = _terminal_attempt(1)
+    path = archive / format_archive_name(receipt)
+    write_operator_receipt(path, receipt)
+    identity = parse_archive_name(path.name)
+    parts = {
+        "run": identity.run_id,
+        "attempt": cast(str, identity.attempt_id),
+        "stage": cast(str, identity.terminal_stage),
+        "sha": cast(str, identity.receipt_content_sha256_prefix),
+    }
+    parts[field] = replacement
+    mismatched = archive / (
+        f"v2--{parts['run']}--{parts['attempt']}--{parts['stage']}--"
+        f"{parts['sha']}.json"
+    )
+    path.rename(mismatched)
+
+    with pytest.raises(Phase3FOperatorError, match="OPERATOR_ARCHIVE_NAME_MISMATCH"):
+        reconcile_operator_archive_index(root)
+
+
+def test_local_receipt_reconciliation_recovers_partial_and_quarantines_index_temp(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "_operator"
+    root.mkdir(parents=True)
+    partial_receipt = root / ".terminal-receipt.tmp"
+    write_operator_receipt(partial_receipt, _terminal_attempt(1))
+    (root / ".archive-index.json.deadbeef.tmp").write_bytes(b"truncated")
+
+    result = reconcile_local_operator_receipts(root)
+    index = reconcile_operator_archive_index(root)
+
+    assert result["recovered_partial_receipt_count"] == 1
+    assert result["quarantined_partial_file_count"] == 1
+    assert result["after_partial_file_count"] == 0
+    assert index["archive_receipt_count"] == 1
+    assert len(tuple((root / "quarantine").glob("*.quarantined"))) == 1
+    assert operator_archive_index_matches(root, index)
+
+
+def test_local_receipt_reconciliation_is_noop_on_second_run(tmp_path: Path) -> None:
+    root = tmp_path / "_operator"
+    current = root / "phase3f-current.json"
+    receipt = _terminal_attempt(1)
+    write_operator_receipt(current, receipt)
+
+    first = reconcile_local_operator_receipts(root)
+    first_files = {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    second = reconcile_local_operator_receipts(root)
+    second_files = {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+    assert first["before_current_receipt_count"] == 1
+    assert first["after_current_receipt_count"] == 0
+    assert first["terminal_receipt_archived"] is True
+    assert first["changed"] is True
+    assert second["terminal_receipt_archived"] is False
+    assert second["changed"] is False
+    assert second["before_operator_state_sha256"] == second["after_operator_state_sha256"]
+    assert first_files == second_files
+    assert operator_archive_index_matches(root)
 
 
 def test_status_is_read_only_and_rejects_a_second_pod() -> None:

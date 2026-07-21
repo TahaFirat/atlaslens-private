@@ -19,6 +19,7 @@ restored. Execute requires an explicit cloud-consent switch:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Preflight
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action ReconcileLocalReceipts
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action CloudPlan
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Execute -CloudConsent
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Status
@@ -51,14 +52,26 @@ the next plan accepts exactly one additional receipt only when removing that
 receipt reproduces the snapshot's recorded source count and SHA-256; replacement
 or multiple unbound additions fail closed.
 
+`ReconcileLocalReceipts` is local-only and must be used when CloudPlan reports
+an archive-index or partial-file reconciliation blocker. It touches only
+`<CloudRuntimeRoot>\_operator`, asks for neither Mapillary nor RunPod credentials,
+and makes no network call. A terminal `cleanup_verified` current receipt is moved
+losslessly into the immutable archive, valid interrupted receipt temporaries are
+recovered, invalid temporaries are content-addressed into quarantine, and the
+hash-chain index is rebuilt atomically. Repeating the action against the same
+state is a byte-level no-op. Active or cleanup-unverified current receipts remain
+typed blockers and are never archived by this action.
+
 The dataset `run_id` is stable across retries; every cloud lifecycle receives a
-new 32-hex `attempt_id`. A terminal receipt is archived immutably by run,
-attempt, terminal stage, and receipt-content SHA prefix. The atomic archive
-index is deterministic and hash-chained. Legacy receipts remain byte-for-byte
-unchanged and receive synthetic content-derived identities only in the index.
-Byte-identical archive retries succeed without another copy; semantic legacy
-duplicates are retained as one duplicate group; a content-prefix collision
-extends the immutable name instead of overwriting history. Budget evidence and
+new 32-hex `attempt_id`. A new terminal receipt uses the exact canonical grammar
+`v2--<run_id>--<attempt_id>--<failed|terminated>--<16 lowercase SHA hex>.json`.
+The formatter and parser round-trip byte-exactly, reject alternate separators,
+Unicode and case drift, and never overwrite a content-prefix collision. The
+atomic archive index is deterministic and hash-chained. Existing `<run_id>.json`
+and historical unversioned compound receipts remain byte-for-byte unchanged and
+are classified as legacy by the same parser. Byte-identical archive retries
+succeed without another copy; semantic legacy duplicates remain one duplicate
+group. Budget evidence and
 the create idempotency key use attempt identity. An active/stale receipt or a
 terminal receipt without verified cleanup blocks with a typed error.
 If SSH-key or transfer preparation fails after current-receipt creation but

@@ -780,6 +780,7 @@ def cloud_plan(
     from atlaslens_api.phase3f.operator import (  # noqa: PLC0415
         OperatorReceipt,
         Phase3FOperatorError,
+        operator_archive_index_matches,
         prepare_operator_attempt,
         read_operator_receipt,
         reconcile_operator_archive_index,
@@ -797,6 +798,10 @@ def cloud_plan(
             and current.stage in {"failed", "terminated"}
         )
     initial_index = reconcile_operator_archive_index(real_operator_root, write=False)
+    stored_index_matches = operator_archive_index_matches(
+        real_operator_root,
+        initial_index,
+    )
     active_local_receipts += cast(int, initial_index["active_receipt_count"])
     unclean_local_receipts += cast(int, initial_index["unclean_receipt_count"])
     local_blockers: list[str] = (
@@ -804,6 +809,10 @@ def cloud_plan(
         if local.get("next_phase") == "training_completed"
         else []
     )
+    if not stored_index_matches:
+        local_blockers.append("OPERATOR_ARCHIVE_INDEX_MISMATCH")
+    if cast(int, initial_index["partial_file_count"]) > 0:
+        local_blockers.append("OPERATOR_ARCHIVE_PARTIAL_REQUIRES_RECONCILIATION")
     simulated_index = initial_index
     attempt_id_ready = False
     lock_released = False
@@ -892,13 +901,42 @@ def cloud_plan(
         "legacy_attempt_count": simulated_index["legacy_attempt_count"],
         "duplicate_group_count": simulated_index["duplicate_group_count"],
         "duplicate_receipt_count": simulated_index["duplicate_receipt_count"],
+        "duplicate_budget_linkage_count": simulated_index[
+            "duplicate_budget_linkage_count"
+        ],
         "recoverable_partial_file_count": simulated_index["partial_file_count"],
+        "filename_parse_failure_count": 0,
+        "filename_content_identity_mismatch_count": 0,
+        "index_hash_chain_mismatch_count": int(not stored_index_matches),
         "attempt_id_ready": attempt_id_ready,
         "operator_lock_released": lock_released,
         "budget_snapshot": budget,
         "dataset_write_count": 0,
         "secret_prompt_count": 0,
         "runpod_api_calls": 0,
+        "cloud_mutations": 0,
+        "secrets_included": False,
+    }
+
+
+def reconcile_local_receipts(cloud_runtime: Path) -> dict[str, object]:
+    source = Path(__file__).resolve().parents[2] / "services" / "api" / "src"
+    if str(source) not in sys.path:
+        sys.path.insert(0, str(source))
+    from atlaslens_api.phase3f.operator import (  # noqa: PLC0415
+        reconcile_local_operator_receipts,
+    )
+
+    operator_root = cloud_runtime.resolve() / "_operator"
+    result = reconcile_local_operator_receipts(operator_root)
+    return {
+        "schema": "atlaslens-phase3f-local-receipt-reconciliation-v1",
+        "action": "reconcile-local-receipts",
+        **result,
+        "dataset_write_count": 0,
+        "secret_prompt_count": 0,
+        "runpod_api_calls": 0,
+        "mapillary_api_calls": 0,
         "cloud_mutations": 0,
         "secrets_included": False,
     }
@@ -940,7 +978,14 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="atlaslens-phase3f-end-to-end")
     parser.add_argument(
         "action",
-        choices=("preflight", "readiness", "resume-plan", "cloud-plan", "status"),
+        choices=(
+            "preflight",
+            "readiness",
+            "resume-plan",
+            "cloud-plan",
+            "reconcile-local-receipts",
+            "status",
+        ),
     )
     parser.add_argument("--repository-root", type=Path, required=True)
     parser.add_argument("--runtime-root", type=Path, required=True)
@@ -969,6 +1014,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.runtime_root,
                 args.cloud_runtime_root,
             )
+        elif args.action == "reconcile-local-receipts":
+            _require(args.cloud_runtime_root is not None, "CLOUD_RUNTIME_ROOT_MISSING")
+            result = reconcile_local_receipts(args.cloud_runtime_root)
         else:
             _require(args.cloud_runtime_root is not None, "CLOUD_RUNTIME_ROOT_MISSING")
             result = status(args.repository_root, args.runtime_root, args.cloud_runtime_root)
