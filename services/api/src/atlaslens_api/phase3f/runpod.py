@@ -8,6 +8,7 @@ before creation; no GraphQL mutation is implemented here.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import ipaddress
 import json
 import re
@@ -672,6 +673,12 @@ class PodGPUAttestationProgressDiagnostic:
     observed_gpu_id: str | None
     gpu_count: int | None
     cost_attestation: str | None
+    receipt_bound_pod_count: int | None = None
+    unexpected_pod_count: int | None = None
+    endpoint_count: int | None = None
+    network_volume_count: int | None = None
+    template_count: int | None = None
+    receipt_bound_match: bool | None = None
     observed_gpu_id_sha256: str | None = None
     create_http_class: str = "success_201"
     secret_free: bool = True
@@ -689,6 +696,12 @@ class PodGPUAttestationProgressDiagnostic:
             "observed_gpu_id_sha256": self.observed_gpu_id_sha256,
             "gpu_count": self.gpu_count,
             "cost_attestation": self.cost_attestation,
+            "receipt_bound_pod_count": self.receipt_bound_pod_count,
+            "unexpected_pod_count": self.unexpected_pod_count,
+            "endpoint_count": self.endpoint_count,
+            "network_volume_count": self.network_volume_count,
+            "template_count": self.template_count,
+            "receipt_bound_match": self.receipt_bound_match,
             "create_http_class": self.create_http_class,
             "secret_free": self.secret_free,
         }
@@ -774,6 +787,7 @@ class RunPodV1Client:
         record_connectivity_progress: (
             Callable[[PodConnectivityProgressDiagnostic], None] | None
         ) = None,
+        require_receipt_binding: bool = False,
         attestation_timeout_seconds: float = POD_GPU_ATTESTATION_TIMEOUT_SECONDS,
         attestation_poll_seconds: float = POD_GPU_ATTESTATION_POLL_SECONDS,
         connectivity_timeout_seconds: float = POD_CONNECTIVITY_TIMEOUT_SECONDS,
@@ -800,6 +814,7 @@ class RunPodV1Client:
             0 < connectivity_timeout_seconds <= POD_CONNECTIVITY_TIMEOUT_SECONDS,
             "connectivity_timeout_invalid",
         )
+        _require(isinstance(require_receipt_binding, bool), "receipt_binding_mode_invalid")
         self._api_token = api_token
         self._config = config
         self._last_offer: GPUOffer | None = None
@@ -816,6 +831,8 @@ class RunPodV1Client:
         self._record_rental_attestation = record_rental_attestation
         self._record_gpu_attestation_progress = record_gpu_attestation_progress
         self._record_connectivity_progress = record_connectivity_progress
+        self._require_receipt_binding = require_receipt_binding
+        self._receipt_binding_confirmed = False
         self._attestation_timeout_seconds = attestation_timeout_seconds
         self._attestation_poll_seconds = attestation_poll_seconds
         self._connectivity_timeout_seconds = connectivity_timeout_seconds
@@ -890,16 +907,36 @@ class RunPodV1Client:
             "pods",
             params={"includeMachine": "true", "includeNetworkVolume": "true"},
         )
-        records: list[PodRecord] = []
+        return self._pod_records(rows, duplicate_code="pod_record_invalid")
+
+    @staticmethod
+    def _pod_records(
+        rows: Sequence[Mapping[str, object]],
+        *,
+        duplicate_code: str,
+    ) -> tuple[PodRecord, ...]:
+        by_id: dict[str, PodRecord] = {}
         for row in rows:
             pod_id = _resource_id(row.get("id"), "pod_id_invalid")
             name = row.get("name")
             marker = name if isinstance(name, str) and _MARKER.fullmatch(name) else None
             try:
-                records.append(PodRecord(pod_id, marker))
+                candidate = PodRecord(pod_id, marker)
             except Phase3FSafetyError as exc:
                 raise RunPodAPIError("pod_record_invalid") from exc
-        return tuple(sorted(records, key=lambda item: item.pod_id))
+            prior = by_id.get(pod_id)
+            if prior is not None:
+                _require(
+                    prior.run_marker is None
+                    or candidate.run_marker is None
+                    or hmac.compare_digest(prior.run_marker, candidate.run_marker),
+                    duplicate_code,
+                )
+                if prior.run_marker is None and candidate.run_marker is not None:
+                    by_id[pod_id] = candidate
+            else:
+                by_id[pod_id] = candidate
+        return tuple(sorted(by_id.values(), key=lambda item: item.pod_id))
 
     def list_endpoints(self) -> tuple[str, ...]:
         return self._list_ids("endpoints", "endpoint_id_invalid")
@@ -1491,6 +1528,7 @@ class RunPodV1Client:
         )
         self._last_offer = offer
         self._last_gpu_attestation_progress = None
+        self._receipt_binding_confirmed = False
         create_payload, _contract = build_create_payload(self._config, request, offer)
         self._cloud_mutation_count += 1
         payload = self._request_json(
@@ -1509,10 +1547,16 @@ class RunPodV1Client:
             raise RunPodAPIError("create_response_invalid") from exc
         try:
             if self._bind_created_pod is not None:
-                self._bind_created_pod(created)
+                try:
+                    self._bind_created_pod(created)
+                except Exception:
+                    raise RunPodAPIError("POD_RECEIPT_BINDING_MISSING") from None
+                self._receipt_binding_confirmed = True
+            _require(
+                self._receipt_binding_confirmed or not self._require_receipt_binding,
+                "POD_RECEIPT_BINDING_MISSING",
+            )
             _require(row.get("name") == request.run_marker, "create_response_marker_mismatch")
-            _require(row.get("endpointId") is None, "create_response_endpoint_bound")
-            _require(row.get("networkVolume") is None, "create_response_network_volume")
             _require(row.get("volumeInGb") == POD_VOLUME_GB, "create_response_volume")
             _require(
                 row.get("volumeMountPath") == "/workspace",
@@ -1655,7 +1699,14 @@ class RunPodV1Client:
                     raise RunPodAPIError("POD_GPU_ATTESTATION_POD_MISSING") from None
                 raise
             verified = _object(payload, "pod_gpu_attestation_response_invalid")
-            _require(verified.get("id") == created.pod_id, "pod_gpu_attestation_id_mismatch")
+            verified_id = _resource_id(
+                verified.get("id"),
+                "pod_gpu_attestation_response_invalid",
+            )
+            _require(
+                hmac.compare_digest(verified_id, created.pod_id),
+                "pod_gpu_attestation_id_mismatch",
+            )
 
             marker = verified.get("name", _MISSING)
             get_value = verified.get("interruptible", _MISSING)
@@ -1696,7 +1747,11 @@ class RunPodV1Client:
                 "pod_interruptible_type_invalid",
             )
             if marker is not _MISSING and marker is not None:
-                _require(marker == request.run_marker, "pod_gpu_attestation_marker_mismatch")
+                _require(
+                    isinstance(marker, str)
+                    and hmac.compare_digest(marker, request.run_marker),
+                    "pod_gpu_attestation_marker_mismatch",
+                )
             if get_value is True:
                 raise RunPodAPIError("pod_interruptible_true")
             if desired is not _MISSING and desired is not None:
@@ -1728,48 +1783,48 @@ class RunPodV1Client:
                 )
             actual_price = observed_price if observed_price is not None else create_price
 
-            _require(
-                verified.get("endpointId") is None,
-                "pod_attestation_related_resource_present",
-            )
-            _require(
-                verified.get("networkVolume") is None
-                and verified.get("networkVolumeId") is None,
-                "pod_attestation_related_resource_present",
-            )
-            _require(
-                verified.get("templateId") is None,
-                "pod_attestation_related_resource_present",
-            )
-
             inventory = self._attestation_inventory(deadline)
-            if inventory.pods:
-                _require(
-                    len(inventory.pods) == 1
-                    and inventory.pods[0].pod_id == created.pod_id,
-                    "pod_attestation_inventory_mismatch",
-                )
-                inventory_marker = inventory.pods[0].run_marker
-                _require(
-                    inventory_marker is None or inventory_marker == request.run_marker,
-                    "pod_attestation_inventory_mismatch",
-                )
-            _require(
-                not inventory.endpoint_ids
-                and not inventory.network_volume_ids
-                and not inventory.template_ids,
-                "pod_attestation_related_resource_present",
+            receipt_bound = tuple(
+                pod
+                for pod in inventory.pods
+                if hmac.compare_digest(pod.pod_id, created.pod_id)
             )
+            unexpected = tuple(
+                pod
+                for pod in inventory.pods
+                if not hmac.compare_digest(pod.pod_id, created.pod_id)
+            )
+            marker_matches = bool(receipt_bound) and all(
+                pod.run_marker is None
+                or hmac.compare_digest(pod.run_marker, request.run_marker)
+                for pod in receipt_bound
+            )
+            receipt_bound_match = (
+                (self._receipt_binding_confirmed or not self._require_receipt_binding)
+                and len(receipt_bound) == 1
+                and marker_matches
+            )
+            inventory_failure: str | None = None
+            if unexpected or len(receipt_bound) > 1 or (
+                receipt_bound and not marker_matches
+            ):
+                inventory_failure = "UNEXPECTED_POD_INVENTORY"
+            elif (
+                inventory.endpoint_ids
+                or inventory.network_volume_ids
+                or inventory.template_ids
+            ):
+                inventory_failure = "pod_attestation_related_resource_present"
 
             ready = (
-                marker == request.run_marker
+                isinstance(marker, str)
+                and hmac.compare_digest(marker, request.run_marker)
                 and desired == "RUNNING"
                 and gpu_id is not None
                 and gpu_path is not None
                 and gpu_count == 1
                 and actual_price is not None
-                and len(inventory.pods) == 1
-                and inventory.pods[0].pod_id == created.pod_id
+                and receipt_bound_match
             )
             elapsed = max(0.0, self._monotonic() - started)
             cost_attestation = (
@@ -1797,6 +1852,12 @@ class RunPodV1Client:
                     ),
                     gpu_count=gpu_count,
                     cost_attestation=cost_attestation,
+                    receipt_bound_pod_count=len(receipt_bound),
+                    unexpected_pod_count=len(unexpected),
+                    endpoint_count=len(inventory.endpoint_ids),
+                    network_volume_count=len(inventory.network_volume_ids),
+                    template_count=len(inventory.template_ids),
+                    receipt_bound_match=receipt_bound_match,
                     observed_gpu_id_sha256=(
                         hashlib.sha256(gpu_id.encode("utf-8")).hexdigest()
                         if gpu_id is not None and gpu_id != offer.gpu_type_id
@@ -1804,6 +1865,8 @@ class RunPodV1Client:
                     ),
                 )
             )
+            if inventory_failure is not None:
+                raise RunPodAPIError(inventory_failure)
             if elapsed >= self._attestation_timeout_seconds:
                 current = self._last_gpu_attestation_progress
                 if current is not None:
@@ -1885,12 +1948,10 @@ class RunPodV1Client:
             params={"includeMachine": "true", "includeNetworkVolume": "true"},
             timeout_seconds=self._remaining_attestation_seconds(deadline),
         )
-        pods: list[PodRecord] = []
-        for row in pod_rows:
-            pod_id = _resource_id(row.get("id"), "pod_id_invalid")
-            name = row.get("name")
-            marker = name if isinstance(name, str) and _MARKER.fullmatch(name) else None
-            pods.append(PodRecord(pod_id, marker))
+        pods = self._pod_records(
+            pod_rows,
+            duplicate_code="UNEXPECTED_POD_INVENTORY",
+        )
         endpoint_ids = self._attestation_ids("endpoints", "endpoint_id_invalid", deadline)
         network_volume_ids = self._attestation_ids(
             "networkvolumes",
@@ -1899,7 +1960,7 @@ class RunPodV1Client:
         )
         template_ids = self._attestation_ids("templates", "template_id_invalid", deadline)
         return RunPodInventory(
-            pods=tuple(sorted(pods, key=lambda item: item.pod_id)),
+            pods=pods,
             endpoint_ids=endpoint_ids,
             network_volume_ids=network_volume_ids,
             template_ids=template_ids,
@@ -2223,14 +2284,6 @@ class RunPodV1Client:
                     )
                 else:
                     price = attestation.create_cost_per_hr
-
-                _require(
-                    row.get("endpointId") is None
-                    and row.get("networkVolume") is None
-                    and row.get("networkVolumeId") is None
-                    and row.get("templateId") is None,
-                    "POD_CONNECTIVITY_RELATED_RESOURCE_PRESENT",
-                )
 
                 ip_value = row.get("publicIp", _MISSING)
                 public_ip_present = isinstance(ip_value, str) and bool(ip_value.strip())

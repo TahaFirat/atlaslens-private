@@ -116,6 +116,12 @@ class OperatorReceipt:
     gpu_count: int | None = None
     cost_attestation: str | None = None
     create_http_class: str | None = None
+    receipt_bound_pod_count: int | None = None
+    unexpected_pod_count: int | None = None
+    endpoint_count: int | None = None
+    network_volume_count: int | None = None
+    template_count: int | None = None
+    receipt_bound_match: bool | None = None
     allocation_attested_at: str | None = None
     connectivity_outcome: str | None = None
     connectivity_failure_code: str | None = None
@@ -372,14 +378,50 @@ class OperatorReceipt:
                 or self.cost_attestation == _GPU_ATTESTATION_COST,
                 "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
             )
+            post_create_inventory = (
+                self.receipt_bound_pod_count,
+                self.unexpected_pod_count,
+                self.endpoint_count,
+                self.network_volume_count,
+                self.template_count,
+            )
+            if any(value is not None for value in post_create_inventory):
+                _require(
+                    all(
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and 0 <= value <= 10_000
+                        for value in post_create_inventory
+                    )
+                    and isinstance(self.receipt_bound_match, bool),
+                    "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+                )
+            else:
+                _require(
+                    self.receipt_bound_match is None,
+                    "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+                )
             if self.gpu_attestation_outcome == "attested":
+                legacy_inventory = all(
+                    value is None
+                    for value in (*post_create_inventory, self.receipt_bound_match)
+                )
+                safe_inventory = (
+                    self.receipt_bound_pod_count == 1
+                    and self.unexpected_pod_count == 0
+                    and self.endpoint_count == 0
+                    and self.network_volume_count == 0
+                    and self.template_count == 0
+                    and self.receipt_bound_match is True
+                )
                 _require(
                     self.rental_evidence is not None
                     and self.normalized_gpu_path is not None
                     and self.observed_gpu_id == self.expected_gpu_id
                     and self.gpu_count == 1
                     and self.final_desired_status == "RUNNING"
-                    and self.cost_attestation == _GPU_ATTESTATION_COST,
+                    and self.cost_attestation == _GPU_ATTESTATION_COST
+                    and (legacy_inventory or safe_inventory),
                     "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
                 )
         else:
@@ -398,6 +440,12 @@ class OperatorReceipt:
                         self.gpu_count,
                         self.cost_attestation,
                         self.create_http_class,
+                        self.receipt_bound_pod_count,
+                        self.unexpected_pod_count,
+                        self.endpoint_count,
+                        self.network_volume_count,
+                        self.template_count,
+                        self.receipt_bound_match,
                     )
                 ),
                 "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
@@ -523,6 +571,12 @@ class OperatorReceipt:
             "gpu_count": self.gpu_count,
             "cost_attestation": self.cost_attestation,
             "create_http_class": self.create_http_class,
+            "receipt_bound_pod_count": self.receipt_bound_pod_count,
+            "unexpected_pod_count": self.unexpected_pod_count,
+            "endpoint_count": self.endpoint_count,
+            "network_volume_count": self.network_volume_count,
+            "template_count": self.template_count,
+            "receipt_bound_match": self.receipt_bound_match,
             "allocation_attested_at": self.allocation_attested_at,
             "connectivity_outcome": self.connectivity_outcome,
             "connectivity_failure_code": self.connectivity_failure_code,
@@ -589,6 +643,14 @@ class OperatorReceipt:
             "cost_attestation",
             "create_http_class",
         }
+        post_create_inventory_fields = {
+            "receipt_bound_pod_count",
+            "unexpected_pod_count",
+            "endpoint_count",
+            "network_volume_count",
+            "template_count",
+            "receipt_bound_match",
+        }
         connectivity_fields = {
             "allocation_attested_at",
             "connectivity_outcome",
@@ -615,6 +677,13 @@ class OperatorReceipt:
                         legacy_expected
                         | evidence_fields
                         | gpu_attestation_fields
+                        | connectivity_fields
+                    ),
+                    frozenset(
+                        legacy_expected
+                        | evidence_fields
+                        | gpu_attestation_fields
+                        | post_create_inventory_fields
                         | connectivity_fields
                     ),
                 }
@@ -685,6 +754,21 @@ class OperatorReceipt:
         gpu_count = row.get("gpu_count") if has_gpu_attestation else None
         cost_attestation = row.get("cost_attestation") if has_gpu_attestation else None
         create_http_class = row.get("create_http_class") if has_gpu_attestation else None
+        has_post_create_inventory = "receipt_bound_pod_count" in row
+        receipt_bound_pod_count = (
+            row.get("receipt_bound_pod_count") if has_post_create_inventory else None
+        )
+        unexpected_pod_count = (
+            row.get("unexpected_pod_count") if has_post_create_inventory else None
+        )
+        endpoint_count = row.get("endpoint_count") if has_post_create_inventory else None
+        network_volume_count = (
+            row.get("network_volume_count") if has_post_create_inventory else None
+        )
+        template_count = row.get("template_count") if has_post_create_inventory else None
+        receipt_bound_match = (
+            row.get("receipt_bound_match") if has_post_create_inventory else None
+        )
         has_connectivity = "connectivity_outcome" in row
         allocation_attested_at = (
             row.get("allocation_attested_at") if has_connectivity else None
@@ -735,12 +819,22 @@ class OperatorReceipt:
             public_ip_present,
             tcp_port_present,
             ssh_ready,
+            receipt_bound_match,
         ):
             _require(
                 optional_boolean is None or isinstance(optional_boolean, bool),
                 "OPERATOR_RECEIPT_EVIDENCE_INVALID",
             )
-        for optional_integer in (create_status, get_status, inventory_count):
+        for optional_integer in (
+            create_status,
+            get_status,
+            inventory_count,
+            receipt_bound_pod_count,
+            unexpected_pod_count,
+            endpoint_count,
+            network_volume_count,
+            template_count,
+        ):
             _require(
                 optional_integer is None
                 or (isinstance(optional_integer, int) and not isinstance(optional_integer, bool)),
@@ -842,6 +936,12 @@ class OperatorReceipt:
             gpu_count=cast(int | None, gpu_count),
             cost_attestation=cast(str | None, cost_attestation),
             create_http_class=cast(str | None, create_http_class),
+            receipt_bound_pod_count=cast(int | None, receipt_bound_pod_count),
+            unexpected_pod_count=cast(int | None, unexpected_pod_count),
+            endpoint_count=cast(int | None, endpoint_count),
+            network_volume_count=cast(int | None, network_volume_count),
+            template_count=cast(int | None, template_count),
+            receipt_bound_match=cast(bool | None, receipt_bound_match),
             allocation_attested_at=cast(str | None, allocation_attested_at),
             connectivity_outcome=cast(str | None, connectivity_outcome),
             connectivity_failure_code=cast(str | None, connectivity_failure_code),
@@ -931,6 +1031,12 @@ class OperatorReceipt:
             gpu_count=diagnostic.gpu_count,
             cost_attestation=diagnostic.cost_attestation,
             create_http_class=diagnostic.create_http_class,
+            receipt_bound_pod_count=diagnostic.receipt_bound_pod_count,
+            unexpected_pod_count=diagnostic.unexpected_pod_count,
+            endpoint_count=diagnostic.endpoint_count,
+            network_volume_count=diagnostic.network_volume_count,
+            template_count=diagnostic.template_count,
+            receipt_bound_match=diagnostic.receipt_bound_match,
         )
 
     def record_connectivity_progress(

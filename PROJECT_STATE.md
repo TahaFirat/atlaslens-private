@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-21T15:42:35+03:00
+last_verified_at: 2026-07-21T16:30:21+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: phase3f_runpod_connectivity_wait_repaired_live_sealed_830_preserved
+product_phase_status: phase3f_receipt_bound_post_create_inventory_repaired_live_sealed_830_preserved
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -466,6 +466,19 @@ phase_3f_connectivity_budget_live_values: actual_0_8365359555_active0_unbilled0_
 phase_3f_connectivity_tests: pass_282_phase3f
 phase_3f_connectivity_static: pass_ruff_strict_mypy_260_sources_powershell5_diff_secret_scan
 phase_3f_connectivity_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_resume_zero_dataset_runtime_mutation
+phase_3f_post_create_inventory_failure: pod_attestation_related_resource_present_after_0_547_seconds
+phase_3f_post_create_inventory_source_condition: overloaded_nested_pod_association_or_independent_inventory_exact_live_subcondition_unrecoverable_raw_body_absent
+phase_3f_post_create_inventory_model: receipt_bound_pod1_unexpected_pods0_endpoints0_network_volumes0_templates0
+phase_3f_post_create_nested_fields: pod_owned_machine_ephemeral_container_volume_ports_public_ip_and_associations_not_independent_inventory
+phase_3f_post_create_receipt_binding: atomic_write_reread_exact_constant_time_match_before_attestation
+phase_3f_post_create_eventual_inventory: exact_get_success_list_missing_is_pending_same_pod_no_recreate
+phase_3f_post_create_create_invariant: one_post_max_zero_retry
+phase_3f_post_create_cleanup: exact_receipt_bound_pod_only_full_inventory_0_0_0_0_required
+phase_3f_post_create_budget_live_values: actual_0_8372639018_active0_unbilled0_proposed3_remaining9_1627360982
+phase_3f_post_create_tests: pass_292_phase3f
+phase_3f_post_create_static: pass_ruff_strict_mypy_3_changed_sources_powershell5_diff_secret_scan
+phase_3f_post_create_broader_mypy: phase3f20_sources_preexisting2_unused_ignores_full260_preexisting54_errors_35_files
+phase_3f_post_create_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_resume_zero_execute_zero_dataset_runtime_mutation
 phase_3f_next_action: run_exact_resume_ce23_with_explicit_cloud_consent
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
@@ -559,6 +572,66 @@ true, `gpu_started=false`, and `cloud_mutations=0`; its readiness SHA-256 is
 All 254 Phase 3F tests pass. Ruff, strict mypy on both changed sources, all five
 Phase 3F PowerShell parsers, diff validation, and the high-confidence secret scan
 pass. No network, RunPod/GPU, Resume, dataset, media, or runtime mutation occurred.
+
+## Product Phase 3F receipt-bound post-create inventory
+
+Status: **REPAIRED AND LIVE READ-ONLY VERIFIED - RUNPOD NOT CALLED**.
+
+The historical operator receipt proves HTTP 201 produced an exact bound Pod,
+the first authenticated allocation poll saw `RUNNING` and the selected GPU at
+`machine.gpuTypeId`, and the old code failed after 0.547 seconds with
+`pod_attestation_related_resource_present`. That error was overloaded: it was
+raised both for non-null `endpointId`, `networkVolume`, `networkVolumeId`, or
+`templateId` fields nested in the Pod JSON and for independently listed account
+endpoints, network volumes, or templates. The receipt intentionally retained no
+raw provider body and had none of the new count telemetry, so the exact live
+subcondition/resource field cannot be reconstructed. It is therefore not valid
+to claim that the Pod was never rented. The empty baseline, exact receipt binding,
+successful allocation fields, and final `0/0/0/0` cleanup remain proven.
+
+Post-create inventory now accepts exactly one unique receipt-bound Pod and zero
+unexpected Pods, independent endpoints, independent network volumes, and
+independent templates. Pod-owned machine, ephemeral/container volume, nested
+associations, ports, and public-IP fields are not separate account resources.
+Duplicate rows for the same bound Pod are counted once; if the exact authenticated
+Pod GET succeeds while list inventory is temporarily empty, polling continues on
+the same Pod under the existing monotonic allocation deadline. Another Pod is
+`UNEXPECTED_POD_INVENTORY`; an independently listed endpoint, network volume, or
+template retains `pod_attestation_related_resource_present`. No path issues a
+second create.
+
+The HTTP-201 ID is written atomically to the operator receipt, re-read, and
+constant-time matched before allocation attestation. Sanitized telemetry contains
+only `receipt_bound_pod_count`, `unexpected_pod_count`, `endpoint_count`,
+`network_volume_count`, `template_count`, and `receipt_bound_match`; it never
+contains Pod/resource IDs, IPs, ports, or secrets. Every terminal error still
+terminates only the receipt-bound Pod, and the supervisor accepts cleanup only
+when Pod/endpoint/network-volume/template inventories all return to the empty
+baseline. The live historical receipt remains `terminated` with
+`cleanup_verified=true`; this repair made no RunPod request or mutation.
+
+The new budget regression preserves the reported reconciliation exactly:
+actual billed USD `0.8372639018`, active exposure `0`, conservative unbilled
+estimate `0`, proposed maximum `3`, and remaining authorized USD `9.1627360982`.
+The live sealed-corpus audit recomputed readiness exactly and reported 830 assets,
+`ACQUISITION_SEALED`, `model_loaded=false`, GPU/cloud mutation counts zero, and
+the same hashes:
+
+| Read-only evidence | Before | After |
+|---|---|---|
+| Readiness SHA-256 | `2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9` | same |
+| Sealed-assets SHA-256 | `b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1` | same |
+| Sealed metadata inventory SHA-256 | `3ccac5be7232e7d6afb205eba384c4ac6772e2d8a0b463c066dfe4d1fd82d742` | same |
+| Sealed media inventory SHA-256 | `da189be7feb70643d6579b0cfb61c0a7e7b9878f28ed19b501082f6b59ee7cae` | same |
+| Bundle checksum inventory SHA-256 | `f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93` | same |
+
+All 292 Phase 3F tests pass. Ruff, strict mypy for the three changed production
+sources, all five Phase 3F PowerShell parsers, diff validation, and the
+high-confidence secret scan pass. The wider Phase 3F mypy invocation exposes two
+pre-existing unused-ignore findings in unchanged `end_to_end.py`; the full
+260-source invocation exposes 54 pre-existing findings in 35 unchanged files.
+No network, Mapillary, RunPod/GPU, Resume/Execute, dataset, media, live-runtime,
+budget-limit, or remote mutation occurred.
 
 ## Product Phase 3F receipt-bound RunPod connectivity readiness
 

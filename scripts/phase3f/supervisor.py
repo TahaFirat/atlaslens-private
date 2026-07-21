@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -1241,9 +1242,19 @@ def _bind_operator_pod(
     pod: PodRecord,
 ) -> None:
     receipt = read_operator_receipt(receipt_path)
-    _require(receipt.run_id == expected_run_id, "OPERATOR_RECEIPT_RUN_ID_MISMATCH")
-    _require(receipt.run_marker == pod.run_marker, "OPERATOR_RECEIPT_POD_MARKER_MISMATCH")
-    _require(receipt.pod_id in {None, pod.pod_id}, "OPERATOR_RECEIPT_POD_ID_CONFLICT")
+    _require(
+        hmac.compare_digest(receipt.run_id, expected_run_id),
+        "OPERATOR_RECEIPT_RUN_ID_MISMATCH",
+    )
+    _require(
+        pod.run_marker is not None
+        and hmac.compare_digest(receipt.run_marker, pod.run_marker),
+        "OPERATOR_RECEIPT_POD_MARKER_MISMATCH",
+    )
+    _require(
+        receipt.pod_id is None or hmac.compare_digest(receipt.pod_id, pod.pod_id),
+        "OPERATOR_RECEIPT_POD_ID_CONFLICT",
+    )
     _require(receipt.stage in {"preflight", "running"}, "OPERATOR_RECEIPT_STAGE_INVALID")
     if receipt.pod_id is None or receipt.stage != "running":
         write_operator_receipt(
@@ -1254,6 +1265,15 @@ def _bind_operator_pod(
                 pod_bound_at=datetime.now(UTC).isoformat(),
             ),
         )
+    confirmed = read_operator_receipt(receipt_path)
+    _require(
+        confirmed.stage == "running"
+        and confirmed.pod_id is not None
+        and pod.run_marker is not None
+        and hmac.compare_digest(confirmed.pod_id, pod.pod_id)
+        and hmac.compare_digest(confirmed.run_marker, pod.run_marker),
+        "OPERATOR_RECEIPT_POD_BINDING_MISSING",
+    )
 
 
 def _record_operator_rental_attestation(
@@ -1440,6 +1460,7 @@ def _run_execute(
         with RunPodV1Client(
             api_token=token,
             config=config,
+            require_receipt_binding=True,
             bind_created_pod=lambda pod: _bind_operator_pod(
                 receipt_path,
                 expected_run_id=run_id,

@@ -178,6 +178,12 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
         observed_gpu_id="NVIDIA RTX A5000",
         gpu_count=1,
         cost_attestation="graphql_uninterruptable_price_match",
+        receipt_bound_pod_count=1,
+        unexpected_pod_count=0,
+        endpoint_count=0,
+        network_volume_count=0,
+        template_count=0,
+        receipt_bound_match=True,
     )
 
     module._record_operator_gpu_attestation_progress(
@@ -205,6 +211,12 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
             observed_gpu_id="NVIDIA RTX A5000",
             gpu_count=1,
             cost_attestation="graphql_uninterruptable_price_match",
+            receipt_bound_pod_count=1,
+            unexpected_pod_count=0,
+            endpoint_count=0,
+            network_volume_count=0,
+            template_count=0,
+            receipt_bound_match=True,
         ),
     )
     module._record_operator_connectivity_progress(
@@ -237,6 +249,12 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
     assert recorded.observed_gpu_id == "NVIDIA RTX A5000"
     assert recorded.gpu_count == 1
     assert recorded.cost_attestation == "graphql_uninterruptable_price_match"
+    assert recorded.receipt_bound_pod_count == 1
+    assert recorded.unexpected_pod_count == 0
+    assert recorded.endpoint_count == 0
+    assert recorded.network_volume_count == 0
+    assert recorded.template_count == 0
+    assert recorded.receipt_bound_match is True
     assert recorded.allocation_attested_at is not None
     assert recorded.connectivity_outcome == "ready"
     assert recorded.public_ip_present is True
@@ -377,6 +395,12 @@ def test_legacy_operator_receipt_remains_readable(tmp_path: Path) -> None:
         "cost_attestation",
         "create_http_class",
         "allocation_attested_at",
+        "receipt_bound_pod_count",
+        "unexpected_pod_count",
+        "endpoint_count",
+        "network_volume_count",
+        "template_count",
+        "receipt_bound_match",
         "connectivity_outcome",
         "connectivity_failure_code",
         "public_ip_present",
@@ -412,6 +436,12 @@ def test_previous_v2_operator_receipt_remains_readable(tmp_path: Path) -> None:
         "cost_attestation",
         "create_http_class",
         "allocation_attested_at",
+        "receipt_bound_pod_count",
+        "unexpected_pod_count",
+        "endpoint_count",
+        "network_volume_count",
+        "template_count",
+        "receipt_bound_match",
         "connectivity_outcome",
         "connectivity_failure_code",
         "public_ip_present",

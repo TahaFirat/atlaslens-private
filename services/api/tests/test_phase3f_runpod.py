@@ -1514,7 +1514,10 @@ def test_on_demand_attestation_mismatch_terminates_receipt_bound_pod(
     assert session.last_audit.termination_verified is True
 
 
-def test_on_demand_attestation_rejects_multiple_pod_inventory_without_touching_other() -> None:
+@pytest.mark.parametrize("include_receipt_bound", [True, False])
+def test_on_demand_attestation_rejects_unexpected_pod_inventory_without_touching_other(
+    include_receipt_bound: bool,
+) -> None:
     pod_present = False
     delete_calls: list[str] = []
 
@@ -1538,7 +1541,7 @@ def test_on_demand_attestation_rejects_multiple_pod_inventory_without_touching_o
             return httpx.Response(200, json={"id": "created-pod"})
         if path.endswith("/pods"):
             rows = [{"id": "other-pod", "name": "other-run"}]
-            if pod_present:
+            if pod_present and include_receipt_bound:
                 rows.insert(0, {"id": "created-pod", "name": "phase3f-run-001"})
             return httpx.Response(200, json=rows)
         if path.endswith(("/endpoints", "/networkvolumes", "/templates")):
@@ -1553,12 +1556,287 @@ def test_on_demand_attestation_rejects_multiple_pod_inventory_without_touching_o
         session = SinglePodSession(client)
         with pytest.raises(
             RunPodCreateError,
-            match="pod_attestation_inventory_mismatch",
+            match="UNEXPECTED_POD_INVENTORY",
         ):
             session.execute(_request(), lambda _lease: None)
 
     assert delete_calls == ["/v1/pods/created-pod"]
     assert pod_present is False
+
+
+def test_post_create_inventory_accepts_only_receipt_bound_pod_and_nested_fields() -> None:
+    post_calls = 0
+    bound: list[PodRecord] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            post_calls += 1
+            payload = _created_payload()
+            payload.update(
+                {
+                    "endpointId": "nested-endpoint-reference",
+                    "networkVolume": {"id": "ephemeral-container-volume"},
+                    "templateId": "nested-template-reference",
+                }
+            )
+            return httpx.Response(201, json=payload)
+        if request.url.path.endswith("/pods/created-pod"):
+            payload = _attested_pod_payload(gpu_shape="machine.gpuTypeId")
+            payload.update(
+                {
+                    "endpointId": "nested-endpoint-reference",
+                    "networkVolume": {"id": "ephemeral-container-volume"},
+                    "networkVolumeId": "nested-volume-reference",
+                    "templateId": "nested-template-reference",
+                    "portMappings": {"22": 10341},
+                }
+            )
+            return httpx.Response(200, json=payload)
+        if request.url.path.endswith("/pods"):
+            return httpx.Response(
+                200,
+                json=[{"id": "created-pod", "name": "phase3f-run-001"}],
+            )
+        if request.url.path.endswith(("/endpoints", "/networkvolumes", "/templates")):
+            return httpx.Response(200, json=[])
+        raise AssertionError(request.url.path)
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        bind_created_pod=bound.append,
+        require_receipt_binding=True,
+    ) as client:
+        pod = client.create_pod(_request())
+        progress = client.last_gpu_attestation_progress
+
+    assert pod == PodRecord("created-pod", "phase3f-run-001")
+    assert bound == [pod]
+    assert post_calls == 1
+    assert progress is not None
+    assert progress.outcome == "attested"
+    assert progress.receipt_bound_pod_count == 1
+    assert progress.unexpected_pod_count == 0
+    assert progress.endpoint_count == 0
+    assert progress.network_volume_count == 0
+    assert progress.template_count == 0
+    assert progress.receipt_bound_match is True
+
+
+@pytest.mark.parametrize(
+    ("resource_path", "telemetry_field"),
+    [
+        ("endpoints", "endpoint_count"),
+        ("networkvolumes", "network_volume_count"),
+        ("templates", "template_count"),
+    ],
+)
+def test_independent_post_create_resource_fails_with_typed_telemetry_and_cleanup(
+    resource_path: str,
+    telemetry_field: str,
+) -> None:
+    pod_present = False
+    post_calls = 0
+    deleted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present, post_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            post_calls += 1
+            pod_present = True
+            return httpx.Response(201, json=_created_payload())
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            pod_present = False
+            return httpx.Response(204)
+        if request.url.path.endswith("/pods/created-pod"):
+            return httpx.Response(
+                200,
+                json=_attested_pod_payload(gpu_shape="machine.gpuTypeId"),
+            )
+        if request.url.path.endswith("/pods"):
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        if request.url.path.endswith(f"/{resource_path}"):
+            return httpx.Response(200, json=[{"id": f"unexpected-{resource_path}"}])
+        if request.url.path.endswith(("/endpoints", "/networkvolumes", "/templates")):
+            return httpx.Response(200, json=[])
+        raise AssertionError(request.url.path)
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        bind_created_pod=lambda _pod: None,
+        require_receipt_binding=True,
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(
+            RunPodCreateError,
+            match="pod_attestation_related_resource_present",
+        ):
+            session.execute(_request(), lambda _lease: None)
+        progress = client.last_gpu_attestation_progress
+
+    assert post_calls == 1
+    assert deleted == ["/v1/pods/created-pod"]
+    assert pod_present is False
+    assert progress is not None
+    assert progress.outcome == "failed"
+    assert getattr(progress, telemetry_field) == 1
+    assert progress.receipt_bound_pod_count == 1
+    assert progress.unexpected_pod_count == 0
+    assert progress.receipt_bound_match is True
+    public = progress.to_public_dict()
+    assert "unexpected-" not in repr(public)
+    assert "created-pod" not in repr(public)
+    assert TOKEN not in repr(public)
+
+
+def test_duplicate_receipt_bound_pod_rows_are_deduplicated() -> None:
+    post_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            post_calls += 1
+            return httpx.Response(201, json=_created_payload())
+        if request.url.path.endswith("/pods/created-pod"):
+            return httpx.Response(
+                200,
+                json=_attested_pod_payload(gpu_shape="machine.gpuTypeId"),
+            )
+        if request.url.path.endswith("/pods"):
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": "created-pod", "name": None},
+                    {"id": "created-pod", "name": "phase3f-run-001"},
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    with _client(handler) as client:
+        pod = client.create_pod(_request())
+        progress = client.last_gpu_attestation_progress
+
+    assert pod.pod_id == "created-pod"
+    assert post_calls == 1
+    assert progress is not None
+    assert progress.receipt_bound_pod_count == 1
+    assert progress.unexpected_pod_count == 0
+
+
+def test_post_create_inventory_waits_for_receipt_bound_list_visibility() -> None:
+    clock = _FakeClock()
+    post_calls = 0
+    inventory_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls, inventory_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            post_calls += 1
+            return httpx.Response(201, json=_created_payload())
+        if request.url.path.endswith("/pods/created-pod"):
+            return httpx.Response(
+                200,
+                json=_attested_pod_payload(gpu_shape="machine.gpuTypeId"),
+            )
+        if request.url.path.endswith("/pods"):
+            inventory_calls += 1
+            rows = []
+            if inventory_calls > 1:
+                rows = [{"id": "created-pod", "name": "phase3f-run-001"}]
+            return httpx.Response(200, json=rows)
+        return httpx.Response(200, json=[])
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        attestation_timeout_seconds=10,
+        attestation_poll_seconds=2,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    ) as client:
+        pod = client.create_pod(_request())
+
+    assert pod.pod_id == "created-pod"
+    assert post_calls == 1
+    assert inventory_calls == 2
+    assert clock.sleeps == [2]
+
+
+@pytest.mark.parametrize("callback_raises", [False, True])
+def test_required_receipt_binding_failure_never_attests_or_recreates(
+    callback_raises: bool,
+) -> None:
+    pod_present = False
+    post_calls = 0
+    exact_get_calls = 0
+    deleted: list[str] = []
+
+    def failed_binding(_pod: PodRecord) -> None:
+        raise RuntimeError(TOKEN)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present, post_calls, exact_get_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            post_calls += 1
+            pod_present = True
+            return httpx.Response(201, json=_created_payload())
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            pod_present = False
+            return httpx.Response(204)
+        if request.url.path.endswith("/pods/created-pod"):
+            exact_get_calls += 1
+            return httpx.Response(200, json={"id": "created-pod"})
+        if request.url.path.endswith("/pods"):
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        return httpx.Response(200, json=[])
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        bind_created_pod=failed_binding if callback_raises else None,
+        require_receipt_binding=True,
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(
+            RunPodCreateError,
+            match="POD_RECEIPT_BINDING_MISSING",
+        ) as error:
+            session.execute(_request(), lambda _lease: None)
+
+    assert post_calls == 1
+    assert exact_get_calls == 0
+    assert deleted == ["/v1/pods/created-pod"]
+    assert pod_present is False
+    assert TOKEN not in str(error.value)
+    assert TOKEN not in repr(error.value)
 
 
 def test_boolean_true_is_bound_then_terminated_with_post_id_cleanup() -> None:

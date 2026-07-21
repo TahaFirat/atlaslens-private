@@ -1,5 +1,37 @@
 # Decision log
 
+## 2026-07-21 - Phase 3F distinguishes the receipt-bound Pod from independent inventory
+
+- Context: Post-create allocation attestation accepted only one account Pod, but
+  also treated non-null `endpointId`, `networkVolume`, `networkVolumeId`, or
+  `templateId` fields nested in that Pod JSON as proof of an extra account
+  resource. RunPod may expose Pod-owned ephemeral/container volume, machine,
+  port, public-IP, or association data in the Pod object without creating a
+  separate endpoint, network volume, template, or second Pod. The overloaded
+  `pod_attestation_related_resource_present` code did not record which condition
+  fired. The historical raw response was intentionally not retained, so its
+  exact nested field cannot be reconstructed.
+- Decision: Atomically bind the HTTP-201 Pod ID to the operator receipt before
+  allocation attestation, verify that binding after the atomic write, and use
+  constant-time comparison for receipt-bound ID/marker matching. Post-create
+  inventory accepts exactly one unique receipt-bound Pod and zero unexpected
+  Pods, independent endpoints, independent network volumes, and independent
+  templates. Duplicate list rows for that same Pod are one resource; a briefly
+  missing list row remains pending while exact authenticated Pod GET succeeds.
+  Nested Pod fields are not account-inventory evidence. Presence of any
+  independent endpoint, network volume, or template retains the typed related-
+  resource failure; any other Pod is `UNEXPECTED_POD_INVENTORY`.
+- Alternatives: Require every nested association field to be null; ignore all
+  account inventory after create; retry create when list visibility lags; or log
+  raw provider response bodies and resource identifiers.
+- Consequences: Exactly one create remains permitted. Sanitized receipt/log
+  telemetry records only receipt-bound/unexpected Pod counts, independent
+  resource counts, and a binding-match boolean. Every terminal failure still
+  terminates only the receipt-bound Pod and requires the complete account
+  inventory to return to the empty baseline before cleanup is verified. Budget,
+  dataset, readiness, and connectivity policies are unchanged.
+- Target phase: Product Phase 3F bounded private fine-tuning only.
+
 ## 2026-07-21 - Phase 3F separates RunPod allocation from connectivity readiness
 
 - Context: RunPod returned HTTP 201, the receipt-bound Pod was `RUNNING`, and

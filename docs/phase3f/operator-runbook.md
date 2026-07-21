@@ -273,8 +273,12 @@ when request `interruptible` is exact boolean `false`, create is HTTP 201, the I
 is already receipt-bound, returned GPU and `RUNNING` status match, `costPerHr` is
 positive and within both the hourly ceiling and 0.005 USD/hour of the revalidated
 GraphQL `uninterruptablePrice`, neither representation proves boolean `true`, and
-inventory shows only the receipt-bound Pod with no endpoint, network volume or
-template. This evidence is recorded as
+account inventory shows one unique receipt-bound Pod and no unexpected Pod,
+independent endpoint, independent network volume or independent template. Pod
+JSON fields such as `endpointId`, `networkVolume`, `networkVolumeId`,
+`templateId`, machine data, ephemeral/container volume, ports and public IP are
+attributes or associations of that Pod and are not counted as additional account
+resources. This evidence is recorded as
 `request_and_on_demand_price_attested`; it is never described as
 `interruptible_field_verified`. Receipt v2 also records the atomic binding time
 and sanitized field-presence/type evidence while remaining able to read legacy
@@ -291,12 +295,19 @@ paths must agree, and display names or `machine.minPodGpuCount` are not allocati
 evidence. Missing/null machine, GPU or status values remain pending. Allocation
 success requires the exact bound ID and run name, `RUNNING`, count one, selected
 GPU ID, valid on-demand price/rental evidence, no proof of `interruptible=true`,
-and only the bound Pod with no endpoint, network volume or template. Public IP and
-port mapping are eventual connectivity fields and are not allocation invariants.
+and account inventory containing only the bound Pod, with zero unexpected Pods,
+independent endpoints, independent network volumes and independent templates.
+Duplicate list rows for the same bound Pod are counted once. If exact bound-Pod
+GET succeeds while the Pod list has not converged, allocation remains pending
+within the same deadline and never creates another Pod. Public IP and port
+mapping are eventual connectivity fields and are not allocation invariants.
 A mismatch terminates immediately; expiration raises
 `POD_GPU_ATTESTATION_TIMEOUT`. Receipt v2 stores
-only allowlisted fields or a hash for mismatching GPU text, plus poll count/time
-and outcome, and remains able to read receipts written before these fields.
+only allowlisted fields or a hash for mismatching GPU text, plus poll count/time,
+outcome, `receipt_bound_pod_count`, `unexpected_pod_count`, `endpoint_count`,
+`network_volume_count`, `template_count`, and `receipt_bound_match`. It never
+logs Pod/resource IDs and remains able to read receipts written before these
+fields.
 
 After `allocation_attested_at` is recorded, connectivity uses authenticated
 `GET /pods/{receipt-bound-id}` only; it never issues another create/POST. The
