@@ -398,7 +398,14 @@ phase_3f_e2e_training_bounds: deterministic_seed_batch_8_6_4_accumulation_oom_re
 phase_3f_e2e_holdout: final_only_once_after_validation_threshold_lock
 phase_3f_e2e_promotion: never_automatic_regression_keeps_production_unchanged
 phase_3f_e2e_secret_transport: secure_prompt_child_environment_only_sequential_mapillary_then_runpod_finally_cleared
-phase_3f_e2e_budget: per_run_absolute_3_soft_2_95_terminate_2_99_historical_fail_closed_10_before_runpod_client
+phase_3f_e2e_budget: per_run_absolute_3_soft_2_95_terminate_2_99_historical_fail_closed_10_before_cloud_mutation
+phase_3f_budget_reconciliation: authenticated_empty_inventory_then_readonly_billing_local_receipt_dedup_and_closed_reservation_release
+phase_3f_budget_live_legacy_reservations: three_cleanup_verified_pod_receipts_raw_usd30
+phase_3f_budget_live_local_conservative_usd: 0_3312660582138888888888888888
+phase_3f_budget_live_local_releasable_usd: 29_66873394178611111111111111
+phase_3f_budget_tests: pass_254_phase3f
+phase_3f_budget_static: pass_ruff_strict_mypy_2_changed_sources_powershell_parse_secret_scan
+phase_3f_budget_live_actions: zero_network_zero_runpod_zero_gpu_zero_resume_zero_runtime_mutation
 phase_3f_e2e_phase3f_tests: pass_199
 phase_3f_e2e_static: pass_ruff_strict_mypy_14_source_files_powershell_parse
 phase_3f_e2e_full_backend: pass_1118_skipped_7_one_unrelated_existing_private_evaluation_artifact_gate
@@ -493,6 +500,44 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F RunPod budget reconciliation
+
+Status: **REPAIRED AND VERIFIED OFFLINE - LIVE RESUME NOT EXECUTED**.
+
+The false positive came from the historical fallback in the Phase 3F supervisor:
+every Pod-bearing operator receipt without a completed supervisor output receipt
+was charged at its full declared maximum. The local history contains three such
+terminated, cleanup-verified Pods. Their legacy receipts declare USD 10 each, not
+USD 3, so the old gate counted USD 30 as spent. The remaining three operator
+receipts contain no Pod and contributed zero.
+
+The three Pod lifecycles total only USD 0.0312660582138888888888888888 at the
+safest recorded hourly rates. Retaining the existing USD 0.10 disk allowance for
+each makes the local conservative historical estimate
+USD 0.3312660582138888888888888888 and the locally releasable part of the legacy
+reservations USD 29.66873394178611111111111111. The operator-reported USD 9.17
+balance would imply USD 0.83 account spend and USD 29.17 released, but it is not
+treated as authoritative until the next explicitly authorized authenticated,
+read-only snapshot.
+
+Execute/Resume now performs authenticated Pod/endpoint/network-volume/template
+inventory, requires it to be empty, and obtains a read-only billing snapshot
+before any local operator mutation, SSH key creation, GPU selection, or Pod create.
+The reconciliation de-duplicates Pod evidence, uses the safer of provider-account
+spend and local lifecycle evidence, releases only unused closed reservations, and
+retains full exposure for active or cleanup-unverified runs. Its atomic receipt
+contains only sanitized totals, hashes, and a receipt ID. `BUDGET_INSUFFICIENT`
+reports projected-capacity failure; `HISTORICAL_BUDGET_ALREADY_EXCEEDED` remains
+only for verified actual spend above USD 10. The USD 3/2.95/2.99 per-run controls
+and USD 10 historical cap are unchanged.
+
+The sealed run remains `READY_FOR_TRAINING` with 830 assets, all readiness checks
+true, `gpu_started=false`, and `cloud_mutations=0`; its readiness SHA-256 is
+`2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9`.
+All 254 Phase 3F tests pass. Ruff, strict mypy on both changed sources, all five
+Phase 3F PowerShell parsers, diff validation, and the high-confidence secret scan
+pass. No network, RunPod/GPU, Resume, dataset, media, or runtime mutation occurred.
 
 ## Product Phase 3F exhausted media reserve replenishment
 

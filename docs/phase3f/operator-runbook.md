@@ -34,10 +34,18 @@ cleared in `finally` blocks and the secure BSTR is zeroed.
 
 The fine-tuning path has a hard USD 3 ceiling per run (`2.95` soft stop,
 `2.99` termination stop) and a fail-closed USD 10 historical ceiling. Before
-the RunPod client is created, verified completed receipts are summed by their
-conservative incremental upper bound; any prior cleaned-up run that opened a
-Pod but lacks a completed output receipt reserves its declared maximum. A new
-run is refused when its full USD 3 allowance would cross the historical limit.
+any mutation, an authenticated read-only client inventories Pods, endpoints,
+network volumes, and templates, then reads the account billing snapshot. Any
+inventory object or unrecognized active hourly spend blocks creation. The
+supervisor reconciles provider-billed totals with de-duplicated local receipts
+and a conservative timestamp-by-hourly-price plus disk estimate. A terminated,
+cleanup-verified Pod releases only the unused part of its reservation; active or
+cleanup-unverified runs retain their full exposure. The sanitized reconciliation
+receipt stores totals and hashes, never the provider body or credentials. A new
+run is refused with `BUDGET_INSUFFICIENT` unless billed cost, unbilled estimate,
+active exposure, and the full USD 3 proposal fit under USD 10;
+`HISTORICAL_BUDGET_ALREADY_EXCEEDED` is reserved for verified actual spend over
+the cap.
 
 The v4 acquisition supervisor checkpoint is written atomically beside the
 existing page and media checkpoints. Migration is additive: it records the v3

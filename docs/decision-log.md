@@ -1,5 +1,29 @@
 # Decision log
 
+## 2026-07-21 - Phase 3F releases closed RunPod reservations after reconciliation
+
+- Context: The historical gate treated every Pod-bearing operator receipt without
+  a completed supervisor output receipt as if its entire declared reservation had
+  been billed. Three short, terminated, cleanup-verified migration Pods therefore
+  contributed USD 30 from their legacy USD 10 receipt maxima and produced a false
+  `HISTORICAL_BUDGET_ALREADY_EXCEEDED` before any authenticated inventory check.
+- Decision: Before mutation, require an empty authenticated inventory and a
+  read-only billing snapshot. De-duplicate Pod evidence, retain full exposure for
+  active or cleanup-unverified runs, and estimate closed unbilled Pods from their
+  lifecycle duration, the safest recorded hourly price, and a USD 0.10 disk
+  allowance. Use the higher of provider-account spend and local evidence without
+  summing both for the same historical cost. Atomically persist only sanitized
+  totals, source/snapshot hashes, and a receipt identifier.
+- Alternatives: Clear the budget history; trust the reported dashboard balance as
+  authoritative; keep every historical reservation permanently; raise the USD 10
+  cap; or mutate cloud resources before reconciliation.
+- Consequences: Closed unused reservation becomes available without erasing its
+  evidence. Unknown resources/current spend fail closed. Actual spend above USD 10
+  retains the historical-exceeded code; otherwise insufficient projected capacity
+  reports `BUDGET_INSUFFICIENT`. Per-run USD 3, soft USD 2.95, terminate USD 2.99,
+  and historical USD 10 limits are unchanged.
+- Target phase: Product Phase 3F bounded private fine-tuning only.
+
 ## 2026-07-21 - Phase 3F media reserves are replenished from the locked metadata pool
 
 - Context: The direct image resolver completed all usable tasks in the original

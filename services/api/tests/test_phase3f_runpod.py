@@ -298,6 +298,89 @@ def test_inventory_lists_only_documented_rest_v1_resources() -> None:
     assert [request.method for request in requests] == ["GET", "GET", "GET", "GET"]
 
 
+def test_account_billing_snapshot_is_authenticated_read_only_and_exact_contract() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        _assert_secret_safe(request)
+        assert str(request.url) == GRAPHQL_URL
+        assert request.method == "POST"
+        body = json.loads(request.content)
+        assert body["operationName"] == "AtlasLensPhase3FAccountBilling"
+        query = body["query"]
+        assert "myself" in query
+        assert "clientBalance" in query
+        assert "currentSpendPerHr" in query
+        assert "mutation" not in query.lower()
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "myself": {
+                        "clientBalance": "9.17",
+                        "currentSpendPerHr": "0",
+                    }
+                }
+            },
+        )
+
+    with _client(handler) as client:
+        snapshot = client.account_billing_snapshot()
+        assert client.api_request_count == 1
+        assert client.cloud_mutation_count == 0
+
+    assert snapshot.client_balance_usd == Decimal("9.17")
+    assert snapshot.current_spend_per_hour_usd == Decimal("0")
+    assert len(requests) == 1
+    assert TOKEN not in repr(snapshot)
+
+
+def test_account_billing_graphql_error_redacts_secret_and_response_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_secret_safe(request)
+        return httpx.Response(
+            200,
+            json={
+                "errors": [
+                    {
+                        "message": f"Bearer {TOKEN} https://provider.invalid/private",
+                        "extensions": {"code": "FORBIDDEN"},
+                    }
+                ],
+                "data": {"myself": None},
+            },
+        )
+
+    with _client(handler) as client:
+        with pytest.raises(RunPodAPIError, match="BILLING_RECONCILIATION_GRAPHQL_ERRORS"):
+            client.account_billing_snapshot()
+        diagnostic = client.last_graphql_errors[0]
+
+    assert diagnostic.message == "<redacted>"
+    assert diagnostic.secret_free is True
+    assert TOKEN not in repr(diagnostic)
+
+
+@pytest.mark.parametrize(
+    "myself",
+    (
+        None,
+        {},
+        {"clientBalance": None, "currentSpendPerHr": "0"},
+        {"clientBalance": "9.17", "currentSpendPerHr": "0", "extra": "refuse"},
+    ),
+)
+def test_account_billing_snapshot_fails_closed_on_unknown_schema(myself: object) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"myself": myself}})
+
+    with _client(handler) as client:
+        with pytest.raises(RunPodAPIError):
+            client.account_billing_snapshot()
+        assert client.cloud_mutation_count == 0
+
+
 def test_gpu_offer_uses_official_list_then_detail_schema_and_lowest_price() -> None:
     calls = 0
 

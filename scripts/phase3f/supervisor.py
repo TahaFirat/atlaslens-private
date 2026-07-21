@@ -15,6 +15,7 @@ import time
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "services" / "api" / "src"
@@ -37,6 +38,7 @@ from atlaslens_api.phase3f.runpod import (  # noqa: E402
     PodRentalAttestationDiagnostic,
     PodConnection,
     RunPodAPIError,
+    RunPodBillingSnapshot,
     RunPodConfig,
     RunPodInventory,
     RunPodV1Client,
@@ -84,14 +86,37 @@ GPU_PREFERENCES = (
 REMOTE_JOB_SECONDS = 5 * 60 * 60 + 30 * 60
 E2E_RUN_BUDGET_USD = Decimal("3")
 E2E_HISTORICAL_BUDGET_USD = Decimal("10")
+E2E_CLOSED_POD_DISK_ALLOWANCE_USD = Decimal("0.10")
 MAX_HISTORICAL_RECEIPTS = 1_000
+_SUPERVISOR_RECEIPT_SCHEMA = "atlaslens-phase3f-local-supervisor-receipt-v1"
+_BUDGET_RECONCILIATION_SCHEMA = "atlaslens-phase3f-budget-reconciliation-v1"
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class SupervisorExecutionError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class BudgetReconciliation(NamedTuple):
+    actual_billed_usd: Decimal
+    conservative_unbilled_estimate_usd: Decimal
+    active_exposure_usd: Decimal
+    closed_unused_reservation_released_usd: Decimal
+    proposed_run_max_usd: Decimal
+    historical_total_cap_usd: Decimal
+    remaining_authorized_usd: Decimal
+    projected_total_usd: Decimal
+    legacy_closed_reservation_total_usd: Decimal
+    local_conservative_historical_usd: Decimal
+    provider_balance_delta_usd: Decimal
+    source_receipts_sha256: str
+    provider_snapshot_sha256: str
+    source_receipt_count: int
+    duplicate_billing_record_count: int
+    unrecognized_active_billing: bool
 
 
 def _require(condition: bool, code: str) -> None:
@@ -579,72 +604,339 @@ def _write_receipt(path: Path, value: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
-def _historical_conservative_spend(runtime_root: Path) -> Decimal:
-    spend_by_run: dict[str, Decimal] = {}
+def _budget_decimal(value: object, code: str) -> Decimal:
+    _require(not isinstance(value, bool), code)
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise SupervisorExecutionError(code) from exc
+    _require(amount.is_finite() and amount >= 0, code)
+    return amount
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _receipt_key(run_id: str, pod_id_sha256: str | None) -> str:
+    if pod_id_sha256 is not None:
+        _require(bool(_SHA256.fullmatch(pod_id_sha256)), "HISTORICAL_RECEIPT_INVALID")
+        return f"pod:{pod_id_sha256}"
+    return f"run:{run_id}"
+
+
+def _operator_receipt_key(receipt: OperatorReceipt) -> str:
+    pod_id_sha256 = (
+        None
+        if receipt.pod_id is None
+        else hashlib.sha256(receipt.pod_id.encode("utf-8")).hexdigest()
+    )
+    return _receipt_key(receipt.run_id, pod_id_sha256)
+
+
+def _receipt_paths(runtime_root: Path) -> tuple[list[Path], list[Path]]:
+    supervisor_paths: list[Path] = []
     receipt_root = runtime_root / "_receipts"
     if receipt_root.exists():
-        _require(receipt_root.is_dir() and not receipt_root.is_symlink(), "HISTORICAL_RECEIPTS_INVALID")
-        paths = sorted(receipt_root.glob("*.json"))
-        _require(len(paths) <= MAX_HISTORICAL_RECEIPTS, "HISTORICAL_RECEIPT_CAP_EXCEEDED")
-        for path in paths:
-            _require(
-                path.is_file() and not path.is_symlink() and path.stat().st_size <= 1024 * 1024,
-                "HISTORICAL_RECEIPT_INVALID",
-            )
-            try:
-                row = json.loads(path.read_bytes())
-                _require(isinstance(row, dict), "HISTORICAL_RECEIPT_INVALID")
-                run_id = row.get("run_id")
-                raw_spend = row.get("conservative_incremental_upper_usd")
-                amount = Decimal(str(raw_spend))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, InvalidOperation, ValueError) as exc:
-                raise SupervisorExecutionError("HISTORICAL_RECEIPT_INVALID") from exc
-            _require(
-                row.get("schema") == "atlaslens-phase3f-local-supervisor-receipt-v1"
-                and isinstance(run_id, str)
-                and bool(_RUN_ID.fullmatch(run_id))
-                and run_id not in spend_by_run
-                and amount.is_finite()
-                and amount >= 0,
-                "HISTORICAL_RECEIPT_INVALID",
-            )
-            spend_by_run[run_id] = amount
-
-    operator_root = runtime_root / "_operator"
+        _require(
+            receipt_root.is_dir() and not receipt_root.is_symlink(),
+            "HISTORICAL_RECEIPTS_INVALID",
+        )
+        supervisor_paths = sorted(receipt_root.glob("*.json"))
     operator_paths: list[Path] = []
+    operator_root = runtime_root / "_operator"
     current = operator_root / "phase3f-current.json"
     if current.exists():
         operator_paths.append(current)
     archive = operator_root / "archive"
     if archive.exists():
-        _require(archive.is_dir() and not archive.is_symlink(), "HISTORICAL_RECEIPTS_INVALID")
-        operator_paths.extend(sorted(archive.glob("*.json")))
-    _require(len(operator_paths) <= MAX_HISTORICAL_RECEIPTS, "HISTORICAL_RECEIPT_CAP_EXCEEDED")
-    for path in operator_paths:
-        receipt = read_operator_receipt(path)
         _require(
-            receipt.cleanup_verified and receipt.stage in {"failed", "terminated"},
+            archive.is_dir() and not archive.is_symlink(),
+            "HISTORICAL_RECEIPTS_INVALID",
+        )
+        operator_paths.extend(sorted(archive.glob("*.json")))
+    _require(
+        len(supervisor_paths) + len(operator_paths) <= MAX_HISTORICAL_RECEIPTS,
+        "HISTORICAL_RECEIPT_CAP_EXCEEDED",
+    )
+    for path in (*supervisor_paths, *operator_paths):
+        _require(
+            path.is_file() and not path.is_symlink() and path.stat().st_size <= 1024 * 1024,
             "HISTORICAL_RECEIPT_INVALID",
         )
-        if receipt.run_id not in spend_by_run and receipt.pod_id is not None:
-            spend_by_run[receipt.run_id] = receipt.max_spend_usd
-    total = sum(spend_by_run.values(), Decimal("0"))
-    _require(total <= E2E_HISTORICAL_BUDGET_USD, "HISTORICAL_BUDGET_ALREADY_EXCEEDED")
-    return total
+    return supervisor_paths, operator_paths
 
 
-def _require_e2e_budget(policy: BudgetPolicy, runtime_root: Path) -> tuple[Decimal, Decimal]:
+def _receipt_datetime(value: str | None) -> datetime:
+    if value is None:
+        raise SupervisorExecutionError("HISTORICAL_RECEIPT_TIME_INVALID")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise SupervisorExecutionError("HISTORICAL_RECEIPT_TIME_INVALID") from exc
+    _require(
+        parsed.tzinfo is not None and parsed.utcoffset() is not None,
+        "HISTORICAL_RECEIPT_TIME_INVALID",
+    )
+    return parsed.astimezone(UTC)
+
+
+def _closed_operator_estimate(receipt: OperatorReceipt) -> Decimal:
+    if receipt.pod_id is None:
+        return Decimal("0")
+    started = _receipt_datetime(receipt.pod_bound_at or receipt.started_at)
+    finished = _receipt_datetime(receipt.finished_at)
+    duration_seconds = Decimal(str((finished - started).total_seconds()))
+    _require(
+        Decimal("0") <= duration_seconds <= Decimal(receipt.max_wall_minutes * 60),
+        "HISTORICAL_RECEIPT_TIME_INVALID",
+    )
+    hourly_candidates = [receipt.max_gpu_hourly_usd]
+    if receipt.selected_uninterruptable_price is not None:
+        hourly_candidates.append(receipt.selected_uninterruptable_price)
+    if receipt.create_cost_per_hr is not None:
+        hourly_candidates.append(receipt.create_cost_per_hr)
+    hourly = max(hourly_candidates)
+    compute = hourly * duration_seconds / Decimal(3600)
+    return min(
+        receipt.max_spend_usd,
+        compute + E2E_CLOSED_POD_DISK_ALLOWANCE_USD,
+    )
+
+
+def _historical_budget_evidence(
+    runtime_root: Path,
+) -> tuple[Decimal, Decimal, Decimal, Decimal, str, int, int]:
+    supervisor_paths, operator_paths = _receipt_paths(runtime_root)
+    local_estimate_by_key: dict[str, Decimal] = {}
+    actual_by_key: dict[str, Decimal] = {}
+    active_by_key: dict[str, Decimal] = {}
+    closed_reservation_by_key: dict[str, Decimal] = {}
+    source_hashes: list[str] = []
+    duplicate_billing_records = 0
+
+    for path in operator_paths:
+        source_hashes.append(_sha256_path(path))
+        receipt = read_operator_receipt(path)
+        key = _operator_receipt_key(receipt)
+        closed = receipt.cleanup_verified and receipt.stage in {"failed", "terminated"}
+        if closed:
+            if receipt.pod_id is not None:
+                closed_reservation_by_key[key] = max(
+                    closed_reservation_by_key.get(key, Decimal("0")),
+                    receipt.max_spend_usd,
+                )
+                local_estimate_by_key[key] = max(
+                    local_estimate_by_key.get(key, Decimal("0")),
+                    _closed_operator_estimate(receipt),
+                )
+        else:
+            active_by_key[key] = max(
+                active_by_key.get(key, Decimal("0")),
+                receipt.max_spend_usd,
+            )
+
+    seen_supervisor_keys: set[str] = set()
+    for path in supervisor_paths:
+        source_hashes.append(_sha256_path(path))
+        try:
+            row = json.loads(path.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SupervisorExecutionError("HISTORICAL_RECEIPT_INVALID") from exc
+        _require(isinstance(row, dict), "HISTORICAL_RECEIPT_INVALID")
+        run_id = row.get("run_id")
+        pod_id_sha256 = row.get("pod_id_sha256")
+        _require(
+            row.get("schema") == _SUPERVISOR_RECEIPT_SCHEMA
+            and isinstance(run_id, str)
+            and bool(_RUN_ID.fullmatch(run_id))
+            and (pod_id_sha256 is None or isinstance(pod_id_sha256, str)),
+            "HISTORICAL_RECEIPT_INVALID",
+        )
+        key = _receipt_key(run_id, pod_id_sha256)
+        if key in seen_supervisor_keys:
+            duplicate_billing_records += 1
+        seen_supervisor_keys.add(key)
+        conservative = _budget_decimal(
+            row.get("conservative_incremental_upper_usd"),
+            "HISTORICAL_RECEIPT_INVALID",
+        )
+        local_estimate_by_key[key] = max(
+            local_estimate_by_key.get(key, Decimal("0")),
+            conservative,
+        )
+        if row.get("actual_spend_available") is True:
+            actual = _budget_decimal(
+                row.get("actual_spend_usd"),
+                "HISTORICAL_RECEIPT_INVALID",
+            )
+            actual_by_key[key] = max(actual_by_key.get(key, Decimal("0")), actual)
+        else:
+            _require(
+                row.get("actual_spend_usd") is None,
+                "HISTORICAL_RECEIPT_INVALID",
+            )
+
+    return (
+        sum(actual_by_key.values(), Decimal("0")),
+        sum(local_estimate_by_key.values(), Decimal("0")),
+        sum(active_by_key.values(), Decimal("0")),
+        sum(closed_reservation_by_key.values(), Decimal("0")),
+        _canonical_sha256(sorted(source_hashes)),
+        len(source_hashes),
+        duplicate_billing_records,
+    )
+
+
+def _budget_reconciliation(
+    policy: BudgetPolicy,
+    runtime_root: Path,
+    billing: RunPodBillingSnapshot,
+) -> BudgetReconciliation:
     _require(
         policy.absolute_usd <= E2E_RUN_BUDGET_USD,
         "TRAINING_RUN_BUDGET_EXCEEDS_3_USD",
     )
-    historical = _historical_conservative_spend(runtime_root)
-    projected = historical + policy.absolute_usd
-    _require(
-        projected <= E2E_HISTORICAL_BUDGET_USD,
-        "HISTORICAL_BUDGET_WOULD_EXCEED_10_USD",
+    (
+        local_actual,
+        local_conservative,
+        active_exposure,
+        closed_reservations,
+        source_receipts_sha256,
+        source_receipt_count,
+        duplicate_billing_records,
+    ) = _historical_budget_evidence(runtime_root)
+    provider_balance_delta = max(
+        Decimal("0"),
+        E2E_HISTORICAL_BUDGET_USD - billing.client_balance_usd,
     )
-    return historical, projected
+    unrecognized_active_billing = billing.current_spend_per_hour_usd != 0
+    if unrecognized_active_billing:
+        active_exposure += E2E_HISTORICAL_BUDGET_USD
+    actual_billed = max(local_actual, provider_balance_delta)
+    conservative_unbilled = max(Decimal("0"), local_conservative - actual_billed)
+    historical_and_active = actual_billed + conservative_unbilled + active_exposure
+    remaining = max(Decimal("0"), E2E_HISTORICAL_BUDGET_USD - historical_and_active)
+    projected = historical_and_active + policy.absolute_usd
+    closed_released = max(
+        Decimal("0"),
+        closed_reservations - max(actual_billed, local_conservative),
+    )
+    provider_snapshot_sha256 = _canonical_sha256(
+        {
+            "client_balance_usd": str(billing.client_balance_usd),
+            "current_spend_per_hour_usd": str(billing.current_spend_per_hour_usd),
+        }
+    )
+    return BudgetReconciliation(
+        actual_billed_usd=actual_billed,
+        conservative_unbilled_estimate_usd=conservative_unbilled,
+        active_exposure_usd=active_exposure,
+        closed_unused_reservation_released_usd=closed_released,
+        proposed_run_max_usd=policy.absolute_usd,
+        historical_total_cap_usd=E2E_HISTORICAL_BUDGET_USD,
+        remaining_authorized_usd=remaining,
+        projected_total_usd=projected,
+        legacy_closed_reservation_total_usd=closed_reservations,
+        local_conservative_historical_usd=local_conservative,
+        provider_balance_delta_usd=provider_balance_delta,
+        source_receipts_sha256=source_receipts_sha256,
+        provider_snapshot_sha256=provider_snapshot_sha256,
+        source_receipt_count=source_receipt_count,
+        duplicate_billing_record_count=duplicate_billing_records,
+        unrecognized_active_billing=unrecognized_active_billing,
+    )
+
+
+def _write_budget_reconciliation(
+    runtime_root: Path,
+    *,
+    run_id: str,
+    reconciliation: BudgetReconciliation,
+    api_request_count: int,
+    cloud_mutation_count: int,
+) -> Path:
+    _require(cloud_mutation_count == 0, "BUDGET_RECONCILIATION_AFTER_MUTATION")
+    reconciled_at = datetime.now(UTC).isoformat()
+    totals = {
+        "actual_billed_usd": str(reconciliation.actual_billed_usd),
+        "conservative_unbilled_estimate_usd": str(
+            reconciliation.conservative_unbilled_estimate_usd
+        ),
+        "active_exposure_usd": str(reconciliation.active_exposure_usd),
+        "closed_unused_reservation_released_usd": str(
+            reconciliation.closed_unused_reservation_released_usd
+        ),
+        "proposed_run_max_usd": str(reconciliation.proposed_run_max_usd),
+        "historical_total_cap_usd": str(reconciliation.historical_total_cap_usd),
+        "remaining_authorized_usd": str(reconciliation.remaining_authorized_usd),
+        "projected_total_usd": str(reconciliation.projected_total_usd),
+        "legacy_closed_reservation_total_usd": str(
+            reconciliation.legacy_closed_reservation_total_usd
+        ),
+        "local_conservative_historical_usd": str(
+            reconciliation.local_conservative_historical_usd
+        ),
+    }
+    receipt_base: dict[str, object] = {
+        "schema": _BUDGET_RECONCILIATION_SCHEMA,
+        "reconciled_at": reconciled_at,
+        "run_id_sha256": hashlib.sha256(run_id.encode("utf-8")).hexdigest(),
+        **totals,
+        "source_receipts_sha256": reconciliation.source_receipts_sha256,
+        "provider_snapshot_sha256": reconciliation.provider_snapshot_sha256,
+        "source_receipt_count": reconciliation.source_receipt_count,
+        "duplicate_billing_record_count": reconciliation.duplicate_billing_record_count,
+        "unrecognized_active_billing": reconciliation.unrecognized_active_billing,
+        "inventory": {"pods": 0, "endpoints": 0, "network_volumes": 0, "templates": 0},
+        "runpod_api_request_count": api_request_count,
+        "cloud_mutations": cloud_mutation_count,
+        "provider_response_body_included": False,
+        "secret_values_included": False,
+    }
+    receipt_sha256 = _canonical_sha256(receipt_base)
+    receipt_id = receipt_sha256[:32]
+    document = {
+        **receipt_base,
+        "receipt_id": receipt_id,
+        "receipt_sha256": receipt_sha256,
+    }
+    path = runtime_root / "_budget" / "reconciliations" / f"{receipt_id}.json"
+    _write_receipt(path, document)
+    return path
+
+
+def _require_e2e_budget(
+    policy: BudgetPolicy,
+    runtime_root: Path,
+    *,
+    run_id: str,
+    billing: RunPodBillingSnapshot,
+    api_request_count: int,
+    cloud_mutation_count: int,
+) -> tuple[BudgetReconciliation, Path]:
+    reconciliation = _budget_reconciliation(policy, runtime_root, billing)
+    receipt_path = _write_budget_reconciliation(
+        runtime_root,
+        run_id=run_id,
+        reconciliation=reconciliation,
+        api_request_count=api_request_count,
+        cloud_mutation_count=cloud_mutation_count,
+    )
+    _require(
+        not reconciliation.unrecognized_active_billing,
+        "UNRECOGNIZED_ACTIVE_BILLING_EXPOSURE",
+    )
+    _require(
+        reconciliation.actual_billed_usd <= E2E_HISTORICAL_BUDGET_USD,
+        "HISTORICAL_BUDGET_ALREADY_EXCEEDED",
+    )
+    _require(
+        reconciliation.projected_total_usd <= E2E_HISTORICAL_BUDGET_USD,
+        "BUDGET_INSUFFICIENT",
+    )
+    return reconciliation, receipt_path
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1001,18 +1293,50 @@ def _run_execute(
     session: SinglePodSession | None = None
     capacity_race_inventory_verified = False
     full_inventory_restored = False
-    historical_spend_before = Decimal("0")
-    historical_projected_ceiling = Decimal("0")
+    budget_reconciliation: BudgetReconciliation | None = None
+    budget_receipt_id: str | None = None
     try:
         _disk_gate()
         head, tracked = _preflight_repository()
         _verify_local_readiness()
-        require_startable_receipt(receipt_path)
         if args.sealed_acquisition is not None:
-            historical_spend_before, historical_projected_ceiling = _require_e2e_budget(
-                policy,
-                args.runtime_root,
+            billing_config = RunPodConfig(
+                image_name=IMAGE,
+                gpu_type_preferences=GPU_PREFERENCES,
+                container_disk_gb=40,
+                min_gpu_memory_gb=16,
             )
+            with RunPodV1Client(api_token=token, config=billing_config) as billing_client:
+                reconciliation_inventory = billing_client.inventory()
+                require_empty_inventory(reconciliation_inventory)
+                billing_snapshot = billing_client.account_billing_snapshot()
+                budget_reconciliation, budget_receipt_path = _require_e2e_budget(
+                    policy,
+                    args.runtime_root,
+                    run_id=run_id,
+                    billing=billing_snapshot,
+                    api_request_count=billing_client.api_request_count,
+                    cloud_mutation_count=billing_client.cloud_mutation_count,
+                )
+                budget_receipt_id = budget_receipt_path.stem
+                _emit(
+                    "PHASE3F_BUDGET_RECONCILED",
+                    actual_billed_usd=str(budget_reconciliation.actual_billed_usd),
+                    conservative_unbilled_estimate_usd=str(
+                        budget_reconciliation.conservative_unbilled_estimate_usd
+                    ),
+                    active_exposure_usd=str(budget_reconciliation.active_exposure_usd),
+                    proposed_run_max_usd=str(budget_reconciliation.proposed_run_max_usd),
+                    historical_total_cap_usd=str(
+                        budget_reconciliation.historical_total_cap_usd
+                    ),
+                    remaining_authorized_usd=str(
+                        budget_reconciliation.remaining_authorized_usd
+                    ),
+                    receipt_id=budget_receipt_id,
+                    cloud_mutations=0,
+                )
+        require_startable_receipt(receipt_path)
         archive_completed_operator_receipt(receipt_path)
         write_operator_receipt(receipt_path, operator_receipt)
         owns_operator_receipt = True
@@ -1203,11 +1527,22 @@ def _run_execute(
             "secret_values_included": False,
         }
         if args.sealed_acquisition is not None:
+            reconciliation = budget_reconciliation
+            if reconciliation is None:
+                raise SupervisorExecutionError("BUDGET_RECONCILIATION_MISSING")
             receipt.update(
                 {
                     "training_run_budget_usd": str(E2E_RUN_BUDGET_USD),
-                    "historical_conservative_before_usd": str(historical_spend_before),
-                    "historical_projected_ceiling_usd": str(historical_projected_ceiling),
+                    "actual_billed_usd": str(reconciliation.actual_billed_usd),
+                    "conservative_unbilled_estimate_usd": str(
+                        reconciliation.conservative_unbilled_estimate_usd
+                    ),
+                    "active_exposure_usd": str(reconciliation.active_exposure_usd),
+                    "closed_unused_reservation_released_usd": str(
+                        reconciliation.closed_unused_reservation_released_usd
+                    ),
+                    "remaining_authorized_usd": str(reconciliation.remaining_authorized_usd),
+                    "budget_reconciliation_receipt_id": budget_receipt_id,
                     "historical_budget_limit_usd": str(E2E_HISTORICAL_BUDGET_USD),
                 }
             )

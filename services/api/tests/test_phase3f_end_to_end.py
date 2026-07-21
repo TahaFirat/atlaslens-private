@@ -26,6 +26,55 @@ def _load_supervisor() -> object:
     return module
 
 
+def _budget_policy(module: object) -> object:
+    return module.BudgetPolicy(
+        target_usd=Decimal("2.94"),
+        soft_stop_usd=Decimal("2.95"),
+        terminate_usd=Decimal("2.99"),
+        absolute_usd=Decimal("3"),
+        max_hourly_cost_usd=Decimal("0.50"),
+        max_runtime_seconds=345 * 60,
+    )
+
+
+def _billing_snapshot(
+    module: object,
+    *,
+    balance: str = "10",
+    current_spend: str = "0",
+) -> object:
+    return module.RunPodBillingSnapshot(
+        client_balance_usd=Decimal(balance),
+        current_spend_per_hour_usd=Decimal(current_spend),
+    )
+
+
+def _closed_operator_receipt(
+    module: object,
+    *,
+    run_id: str,
+    pod_id: str,
+    max_spend_usd: str = "3",
+    duration_seconds: int = 120,
+    cleanup_verified: bool = True,
+) -> object:
+    return module.OperatorReceipt(
+        run_id=run_id,
+        run_marker=f"atlaslens-phase3f-{run_id}",
+        pod_id=pod_id,
+        supervisor_pid=1234,
+        stage="terminated" if cleanup_verified else "failed",
+        started_at="2026-07-20T00:00:00+00:00",
+        finished_at=f"2026-07-20T00:{duration_seconds // 60:02d}:{duration_seconds % 60:02d}+00:00",
+        max_spend_usd=Decimal(max_spend_usd),
+        soft_stop_usd=Decimal("2.95"),
+        hard_stop_usd=Decimal("2.99"),
+        max_gpu_hourly_usd=Decimal("0.50"),
+        max_wall_minutes=345,
+        cleanup_verified=cleanup_verified,
+    )
+
+
 def _asset(index: int, *, sequence: str, city: str = "Ankara") -> SplitAsset:
     opaque = f"{index:032x}"
     return SplitAsset(
@@ -199,11 +248,21 @@ def test_training_and_operator_contracts_are_real_and_secret_safe() -> None:
     assert launcher.index('Invoke-Control -ControlAction "readiness"') < launcher.rindex(
         "Invoke-CloudTraining -RunId"
     )
-    assert execute_source.index("_require_e2e_budget") < execute_source.index(
-        "with RunPodV1Client"
+    assert execute_source.index("reconciliation_inventory = billing_client.inventory()") < (
+        execute_source.index("require_empty_inventory(reconciliation_inventory)")
     )
+    assert execute_source.index("require_empty_inventory(reconciliation_inventory)") < (
+        execute_source.index("billing_client.account_billing_snapshot()")
+    )
+    assert execute_source.index("billing_client.account_billing_snapshot()") < (
+        execute_source.index("_require_e2e_budget")
+    )
+    assert execute_source.index("_require_e2e_budget") < execute_source.index(
+        "archive_completed_operator_receipt"
+    )
+    assert execute_source.index("_require_e2e_budget") < execute_source.index("ssh-keygen")
     assert execute_source.index("prepare_transfer_bundle") < execute_source.index(
-        "with RunPodV1Client"
+        "select_gpu_offer"
     )
     assert 'os.environ.pop("MAPILLARY_ACCESS_TOKEN", None)' in job_source
     assert "automatic_promotion_performed" in job_source
@@ -251,19 +310,21 @@ def test_end_to_end_python_control_has_no_secret_inputs() -> None:
 
 def test_e2e_budget_is_three_usd_with_ten_usd_historical_ceiling(tmp_path: Path) -> None:
     module = _load_supervisor()
-    policy = module.BudgetPolicy(
-        target_usd=Decimal("2.94"),
-        soft_stop_usd=Decimal("2.95"),
-        terminate_usd=Decimal("2.99"),
-        absolute_usd=Decimal("3"),
-        max_hourly_cost_usd=Decimal("0.50"),
-        max_runtime_seconds=345 * 60,
+    policy = _budget_policy(module)
+
+    reconciliation, receipt_path = module._require_e2e_budget(
+        policy,
+        tmp_path,
+        run_id="a" * 32,
+        billing=_billing_snapshot(module),
+        api_request_count=5,
+        cloud_mutation_count=0,
     )
 
-    historical, projected = module._require_e2e_budget(policy, tmp_path)
-
-    assert historical == Decimal("0")
-    assert projected == Decimal("3")
+    assert reconciliation.actual_billed_usd == Decimal("0")
+    assert reconciliation.projected_total_usd == Decimal("3")
+    assert reconciliation.remaining_authorized_usd == Decimal("10")
+    assert receipt_path.is_file()
     launcher = LAUNCHER.read_text(encoding="utf-8")
     assert "[decimal]$MaxSpendUsd = 3" in launcher
     assert "E2E_HISTORICAL_BUDGET_USD = Decimal(\"10\")" in SUPERVISOR.read_text(
@@ -285,16 +346,277 @@ def test_e2e_historical_budget_refuses_projected_total_over_ten(tmp_path: Path) 
         ),
         encoding="utf-8",
     )
-    policy = module.BudgetPolicy(
-        target_usd=Decimal("2.94"),
-        soft_stop_usd=Decimal("2.95"),
-        terminate_usd=Decimal("2.99"),
-        absolute_usd=Decimal("3"),
-        max_hourly_cost_usd=Decimal("0.50"),
-        max_runtime_seconds=345 * 60,
+    policy = _budget_policy(module)
+
+    with pytest.raises(module.SupervisorExecutionError) as error:
+        module._require_e2e_budget(
+            policy,
+            tmp_path,
+            run_id="a" * 32,
+            billing=_billing_snapshot(module),
+            api_request_count=5,
+            cloud_mutation_count=0,
+        )
+
+    assert error.value.code == "BUDGET_INSUFFICIENT"
+    assert list((tmp_path / "_budget" / "reconciliations").glob("*.json"))
+
+
+def test_four_short_cleaned_runs_release_unused_reservations_and_allow_point83_plus_three(
+    tmp_path: Path,
+) -> None:
+    module = _load_supervisor()
+    archive = tmp_path / "_operator" / "archive"
+    archive.mkdir(parents=True)
+    for index in range(4):
+        run_id = f"{index + 1:032x}"
+        module.write_operator_receipt(
+            archive / f"{run_id}.json",
+            _closed_operator_receipt(
+                module,
+                run_id=run_id,
+                pod_id=f"closed-pod-{index}",
+            ),
+        )
+
+    reconciliation, _path = module._require_e2e_budget(
+        _budget_policy(module),
+        tmp_path,
+        run_id="f" * 32,
+        billing=_billing_snapshot(module, balance="9.17"),
+        api_request_count=5,
+        cloud_mutation_count=0,
+    )
+
+    assert reconciliation.legacy_closed_reservation_total_usd == Decimal("12")
+    assert reconciliation.local_conservative_historical_usd > Decimal("0.46")
+    assert reconciliation.local_conservative_historical_usd < Decimal("0.47")
+    assert reconciliation.actual_billed_usd == Decimal("0.83")
+    assert reconciliation.conservative_unbilled_estimate_usd == Decimal("0")
+    assert reconciliation.closed_unused_reservation_released_usd == Decimal("11.17")
+    assert reconciliation.projected_total_usd == Decimal("3.83")
+    assert reconciliation.remaining_authorized_usd == Decimal("9.17")
+
+
+def test_billing_lag_keeps_local_lifecycle_estimate_nonzero(tmp_path: Path) -> None:
+    module = _load_supervisor()
+    archive = tmp_path / "_operator" / "archive"
+    archive.mkdir(parents=True)
+    module.write_operator_receipt(
+        archive / "closed.json",
+        _closed_operator_receipt(
+            module,
+            run_id="1" * 32,
+            pod_id="billing-lag-pod",
+        ),
+    )
+
+    reconciliation = module._budget_reconciliation(
+        _budget_policy(module),
+        tmp_path,
+        _billing_snapshot(module, balance="10"),
+    )
+
+    assert reconciliation.actual_billed_usd == Decimal("0")
+    assert reconciliation.conservative_unbilled_estimate_usd > Decimal("0.11")
+    assert reconciliation.projected_total_usd > Decimal("3.11")
+
+
+def test_duplicate_provider_billing_receipt_is_counted_once(tmp_path: Path) -> None:
+    module = _load_supervisor()
+    receipts = tmp_path / "_receipts"
+    receipts.mkdir()
+    pod_hash = "a" * 64
+    for name, amount in (("first", "0.20"), ("duplicate", "0.25")):
+        (receipts / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "atlaslens-phase3f-local-supervisor-receipt-v1",
+                    "run_id": "2" * 32,
+                    "pod_id_sha256": pod_hash,
+                    "conservative_incremental_upper_usd": amount,
+                    "actual_spend_available": True,
+                    "actual_spend_usd": amount,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    reconciliation = module._budget_reconciliation(
+        _budget_policy(module),
+        tmp_path,
+        _billing_snapshot(module),
+    )
+
+    assert reconciliation.actual_billed_usd == Decimal("0.25")
+    assert reconciliation.local_conservative_historical_usd == Decimal("0.25")
+    assert reconciliation.duplicate_billing_record_count == 1
+
+
+def test_cleanup_unverified_run_keeps_full_active_exposure(tmp_path: Path) -> None:
+    module = _load_supervisor()
+    operator_root = tmp_path / "_operator"
+    operator_root.mkdir()
+    module.write_operator_receipt(
+        operator_root / "phase3f-current.json",
+        _closed_operator_receipt(
+            module,
+            run_id="3" * 32,
+            pod_id="unverified-pod",
+            cleanup_verified=False,
+        ),
+    )
+
+    reconciliation = module._budget_reconciliation(
+        _budget_policy(module),
+        tmp_path,
+        _billing_snapshot(module),
+    )
+
+    assert reconciliation.active_exposure_usd == Decimal("3")
+    assert reconciliation.closed_unused_reservation_released_usd == Decimal("0")
+    assert reconciliation.projected_total_usd == Decimal("6")
+
+
+def test_unrecognized_provider_current_spend_blocks_after_sanitized_receipt(
+    tmp_path: Path,
+) -> None:
+    module = _load_supervisor()
+
+    with pytest.raises(module.SupervisorExecutionError) as error:
+        module._require_e2e_budget(
+            _budget_policy(module),
+            tmp_path,
+            run_id="8" * 32,
+            billing=_billing_snapshot(module, current_spend="0.01"),
+            api_request_count=5,
+            cloud_mutation_count=0,
+        )
+
+    assert error.value.code == "UNRECOGNIZED_ACTIVE_BILLING_EXPOSURE"
+    receipts = list((tmp_path / "_budget" / "reconciliations").glob("*.json"))
+    assert len(receipts) == 1
+    document = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert document["unrecognized_active_billing"] is True
+    assert document["active_exposure_usd"] == "10"
+    assert document["cloud_mutations"] == 0
+
+
+@pytest.mark.parametrize(
+    ("balance", "expected_actual", "expect_unbilled"),
+    (("9.90", Decimal("0.10"), True), ("9.50", Decimal("0.50"), False)),
+)
+def test_provider_balance_delta_and_local_estimate_use_the_safe_higher_total(
+    tmp_path: Path,
+    balance: str,
+    expected_actual: Decimal,
+    expect_unbilled: bool,
+) -> None:
+    module = _load_supervisor()
+    archive = tmp_path / "_operator" / "archive"
+    archive.mkdir(parents=True)
+    module.write_operator_receipt(
+        archive / "closed.json",
+        _closed_operator_receipt(
+            module,
+            run_id="4" * 32,
+            pod_id="mismatch-pod",
+        ),
+    )
+
+    reconciliation = module._budget_reconciliation(
+        _budget_policy(module),
+        tmp_path,
+        _billing_snapshot(module, balance=balance),
+    )
+
+    assert reconciliation.actual_billed_usd == expected_actual
+    assert (reconciliation.conservative_unbilled_estimate_usd > 0) is expect_unbilled
+    assert (
+        reconciliation.actual_billed_usd
+        + reconciliation.conservative_unbilled_estimate_usd
+    ) == max(expected_actual, reconciliation.local_conservative_historical_usd)
+
+
+def test_verified_actual_over_ten_uses_historical_exceeded_code(tmp_path: Path) -> None:
+    module = _load_supervisor()
+    receipts = tmp_path / "_receipts"
+    receipts.mkdir()
+    (receipts / "actual.json").write_text(
+        json.dumps(
+            {
+                "schema": "atlaslens-phase3f-local-supervisor-receipt-v1",
+                "run_id": "5" * 32,
+                "pod_id_sha256": "b" * 64,
+                "conservative_incremental_upper_usd": "10.01",
+                "actual_spend_available": True,
+                "actual_spend_usd": "10.01",
+            }
+        ),
+        encoding="utf-8",
     )
 
     with pytest.raises(module.SupervisorExecutionError) as error:
-        module._require_e2e_budget(policy, tmp_path)
+        module._require_e2e_budget(
+            _budget_policy(module),
+            tmp_path,
+            run_id="f" * 32,
+            billing=_billing_snapshot(module),
+            api_request_count=5,
+            cloud_mutation_count=0,
+        )
 
-    assert error.value.code == "HISTORICAL_BUDGET_WOULD_EXCEED_10_USD"
+    assert error.value.code == "HISTORICAL_BUDGET_ALREADY_EXCEEDED"
+
+
+def test_reconciliation_refuses_any_prior_cloud_mutation(tmp_path: Path) -> None:
+    module = _load_supervisor()
+
+    with pytest.raises(module.SupervisorExecutionError) as error:
+        module._require_e2e_budget(
+            _budget_policy(module),
+            tmp_path,
+            run_id="6" * 32,
+            billing=_billing_snapshot(module),
+            api_request_count=5,
+            cloud_mutation_count=1,
+        )
+
+    assert error.value.code == "BUDGET_RECONCILIATION_AFTER_MUTATION"
+    assert not (tmp_path / "_budget").exists()
+
+
+def test_reconciliation_receipt_contains_only_sanitized_totals_and_hashes(
+    tmp_path: Path,
+) -> None:
+    module = _load_supervisor()
+    archive = tmp_path / "_operator" / "archive"
+    archive.mkdir(parents=True)
+    module.write_operator_receipt(
+        archive / "closed.json",
+        _closed_operator_receipt(
+            module,
+            run_id="7" * 32,
+            pod_id="raw-provider-pod-id",
+        ),
+    )
+
+    _reconciliation, receipt_path = module._require_e2e_budget(
+        _budget_policy(module),
+        tmp_path,
+        run_id="f" * 32,
+        billing=_billing_snapshot(module, balance="9.17"),
+        api_request_count=5,
+        cloud_mutation_count=0,
+    )
+    document = json.loads(receipt_path.read_text(encoding="utf-8"))
+    serialized = json.dumps(document, sort_keys=True)
+
+    assert document["schema"] == "atlaslens-phase3f-budget-reconciliation-v1"
+    assert len(document["receipt_id"]) == 32
+    assert len(document["receipt_sha256"]) == 64
+    assert document["provider_response_body_included"] is False
+    assert document["secret_values_included"] is False
+    assert document["cloud_mutations"] == 0
+    assert "raw-provider-pod-id" not in serialized
+    assert "runpod-test-token-never-log" not in serialized

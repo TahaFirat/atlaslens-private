@@ -109,6 +109,12 @@ _GPU_LIST_QUERY: Final = """query AtlasLensPhase3FGpuTypes {
     memoryInGb
   }
 }"""
+_ACCOUNT_BILLING_QUERY: Final = """query AtlasLensPhase3FAccountBilling {
+  myself {
+    clientBalance
+    currentSpendPerHr
+  }
+}"""
 
 
 class RunPodAPIError(RuntimeError):
@@ -693,6 +699,25 @@ class RunPodInventory:
 
 
 @dataclass(frozen=True, slots=True)
+class RunPodBillingSnapshot:
+    """Sanitized authenticated account totals; the provider body is never retained."""
+
+    client_balance_usd: Decimal
+    current_spend_per_hour_usd: Decimal
+
+    def __post_init__(self) -> None:
+        _require(
+            self.client_balance_usd.is_finite() and self.client_balance_usd >= 0,
+            "billing_balance_invalid",
+        )
+        _require(
+            self.current_spend_per_hour_usd.is_finite()
+            and self.current_spend_per_hour_usd >= 0,
+            "billing_current_spend_invalid",
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PodConnection:
     pod_id: str
     public_ip: str
@@ -848,6 +873,39 @@ class RunPodV1Client:
             endpoint_ids=self.list_endpoints(),
             network_volume_ids=self.list_network_volumes(),
             template_ids=self.list_templates(),
+        )
+
+    def account_billing_snapshot(self) -> RunPodBillingSnapshot:
+        """Read authenticated account billing totals without a cloud mutation."""
+
+        payload = self._request_json(
+            "POST",
+            GRAPHQL_URL,
+            expected_status=200,
+            json_body={
+                "query": _ACCOUNT_BILLING_QUERY,
+                "operationName": "AtlasLensPhase3FAccountBilling",
+            },
+        )
+        root = _object(payload, "billing_query_response_invalid")
+        errors = self._sanitize_graphql_errors(root.get("errors"))
+        self._last_graphql_errors = errors
+        _require(not errors, "BILLING_RECONCILIATION_GRAPHQL_ERRORS")
+        data = _object(root.get("data"), "billing_query_response_invalid")
+        myself = _object(data.get("myself"), "billing_query_response_invalid")
+        _require(
+            set(myself) == {"clientBalance", "currentSpendPerHr"},
+            "billing_query_response_invalid",
+        )
+        return RunPodBillingSnapshot(
+            client_balance_usd=_decimal(
+                myself.get("clientBalance"),
+                "billing_balance_invalid",
+            ),
+            current_spend_per_hour_usd=_decimal(
+                myself.get("currentSpendPerHr"),
+                "billing_current_spend_invalid",
+            ),
         )
 
     def check_gpu_availability(
@@ -2344,6 +2402,7 @@ __all__ = [
     "PodRentalAttestationDiagnostic",
     "REST_BASE_URL",
     "RunPodAPIError",
+    "RunPodBillingSnapshot",
     "RunPodCreateError",
     "RunPodConfig",
     "RunPodInventory",
