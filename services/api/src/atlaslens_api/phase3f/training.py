@@ -41,6 +41,12 @@ from atlaslens_api.phase3f.pipeline import (
     Phase3FPipeline,
 )
 from atlaslens_api.phase3f.splits import SplitAsset
+from atlaslens_api.phase3f.training_recovery import (
+    CHECKPOINT_MANIFEST_SCHEMA,
+    CHECKPOINT_POINTER_SCHEMA,
+    TrainingRecoveryError,
+    validate_checkpoint_tree,
+)
 
 TRAINING_READINESS_SCHEMA: Final = "atlaslens-phase3f-training-readiness-v1"
 TRAINING_SPLIT_SCHEMA: Final = "atlaslens-phase3f-training-split-v1"
@@ -51,6 +57,8 @@ MIN_USABLE_ASSETS: Final = 830
 MAX_CONCENTRATION: Final = 0.35
 DEFAULT_MAX_EPOCHS: Final = 8
 DEFAULT_TRAINING_WALL_SECONDS: Final = 4 * 60 * 60 + 30 * 60
+CHECKPOINT_INTERVAL_SECONDS: Final = 5 * 60
+CHECKPOINT_INTERVAL_STEPS: Final = 10
 _SHA256 = set("0123456789abcdef")
 _SECRET_MARKERS: Final = (
     b"RUNPOD_API_KEY",
@@ -119,6 +127,33 @@ def _atomic_json(path: Path, value: object) -> str:
     finally:
         temporary.unlink(missing_ok=True)
     return hashlib.sha256(payload).hexdigest()
+
+
+def training_config_sha256(*, seed: int, max_epochs: int) -> str:
+    """Hash resume-relevant training semantics without machine-adaptive batch size."""
+    return hashlib.sha256(
+        _canonical_bytes(
+            {
+                "schema": "atlaslens-phase3f-training-config-v1",
+                "seed": seed,
+                "maximum_epochs": max_epochs,
+                "objective": "batch_hard_metric_learning_softplus_cosine_v1",
+                "optimizer": "adamw",
+                "learning_rate": "0.000002",
+                "weight_decay": "0.0001",
+                "scheduler": "constant",
+                "mixed_precision": True,
+                "checkpoint_interval_seconds": CHECKPOINT_INTERVAL_SECONDS,
+                "checkpoint_interval_steps": CHECKPOINT_INTERVAL_STEPS,
+            }
+        )
+    ).hexdigest()
+
+
+def _nested_tuple(value: object) -> object:
+    if isinstance(value, list):
+        return tuple(_nested_tuple(item) for item in value)
+    return value
 
 
 def _maximum_share(values: Sequence[str]) -> float:
@@ -605,80 +640,237 @@ class TrainableMegaLocRuntime:
             (hardest_negative[valid] - hardest_positive[valid]) / 0.07
         ).mean()
 
-    def _load_checkpoint(self, checkpoint_root: Path, optimizer: Any) -> tuple[int, int, float]:
-        state_path = checkpoint_root / "training-state.json"
-        delta_path = checkpoint_root / "trainable.safetensors"
-        optimizer_path = checkpoint_root / "optimizer.pt"
-        if not state_path.exists():
-            return 0, 0, math.inf
-        _require(
-            state_path.is_file()
-            and delta_path.is_file()
-            and optimizer_path.is_file()
-            and not any(path.is_symlink() for path in (state_path, delta_path, optimizer_path)),
-            "TRAINING_CHECKPOINT_INVALID",
-        )
+    def _load_checkpoint(
+        self,
+        checkpoint_root: Path,
+        optimizer: Any,
+        scheduler: Any,
+        scaler: Any,
+        *,
+        run_id: str,
+        dataset_readiness_sha256: str,
+        sealed_assets_sha256: str,
+        training_config_sha256_value: str,
+    ) -> dict[str, Any]:
+        pointer_path = checkpoint_root / "latest.json"
+        if not pointer_path.exists():
+            return {
+                "completed_epoch": -1,
+                "next_epoch": 0,
+                "next_batch_index": 0,
+                "optimizer_steps": 0,
+                "best_validation_loss": math.inf,
+                "patience": 0,
+                "history": [],
+                "train_losses": [],
+            }
         try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            status = validate_checkpoint_tree(
+                checkpoint_root,
+                expected_run_id=run_id,
+                expected_readiness_sha256=dataset_readiness_sha256,
+                expected_sealed_assets_sha256=sealed_assets_sha256,
+                expected_training_config_sha256=training_config_sha256_value,
+            )
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            generation_root = checkpoint_root / cast(str, pointer["generation"])
+            state = json.loads(
+                (generation_root / "training-state.json").read_text(encoding="utf-8")
+            )
             _require(isinstance(state, dict), "TRAINING_CHECKPOINT_INVALID")
-            delta = self._load_file(str(delta_path), device="cpu")
+            delta = self._load_file(
+                str(generation_root / "trainable.safetensors"), device="cpu"
+            )
             named = dict(self._model.named_parameters())
             _require(set(delta) == set(self._selected_names), "TRAINING_CHECKPOINT_INVALID")
             with self._torch.no_grad():
                 for name in self._selected_names:
                     named[name].copy_(delta[name].to("cuda"))
             optimizer.load_state_dict(
-                self._torch.load(optimizer_path, map_location="cuda", weights_only=True)
+                self._torch.load(
+                    generation_root / "optimizer.pt",
+                    map_location="cuda",
+                    weights_only=True,
+                )
             )
-            epoch = state.get("completed_epoch")
-            steps = state.get("optimizer_steps")
-            best_loss = state.get("best_validation_loss")
+            scheduler.load_state_dict(
+                self._torch.load(
+                    generation_root / "scheduler.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                )
+            )
+            scaler.load_state_dict(
+                self._torch.load(
+                    generation_root / "scaler.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                )
+            )
+            rng = self._torch.load(
+                generation_root / "rng.pt", map_location="cpu", weights_only=True
+            )
+            _require(isinstance(rng, dict), "TRAINING_CHECKPOINT_INVALID")
+            self._torch.set_rng_state(rng["torch_cpu"])
+            if self._torch.cuda.is_available():
+                self._torch.cuda.set_rng_state_all(rng["torch_cuda"])
+            python_rng = state.get("python_rng_state")
+            numpy_rng = state.get("numpy_rng_state")
             _require(
-                isinstance(epoch, int)
-                and isinstance(steps, int)
-                and isinstance(best_loss, int | float),
+                isinstance(python_rng, list)
+                and isinstance(numpy_rng, dict)
+                and isinstance(numpy_rng.get("keys"), list),
                 "TRAINING_CHECKPOINT_INVALID",
             )
-            return epoch + 1, steps, float(best_loss)
-        except TrainingError:
-            raise
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            random.setstate(cast(tuple[Any, ...], _nested_tuple(python_rng)))
+            np.random.set_state(
+                (
+                    cast(str, numpy_rng["algorithm"]),
+                    np.asarray(numpy_rng["keys"], dtype=np.uint32),
+                    cast(int, numpy_rng["position"]),
+                    cast(int, numpy_rng["has_gauss"]),
+                    cast(float, numpy_rng["cached_gaussian"]),
+                )
+            )
+            _require(status.valid, "TRAINING_CHECKPOINT_INVALID")
+            return cast(dict[str, Any], state)
+        except (TrainingError, TrainingRecoveryError):
+            raise TrainingError("TRAINING_CHECKPOINT_INVALID") from None
+        except (KeyError, OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise TrainingError("TRAINING_CHECKPOINT_INVALID") from exc
 
     def _write_checkpoint(
         self,
         checkpoint_root: Path,
         optimizer: Any,
+        scheduler: Any,
+        scaler: Any,
         *,
-        epoch: int,
+        run_id: str,
+        completed_epoch: int,
+        next_epoch: int,
+        next_batch_index: int,
         optimizer_steps: int,
         best_validation_loss: float,
+        patience: int,
+        history: Sequence[Mapping[str, object]],
+        train_losses: Sequence[float],
+        dataset_readiness_sha256: str,
+        sealed_assets_sha256: str,
+        training_config_sha256_value: str,
     ) -> None:
         checkpoint_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        named = dict(self._model.named_parameters())
-        delta = {
-            name: named[name].detach().float().cpu().contiguous()
-            for name in self._selected_names
-        }
-        delta_partial = checkpoint_root / ".trainable.partial.safetensors"
-        self._save_file(delta, str(delta_partial))
-        os.replace(delta_partial, checkpoint_root / "trainable.safetensors")
-        optimizer_partial = checkpoint_root / ".optimizer.partial.pt"
-        self._torch.save(optimizer.state_dict(), optimizer_partial)
-        os.replace(optimizer_partial, checkpoint_root / "optimizer.pt")
-        _atomic_json(
-            checkpoint_root / "training-state.json",
-            {
-                "schema": "atlaslens-phase3f-training-checkpoint-v1",
-                "completed_epoch": epoch,
+        temporary = checkpoint_root / f".generation-{uuid4().hex}.partial"
+        temporary.mkdir(mode=0o700)
+        try:
+            named = dict(self._model.named_parameters())
+            self._save_file(
+                {
+                    name: named[name].detach().float().cpu().contiguous()
+                    for name in self._selected_names
+                },
+                str(temporary / "trainable.safetensors"),
+            )
+            self._torch.save(optimizer.state_dict(), temporary / "optimizer.pt")
+            self._torch.save(scheduler.state_dict(), temporary / "scheduler.pt")
+            self._torch.save(scaler.state_dict(), temporary / "scaler.pt")
+            self._torch.save(
+                {
+                    "torch_cpu": self._torch.get_rng_state(),
+                    "torch_cuda": self._torch.cuda.get_rng_state_all(),
+                },
+                temporary / "rng.pt",
+            )
+            numpy_state = cast(
+                tuple[str, np.ndarray[Any, np.dtype[np.uint32]], int, int, float],
+                np.random.get_state(),
+            )
+            (
+                numpy_algorithm,
+                numpy_keys,
+                numpy_position,
+                numpy_has_gauss,
+                numpy_cached_gaussian,
+            ) = numpy_state
+            _atomic_json(
+                temporary / "training-state.json",
+                {
+                    "schema": "atlaslens-phase3f-training-checkpoint-v2",
+                    "completed_epoch": completed_epoch,
+                    "next_epoch": next_epoch,
+                    "next_batch_index": next_batch_index,
+                    "optimizer_steps": optimizer_steps,
+                    "best_validation_loss": best_validation_loss,
+                    "patience": patience,
+                    "history": list(history),
+                    "train_losses": list(train_losses),
+                    "holdout_open_count": 0,
+                    "python_rng_state": random.getstate(),
+                    "numpy_rng_state": {
+                        "algorithm": numpy_algorithm,
+                        "keys": numpy_keys.tolist(),
+                        "position": numpy_position,
+                        "has_gauss": numpy_has_gauss,
+                        "cached_gaussian": numpy_cached_gaussian,
+                    },
+                    "selected_parameter_names_sha256": hashlib.sha256(
+                        _canonical_bytes(self._selected_names)
+                    ).hexdigest(),
+                    "secrets_included": False,
+                },
+            )
+            artifacts = []
+            for name in (
+                "trainable.safetensors",
+                "optimizer.pt",
+                "scheduler.pt",
+                "scaler.pt",
+                "rng.pt",
+                "training-state.json",
+            ):
+                path = temporary / name
+                artifacts.append(
+                    {
+                        "path": name,
+                        "size_bytes": path.stat().st_size,
+                        "sha256": _sha256_path(path),
+                    }
+                )
+            manifest = {
+                "schema": CHECKPOINT_MANIFEST_SCHEMA,
+                "run_id": run_id,
+                "dataset_readiness_sha256": dataset_readiness_sha256,
+                "sealed_assets_sha256": sealed_assets_sha256,
+                "training_config_sha256": training_config_sha256_value,
+                "completed_epoch": completed_epoch,
+                "next_epoch": next_epoch,
+                "next_batch_index": next_batch_index,
                 "optimizer_steps": optimizer_steps,
-                "best_validation_loss": best_validation_loss,
-                "selected_parameter_names_sha256": hashlib.sha256(
-                    _canonical_bytes(self._selected_names)
-                ).hexdigest(),
+                "holdout_open_count": 0,
+                "artifacts": artifacts,
                 "secrets_included": False,
-            },
-        )
+            }
+            manifest_sha = _atomic_json(temporary / "checkpoint-manifest.json", manifest)
+            generation = f"generation-{optimizer_steps:08d}-{manifest_sha[:16]}"
+            destination = checkpoint_root / generation
+            if destination.exists():
+                shutil.rmtree(temporary)
+            else:
+                os.replace(temporary, destination)
+            _atomic_json(
+                checkpoint_root / "latest.json",
+                {
+                    "schema": CHECKPOINT_POINTER_SCHEMA,
+                    "generation": generation,
+                    "manifest_sha256": manifest_sha,
+                    "secrets_included": False,
+                },
+            )
+        except Exception as exc:
+            shutil.rmtree(temporary, ignore_errors=True)
+            if isinstance(exc, TrainingError):
+                raise
+            raise TrainingError("TRAINING_CHECKPOINT_WRITE_FAILED") from exc
 
     def train(
         self,
@@ -691,6 +883,11 @@ class TrainableMegaLocRuntime:
         gradient_accumulation: int,
         max_epochs: int,
         deadline_epoch: float,
+        run_id: str,
+        dataset_readiness_sha256: str,
+        sealed_assets_sha256: str,
+        training_config_sha256_value: str,
+        progress_root: Path | None = None,
     ) -> dict[str, object]:
         optimizer = self._torch.optim.AdamW(
             self._selected_parameters,
@@ -698,12 +895,28 @@ class TrainableMegaLocRuntime:
             weight_decay=1e-4,
         )
         scaler = self._torch.amp.GradScaler("cuda", enabled=True)
-        start_epoch, optimizer_steps, best_loss = self._load_checkpoint(
-            checkpoint_root, optimizer
+        scheduler = self._torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda _step: 1.0
         )
-        patience = 0
-        completed_epoch = start_epoch - 1
-        history: list[dict[str, object]] = []
+        resumed = self._load_checkpoint(
+            checkpoint_root,
+            optimizer,
+            scheduler,
+            scaler,
+            run_id=run_id,
+            dataset_readiness_sha256=dataset_readiness_sha256,
+            sealed_assets_sha256=sealed_assets_sha256,
+            training_config_sha256_value=training_config_sha256_value,
+        )
+        start_epoch = cast(int, resumed["next_epoch"])
+        resume_batch = cast(int, resumed["next_batch_index"])
+        optimizer_steps = cast(int, resumed["optimizer_steps"])
+        best_loss = float(resumed["best_validation_loss"])
+        patience = cast(int, resumed["patience"])
+        completed_epoch = cast(int, resumed["completed_epoch"])
+        history = cast(list[dict[str, object]], resumed["history"])
+        resumed_train_losses = cast(list[float], resumed["train_losses"])
+        last_checkpoint_at = time.monotonic()
         for epoch in range(start_epoch, max_epochs):
             _require(time.time() < deadline_epoch, "TRAINING_WALL_LIMIT_REACHED")
             batches = _epoch_batches(
@@ -714,8 +927,10 @@ class TrainableMegaLocRuntime:
             )
             self._model.train()
             optimizer.zero_grad(set_to_none=True)
-            train_losses: list[float] = []
+            train_losses = list(resumed_train_losses) if epoch == start_epoch else []
             for batch_index, batch_assets in enumerate(batches):
+                if epoch == start_epoch and batch_index < resume_batch:
+                    continue
                 _require(time.time() < deadline_epoch, "TRAINING_WALL_LIMIT_REACHED")
                 labels_by_asset = _batch_metric_labels(batch_assets)
                 tensors = [
@@ -747,8 +962,47 @@ class TrainableMegaLocRuntime:
                     self._torch.nn.utils.clip_grad_norm_(self._selected_parameters, 1.0)
                     scaler.step(optimizer)
                     scaler.update()
+                    scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     optimizer_steps += 1
+                    if progress_root is not None:
+                        _atomic_json(
+                            progress_root / "progress.json",
+                            {
+                                "schema": "atlaslens-phase3f-remote-training-progress-v1",
+                                "stage": "training",
+                                "completed_epoch": completed_epoch,
+                                "epoch": epoch,
+                                "next_batch_index": batch_index + 1,
+                                "optimizer_steps": optimizer_steps,
+                                "holdout_open_count": 0,
+                                "secrets_included": False,
+                            },
+                        )
+                    now = time.monotonic()
+                    if (
+                        optimizer_steps % CHECKPOINT_INTERVAL_STEPS == 0
+                        or now - last_checkpoint_at >= CHECKPOINT_INTERVAL_SECONDS
+                    ):
+                        self._write_checkpoint(
+                            checkpoint_root,
+                            optimizer,
+                            scheduler,
+                            scaler,
+                            run_id=run_id,
+                            completed_epoch=completed_epoch,
+                            next_epoch=epoch,
+                            next_batch_index=batch_index + 1,
+                            optimizer_steps=optimizer_steps,
+                            best_validation_loss=best_loss,
+                            patience=patience,
+                            history=history,
+                            train_losses=train_losses,
+                            dataset_readiness_sha256=dataset_readiness_sha256,
+                            sealed_assets_sha256=sealed_assets_sha256,
+                            training_config_sha256_value=training_config_sha256_value,
+                        )
+                        last_checkpoint_at = now
             validation_batches = _epoch_batches(
                 validation_assets,
                 batch_size=batch_size,
@@ -795,18 +1049,52 @@ class TrainableMegaLocRuntime:
                     "improved": improved,
                 }
             )
+            if progress_root is not None:
+                progress_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+                with (progress_root / "metrics.jsonl").open("ab") as metrics_stream:
+                    metrics_stream.write(
+                        _canonical_bytes(
+                            {
+                                "schema": "atlaslens-phase3f-training-metric-v1",
+                                **history[-1],
+                                "optimizer_steps": optimizer_steps,
+                                "holdout_open_count": 0,
+                                "secrets_included": False,
+                            }
+                        )
+                    )
+                    metrics_stream.flush()
+                    os.fsync(metrics_stream.fileno())
             self._write_checkpoint(
                 checkpoint_root,
                 optimizer,
-                epoch=epoch,
+                scheduler,
+                scaler,
+                run_id=run_id,
+                completed_epoch=epoch,
+                next_epoch=epoch + 1,
+                next_batch_index=0,
                 optimizer_steps=optimizer_steps,
                 best_validation_loss=best_loss,
+                patience=patience,
+                history=history,
+                train_losses=(),
+                dataset_readiness_sha256=dataset_readiness_sha256,
+                sealed_assets_sha256=sealed_assets_sha256,
+                training_config_sha256_value=training_config_sha256_value,
             )
             if improved:
+                pointer = json.loads(
+                    (checkpoint_root / "latest.json").read_text(encoding="utf-8")
+                )
                 shutil.copy2(
-                    checkpoint_root / "trainable.safetensors",
+                    checkpoint_root
+                    / cast(str, pointer["generation"])
+                    / "trainable.safetensors",
                     checkpoint_root / "best-trainable.safetensors",
                 )
+            resumed_train_losses = []
+            resume_batch = 0
             if patience >= 2:
                 break
         _require(optimizer_steps > 0, "TRAINING_NO_OPTIMIZER_STEP")
@@ -893,6 +1181,7 @@ class TrainingJobConfig:
     work_root: Path
     output_root: Path
     deadline_epoch: float
+    recovery_root: Path | None = None
     seed: int = 20260720
     max_epochs: int = DEFAULT_MAX_EPOCHS
 
@@ -913,9 +1202,46 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
     _require(not config.output_root.exists(), "TRAINING_OUTPUT_EXISTS")
     config.output_root.mkdir(mode=0o700, parents=True)
     config.work_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    holdout_state_path = config.work_root / "training-checkpoint" / "holdout-state.json"
+    if holdout_state_path.exists():
+        try:
+            holdout_state = json.loads(holdout_state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise TrainingError("TRAINING_HOLDOUT_STATE_INVALID") from exc
+        _require(
+            isinstance(holdout_state, dict)
+            and holdout_state.get("schema") == "atlaslens-phase3f-holdout-state-v1"
+            and holdout_state.get("run_id") == config.run_id,
+            "TRAINING_HOLDOUT_STATE_INVALID",
+        )
+        _require(
+            holdout_state.get("holdout_open_count") == 0,
+            "TRAINING_HOLDOUT_ALREADY_OPENED",
+        )
     readiness_path = config.output_root / "training-readiness.json"
     sealed = require_training_ready(config.sealed_root, report_path=readiness_path)
     _require(sealed.receipt.get("run_id") == config.run_id, "DATASET_RUN_ID_MISMATCH")
+    dataset_readiness_sha256 = _sha256_path(readiness_path)
+    sealed_assets_sha256 = _sha256_path(config.sealed_root / "sealed-assets.json")
+    config_sha256 = training_config_sha256(
+        seed=config.seed,
+        max_epochs=config.max_epochs,
+    )
+    if config.recovery_root is not None:
+        _atomic_json(
+            config.recovery_root / "training-configuration.json",
+            {
+                "schema": "atlaslens-phase3f-training-configuration-v1",
+                "run_id": config.run_id,
+                "dataset_readiness_sha256": dataset_readiness_sha256,
+                "sealed_assets_sha256": sealed_assets_sha256,
+                "training_config_sha256": config_sha256,
+                "seed": config.seed,
+                "maximum_epochs": config.max_epochs,
+                "holdout_open_count": 0,
+                "secrets_included": False,
+            },
+        )
     worker.verify_megaloc_artifacts(
         config.model_path,
         config.vendor_root / "megaloc_model.py",
@@ -1004,6 +1330,11 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
                     gradient_accumulation=accumulation,
                     max_epochs=config.max_epochs,
                     deadline_epoch=config.deadline_epoch,
+                    run_id=config.run_id,
+                    dataset_readiness_sha256=dataset_readiness_sha256,
+                    sealed_assets_sha256=sealed_assets_sha256,
+                    training_config_sha256_value=config_sha256,
+                    progress_root=config.recovery_root,
                 )
                 break
             except torch.cuda.OutOfMemoryError:
@@ -1066,6 +1397,27 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
         )
         pipeline.lock_threshold(threshold)
         _atomic_json(config.output_root / "calibration.json", threshold.document())
+        _atomic_json(
+            holdout_state_path,
+            {
+                "schema": "atlaslens-phase3f-holdout-state-v1",
+                "run_id": config.run_id,
+                "holdout_open_count": 1,
+                "secrets_included": False,
+            },
+        )
+        if config.recovery_root is not None:
+            _atomic_json(
+                config.recovery_root / "progress.json",
+                {
+                    "schema": "atlaslens-phase3f-remote-training-progress-v1",
+                    "stage": "holdout",
+                    "completed_epoch": training["completed_epoch"],
+                    "optimizer_steps": training["optimizer_steps"],
+                    "holdout_open_count": 1,
+                    "secrets_included": False,
+                },
+            )
         holdout_matrix = _runtime_descriptors(
             tuner,
             holdout,
@@ -1168,6 +1520,7 @@ __all__ = [
     "TrainingJobConfig",
     "require_training_ready",
     "run_training_job",
+    "training_config_sha256",
     "training_readiness_document",
     "training_split_document",
     "write_dataset_archive",

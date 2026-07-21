@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-21T20:12:26+03:00
+last_verified_at: 2026-07-21T23:30:00+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: phase3f_archive_codec_unified_live_local_receipts_reconciled_cloudplan_ready
+product_phase_status: phase3f_remote_failure_salvage_resumable_checkpoint_trainingplan_ready
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -517,7 +517,17 @@ phase_3f_archive_cloudplan: pass_blockers0_active0_unclean0_partial0_ready_inven
 phase_3f_archive_tests: pass_341_phase3f
 phase_3f_archive_static: pass_ruff_strict_mypy20_powershell5_diff_secret_scan
 phase_3f_archive_live_actions: local_operator_receipt_reconciliation_only_zero_network_zero_runpod_zero_mapillary_zero_cloud_mutation_zero_dataset_write
-phase_3f_next_action: run_exact_resume_ce23_with_explicit_cloud_consent
+phase_3f_remote_failure_forensic: insufficient_historical_stdout_stderr_exit_signal_epoch_step_checkpoint_absent
+phase_3f_remote_failure_mask: ssh_devnull_nonzero_generic_remote_job_failed_then_remote_and_local_temp_deleted
+phase_3f_remote_recovery: typed_failure_receipt_redacted_tails_telemetry_bounded_300s_precleanup_salvage
+phase_3f_checkpoint_v2: model_optimizer_scheduler_scaler_rng_epoch_step_dataset_readiness_config_bound_atomic
+phase_3f_checkpoint_sync: max_300s_changed_manifest_only_content_addressed_old_valid_preserved
+phase_3f_trainingplan: pass_ready_true_blockers0_fresh_epoch0_step0_network0_mutations0_prompts0
+phase_3f_trainingplan_budget: actual_0_8581701778_remaining_9_1418298222_retry_max_3_projected_remaining_6_1418298222
+phase_3f_remote_recovery_tests: pass_359_phase3f
+phase_3f_remote_recovery_static: pass_ruff_strict_mypy19_powershell5_diff_secret_scan
+phase_3f_remote_recovery_live_actions: zero_resume_zero_execute_zero_network_zero_runpod_zero_mapillary_zero_cloud_mutation_zero_dataset_write
+phase_3f_next_action: run_exact_resume_ce23_with_explicit_cloud_consent_after_review
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
 phase_6c_dataset_qa_ui_gate: pass
@@ -572,6 +582,46 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F remote-training failure salvage and resumable checkpoint
+
+Status: **RECOVERY PATH IMPLEMENTED AND OFFLINE VERIFIED - LIVE RETRY NOT EXECUTED**.
+
+The historical 2628-second failure cannot be classified exactly from retained
+evidence. The supervisor launched SSH with stdout/stderr directed to `DEVNULL`,
+reduced every nonzero return to `REMOTE_JOB_FAILED`, attempted no failure-artifact
+download, deleted remote work/output/transfer state in `finally`, and deleted its
+local temporary run directory. The surviving operator receipt proves allocation,
+connectivity, SSH and receipt-bound cleanup, but contains no process exit/signal,
+traceback, epoch/step, CUDA/disk telemetry or checkpoint. Accordingly the current
+forensic classification is `REMOTE_TRAINING_UNKNOWN_FAILURE`; no training parameter
+was changed on speculation.
+
+Remote training now runs behind a bounded evidence wrapper. It records sanitized
+stdout/stderr tails, typed failure, exception class/message code, progress,
+per-epoch metrics and CUDA/disk telemetry. The supervisor preserves the child code,
+runs a maximum-300-second hash-verified salvage before cleanup, and always proceeds
+to receipt-bound termination. Recovery artifacts live under attempt-specific local
+runtime paths. Checkpoints are content-addressed and atomically published, include
+model, optimizer, constant scheduler, AMP scaler, CPU/CUDA RNG, epoch, next batch,
+step and early-stopping state, and are bound to run, readiness, sealed-assets and
+training-config hashes. Checkpointing occurs every ten optimizer steps or at most
+five minutes; the supervisor polls the remote manifest at most every five minutes
+and downloads only a changed generation without deleting the prior valid archive.
+The holdout-open marker makes post-holdout retries fail closed instead of reopening
+the locked holdout.
+
+The real, read-only `TrainingPlan` reports 830 assets, exact readiness and
+sealed-assets hashes, no checkpoint, `retry_mode=fresh`, start epoch/step `0/0`,
+`REMOTE_TRAINING_UNKNOWN_FAILURE` with `evidence_sufficient=false`, estimated
+remaining wall time 330 minutes, maximum new cost USD 3, authoritative billed USD
+0.8581701778, remaining authorization USD 9.1418298222 and projected remaining USD
+6.1418298222. It returned `local_blockers=[]`, `ready_for_training_retry=true`, and
+zero dataset writes, secret prompts, RunPod API calls and cloud mutations. No live
+retry, network call, resource mutation or corpus/runtime readiness write occurred.
+All 359 Phase 3F tests pass. Ruff passes the complete Phase 3F scope; strict mypy
+passes all 19 production/control sources; all five PowerShell parsers, diff
+validation and the changed-file high-confidence secret scan pass.
 
 ## Product Phase 3F canonical archive codec and live local reconciliation
 

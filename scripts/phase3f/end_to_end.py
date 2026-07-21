@@ -919,6 +919,106 @@ def cloud_plan(
     }
 
 
+def training_plan(
+    repository: Path,
+    runtime_root: Path,
+    cloud_runtime: Path,
+) -> dict[str, object]:
+    """Build a zero-network retry plan from integrity-bound local evidence only."""
+    cloud = cloud_plan(repository, runtime_root, cloud_runtime)
+    run_id = cast(str, cloud["run_id"])
+    source = repository.resolve() / "services" / "api" / "src"
+    if str(source) not in sys.path:
+        sys.path.insert(0, str(source))
+    from atlaslens_api.phase3f.training import training_config_sha256  # noqa: PLC0415
+    from atlaslens_api.phase3f.training_recovery import (  # noqa: PLC0415
+        inspect_local_checkpoint,
+    )
+
+    config_sha256 = training_config_sha256(seed=20260720, max_epochs=8)
+    checkpoint = inspect_local_checkpoint(
+        cloud_runtime.resolve() / "_training" / run_id / "checkpoints",
+        expected_run_id=run_id,
+        expected_readiness_sha256=cast(str, cloud["readiness_sha256"]),
+        expected_sealed_assets_sha256=cast(str, cloud["sealed_assets_sha256"]),
+        expected_training_config_sha256=config_sha256,
+    )
+    blockers = list(cast(list[str], cloud["local_blockers"]))
+    if checkpoint.present and not checkpoint.valid:
+        blockers.append(checkpoint.failure_code or "TRAINING_CHECKPOINT_INVALID")
+
+    latest_failure: dict[str, object] | None = None
+    attempts = cloud_runtime.resolve() / "_training" / run_id / "attempts"
+    if attempts.is_dir() and not attempts.is_symlink():
+        candidates = sorted(attempts.glob("*/recovery-*/recovery/failure.json"))
+        if candidates:
+            latest_failure = _integrity_json(
+                candidates[-1],
+                artifact="remote-failure.json",
+                missing_code="REMOTE_FAILURE_RECEIPT_MISSING",
+                invalid_code="REMOTE_FAILURE_RECEIPT_INVALID",
+                max_bytes=1024 * 1024,
+            )
+    start_epoch = checkpoint.next_epoch if checkpoint.valid else 0
+    start_step = checkpoint.optimizer_steps if checkpoint.valid else 0
+    estimated_wall_minutes = max(30, int(330 * (8 - min(start_epoch, 7)) / 8))
+    budget = cast(dict[str, object] | None, cloud["budget_snapshot"])
+    proposed = Decimal("3") if budget is None else Decimal(cast(str, budget["proposed_run_max_usd"]))
+    remaining = None if budget is None else Decimal(cast(str, budget["remaining_authorized_usd"]))
+    projection = None if remaining is None else str(remaining - proposed)
+    failure_code = (
+        latest_failure.get("failure_code")
+        if isinstance(latest_failure, dict)
+        else "REMOTE_TRAINING_UNKNOWN_FAILURE"
+    )
+    return {
+        "schema": "atlaslens-phase3f-training-plan-v1",
+        "action": "training-plan",
+        "run_id": run_id,
+        "dataset_asset_count": cloud["dataset_asset_count"],
+        "readiness_sha256": cloud["readiness_sha256"],
+        "sealed_assets_sha256": cloud["sealed_assets_sha256"],
+        "training_config_sha256": config_sha256,
+        "failure_forensic": {
+            "failure_code": failure_code,
+            "evidence_sufficient": latest_failure is not None,
+            "process_exit_code": (
+                latest_failure.get("process_exit_code") if latest_failure else None
+            ),
+            "process_signal": (
+                latest_failure.get("process_signal") if latest_failure else None
+            ),
+            "last_completed_epoch": (
+                latest_failure.get("last_completed_epoch") if latest_failure else None
+            ),
+            "last_epoch": latest_failure.get("last_epoch") if latest_failure else None,
+            "last_step": latest_failure.get("last_step") if latest_failure else None,
+            "holdout_open_count": (
+                latest_failure.get("holdout_open_count") if latest_failure else None
+            ),
+        },
+        "checkpoint": checkpoint.to_public_dict(),
+        "retry_mode": (
+            "resume" if checkpoint.valid else "blocked" if checkpoint.present else "fresh"
+        ),
+        "start_epoch": start_epoch,
+        "start_step": start_step,
+        "estimated_remaining_wall_minutes": estimated_wall_minutes,
+        "estimated_maximum_new_cost_usd": str(proposed),
+        "budget_projection": {
+            "authoritative_snapshot": budget,
+            "projected_remaining_authorized_usd_after_retry": projection,
+        },
+        "local_blockers": blockers,
+        "ready_for_training_retry": not blockers,
+        "dataset_write_count": 0,
+        "secret_prompt_count": 0,
+        "runpod_api_calls": 0,
+        "cloud_mutations": 0,
+        "secrets_included": False,
+    }
+
+
 def reconcile_local_receipts(cloud_runtime: Path) -> dict[str, object]:
     source = Path(__file__).resolve().parents[2] / "services" / "api" / "src"
     if str(source) not in sys.path:
@@ -983,6 +1083,7 @@ def _parser() -> argparse.ArgumentParser:
             "readiness",
             "resume-plan",
             "cloud-plan",
+            "training-plan",
             "reconcile-local-receipts",
             "status",
         ),
@@ -1010,6 +1111,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "cloud-plan":
             _require(args.cloud_runtime_root is not None, "CLOUD_RUNTIME_ROOT_MISSING")
             result = cloud_plan(
+                args.repository_root,
+                args.runtime_root,
+                args.cloud_runtime_root,
+            )
+        elif args.action == "training-plan":
+            _require(args.cloud_runtime_root is not None, "CLOUD_RUNTIME_ROOT_MISSING")
+            result = training_plan(
                 args.repository_root,
                 args.runtime_root,
                 args.cloud_runtime_root,

@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Preflight", "CloudPlan", "ReconcileLocalReceipts", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
+    [ValidateSet("Preflight", "CloudPlan", "TrainingPlan", "ReconcileLocalReceipts", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
     [string]$Action,
     [ValidateNotNullOrEmpty()]
     [string]$RuntimeRoot = "D:\AtlasLensRuntime\phase3f-local",
@@ -135,7 +135,7 @@ function Invoke-Control {
         "--repository-root", $repoRoot,
         "--runtime-root", $resolvedRuntime
     )
-    if ($ControlAction -in @("resume-plan", "cloud-plan", "reconcile-local-receipts", "status")) {
+    if ($ControlAction -in @("resume-plan", "cloud-plan", "training-plan", "reconcile-local-receipts", "status")) {
         $arguments += @("--cloud-runtime-root", $resolvedCloudRuntime)
     }
     $controlOutput = @(& $resolvedPython @arguments)
@@ -218,7 +218,7 @@ function Invoke-CloudTraining {
     $runPodSecret = Read-Host "RunPod API key (cloud lifecycle only)" -AsSecureString
     try {
         Invoke-WithSecureEnvironment -Name "RUNPOD_API_KEY" -Secret $runPodSecret -Operation {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cloudLauncher `
+            $cloudOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cloudLauncher `
                 -Execute `
                 -RuntimeRoot $resolvedCloudRuntime `
                 -PythonPath $resolvedPython `
@@ -228,10 +228,13 @@ function Invoke-CloudTraining {
                 -SoftStopUsd $SoftStopUsd `
                 -HardStopUsd $HardStopUsd `
                 -MaxGpuHourlyUsd $MaxGpuHourlyUsd `
-                -MaxWallMinutes $TrainingMaxWallMinutes
+                -MaxWallMinutes $TrainingMaxWallMinutes)
             if ($LASTEXITCODE -ne 0) {
-                throw "PHASE3F_CLOUD_TRAINING_FAILED"
+                Throw-SanitizedChildFailure `
+                    -ChildOutput $cloudOutput `
+                    -FallbackCode "PHASE3F_CLOUD_TRAINING_CHILD_FAILED"
             }
+            $cloudOutput
         }
     }
     finally {
@@ -250,6 +253,9 @@ switch ($Action) {
     }
     "CloudPlan" {
         Invoke-Control -ControlAction "cloud-plan"
+    }
+    "TrainingPlan" {
+        Invoke-Control -ControlAction "training-plan"
     }
     "ReconcileLocalReceipts" {
         Invoke-Control -ControlAction "reconcile-local-receipts"

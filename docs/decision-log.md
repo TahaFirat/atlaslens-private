@@ -1890,3 +1890,19 @@
 - Consequences: UI tests must cover unknown evidence types, no-signal, reduced
   motion, keyboard upload, and approximately 390 px layout.
 - Target phase: Durable.
+
+## 2026-07-21 — Phase 3F remote recovery is evidence-first and content-addressed
+
+- Context: A real training process failed after 2628 seconds, but SSH output and
+  remote work were deleted before any diagnostic or checkpoint was retained.
+- Decision: Preserve typed, redacted remote failure receipts and bounded salvage
+  before cleanup. Publish full-state checkpoints atomically, bind them to dataset
+  and training configuration hashes, sync only changed manifests at five-minute
+  maximum intervals, and fail closed after the locked holdout is opened.
+- Alternatives: Guess a training-parameter fix; retain raw provider logs; retry
+  from model weights without optimizer/scaler/RNG state; skip cleanup on salvage
+  failure.
+- Consequences: Historical root cause remains explicitly unknown, future failures
+  become diagnosable, authorized retries can resume without double-counting a
+  completed optimizer step, and cleanup remains mandatory.
+- Target phase: Product Phase 3F cloud training pilot.

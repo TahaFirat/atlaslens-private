@@ -13,10 +13,11 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "services" / "api" / "src"
@@ -70,6 +71,16 @@ from atlaslens_api.phase3f.supervisor import (  # noqa: E402
     require_inventory_restored,
     verify_output_archive,
 )
+from atlaslens_api.phase3f.training import training_config_sha256  # noqa: E402
+from atlaslens_api.phase3f.training_recovery import (  # noqa: E402
+    SALVAGE_RECEIPT_SCHEMA,
+    TrainingRecoveryError,
+    atomic_json,
+    extract_recovery_archive,
+    inspect_local_checkpoint,
+    sha256_path,
+    store_verified_checkpoint_archive,
+)
 
 REQUIRED_BRANCH = "feature/phase3f-multiregion-pilot"
 REQUIRED_BASE = "183b7c2f410c41d3449238f156e73fed493e9dd9"
@@ -91,6 +102,8 @@ E2E_RUN_BUDGET_USD = Decimal("3")
 E2E_HISTORICAL_BUDGET_USD = Decimal("10")
 E2E_CLOSED_POD_DISK_ALLOWANCE_USD = Decimal("0.10")
 MAX_HISTORICAL_RECEIPTS = 1_000
+CHECKPOINT_SYNC_SECONDS = 5 * 60
+FAILURE_SALVAGE_SECONDS = 5 * 60
 _SUPERVISOR_RECEIPT_SCHEMA = "atlaslens-phase3f-local-supervisor-receipt-v1"
 _BUDGET_RECONCILIATION_SCHEMA = "atlaslens-phase3f-budget-reconciliation-v1"
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -120,6 +133,20 @@ class BudgetReconciliation(NamedTuple):
     source_receipt_count: int
     duplicate_billing_record_count: int
     unrecognized_active_billing: bool
+
+
+class RemoteProcessResult(NamedTuple):
+    return_code: int
+    elapsed_seconds: float
+
+
+class SalvageResult(NamedTuple):
+    attempted: bool
+    succeeded: bool
+    artifact_count: int
+    checkpoint_present: bool
+    checkpoint_sha256: str | None
+    failure_code: str
 
 
 def _require(condition: bool, code: str) -> None:
@@ -355,6 +382,27 @@ def _run_command(arguments: list[str], *, timeout_seconds: float) -> None:
     _require(completed.returncode == 0, "TRANSFER_COMMAND_FAILED")
 
 
+def _run_sha256_command(arguments: list[str], *, timeout_seconds: float) -> str:
+    try:
+        completed = subprocess.run(
+            arguments,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=max(1.0, timeout_seconds),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SupervisorExecutionError("TRANSFER_COMMAND_FAILED") from exc
+    _require(completed.returncode == 0, "TRANSFER_COMMAND_FAILED")
+    try:
+        digest = completed.stdout.decode("ascii", errors="strict").strip()
+    except UnicodeDecodeError as exc:
+        raise SupervisorExecutionError("CHECKPOINT_REMOTE_HASH_INVALID") from exc
+    _require(bool(_SHA256.fullmatch(digest)), "CHECKPOINT_REMOTE_HASH_INVALID")
+    return digest
+
+
 def _ssh_arguments(key: Path, known_hosts: Path, connection: PodConnection) -> list[str]:
     return [
         "ssh",
@@ -442,8 +490,12 @@ def _run_watched(
     *,
     lease: RunPodLease,
     started: float,
-) -> None:
+    periodic: Callable[[], object] | None = None,
+    periodic_seconds: int = CHECKPOINT_SYNC_SECONDS,
+) -> RemoteProcessResult:
     next_status = 0
+    next_periodic = periodic_seconds
+    process_started = time.monotonic()
     try:
         process = subprocess.Popen(
             arguments,
@@ -460,8 +512,15 @@ def _run_watched(
             if elapsed >= next_status:
                 _emit("PHASE3F_CLOUD_JOB_RUNNING", elapsed_seconds=elapsed)
                 next_status = elapsed + 60
+            process_elapsed = time.monotonic() - process_started
+            if periodic is not None and process_elapsed >= next_periodic:
+                periodic()
+                next_periodic += periodic_seconds
             time.sleep(15)
-        _require(process.returncode == 0, "REMOTE_JOB_FAILED")
+        return RemoteProcessResult(
+            return_code=process.returncode if process.returncode is not None else 1,
+            elapsed_seconds=time.monotonic() - process_started,
+        )
     finally:
         if process.poll() is None:
             process.terminate()
@@ -469,6 +528,273 @@ def _run_watched(
                 process.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 process.kill()
+
+
+def _sync_remote_checkpoint(
+    ssh: list[str],
+    scp: list[str],
+    *,
+    public_ip: str,
+    remote_transfer: str,
+    checkpoint_store: Path,
+    partial_path: Path,
+    run_id: str,
+    readiness_sha256: str,
+    sealed_assets_sha256: str,
+    config_sha256: str,
+    timeout_seconds: float,
+) -> bool:
+    sync_started = time.monotonic()
+
+    def remaining() -> float:
+        return timeout_seconds - (time.monotonic() - sync_started)
+
+    partial_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    partial_path.unlink(missing_ok=True)
+    remote_archive = f"{remote_transfer}/checkpoint-sync.tar"
+    try:
+        _require(remaining() > 0, "CHECKPOINT_SYNC_TIMEOUT")
+        remote_manifest_sha256 = _run_sha256_command(
+            [
+                *ssh,
+                "bash",
+                "-lc",
+                shlex.quote(
+                    "phase3f_generation=$(python -c \"import json; "
+                    "print(json.load(open('/workspace/phase3f-work/training-checkpoint/latest.json', "
+                    "encoding='utf-8'))['generation'])\") "
+                    "&& (sha256sum /workspace/phase3f-work/training-checkpoint/"
+                    "\"$phase3f_generation\"/checkpoint-manifest.json; "
+                    "if test -f /workspace/phase3f-work/training-checkpoint/holdout-state.json; "
+                    "then sha256sum /workspace/phase3f-work/training-checkpoint/"
+                    "holdout-state.json; fi) | sha256sum | cut -d' ' -f1"
+                ),
+            ],
+            timeout_seconds=max(1.0, remaining()),
+        )
+        sync_state_path = checkpoint_store / "sync-state.json"
+        if sync_state_path.is_file() and not sync_state_path.is_symlink():
+            try:
+                sync_state = json.loads(sync_state_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                sync_state = None
+            if (
+                isinstance(sync_state, dict)
+                and sync_state.get("remote_manifest_sha256") == remote_manifest_sha256
+            ):
+                return False
+        _run_command(
+            [
+                *ssh,
+                "bash",
+                "-lc",
+                shlex.quote(
+                    "test -f /workspace/phase3f-work/training-checkpoint/latest.json "
+                    "&& phase3f_generation=$(python -c \"import json; "
+                    "print(json.load(open('/workspace/phase3f-work/training-checkpoint/latest.json', "
+                    "encoding='utf-8'))['generation'])\") "
+                    "&& tar -C /workspace/phase3f-work/training-checkpoint "
+                    f"-cf {remote_archive} latest.json \"$phase3f_generation\" "
+                    "&& (if test -f /workspace/phase3f-work/training-checkpoint/"
+                    "best-trainable.safetensors; then tar -C /workspace/phase3f-work/"
+                    "training-checkpoint -rf "
+                    f"{remote_archive} best-trainable.safetensors; fi) "
+                    "&& (if test -f /workspace/phase3f-work/training-checkpoint/"
+                    "holdout-state.json; then tar -C /workspace/phase3f-work/"
+                    "training-checkpoint -rf "
+                    f"{remote_archive} holdout-state.json; fi)"
+                ),
+            ],
+            timeout_seconds=max(1.0, remaining()),
+        )
+        _require(remaining() > 0, "CHECKPOINT_SYNC_TIMEOUT")
+        _run_command(
+            [*scp, f"root@{public_ip}:{remote_archive}", str(partial_path)],
+            timeout_seconds=max(1.0, remaining()),
+        )
+        _require(remaining() > 0, "CHECKPOINT_SYNC_TIMEOUT")
+        status = store_verified_checkpoint_archive(
+            partial_path,
+            checkpoint_store,
+            expected_run_id=run_id,
+            expected_readiness_sha256=readiness_sha256,
+            expected_sealed_assets_sha256=sealed_assets_sha256,
+            expected_training_config_sha256=config_sha256,
+        )
+        atomic_json(
+            sync_state_path,
+            {
+                "schema": "atlaslens-phase3f-checkpoint-sync-v1",
+                "remote_manifest_sha256": remote_manifest_sha256,
+                "checkpoint_archive_sha256": status.archive_sha256,
+                "optimizer_steps": status.optimizer_steps,
+                "secrets_included": False,
+            },
+        )
+        _emit(
+            "PHASE3F_CHECKPOINT_SYNCED",
+            checkpoint_sha256=status.archive_sha256,
+            optimizer_steps=status.optimizer_steps,
+            holdout_open_count=status.holdout_open_count,
+        )
+        return True
+    except (OSError, SupervisorExecutionError, TrainingRecoveryError):
+        partial_path.unlink(missing_ok=True)
+        return False
+
+
+def _salvage_remote_failure(
+    ssh: list[str],
+    scp: list[str],
+    *,
+    public_ip: str,
+    remote_transfer: str,
+    attempt_root: Path,
+    checkpoint_store: Path,
+    run_id: str,
+    readiness_sha256: str,
+    sealed_assets_sha256: str,
+    config_sha256: str,
+    process_result: RemoteProcessResult,
+    timeout_seconds: float,
+) -> SalvageResult:
+    started = time.monotonic()
+    attempt_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    recovery_partial = attempt_root / "recovery.tar.partial"
+    recovery_archive = attempt_root / "recovery.tar"
+    checkpoint_partial = attempt_root / "checkpoint.tar.partial"
+    artifact_count = 0
+    checkpoint_present = False
+    checkpoint_sha256: str | None = None
+    failure_code = "REMOTE_TRAINING_UNKNOWN_FAILURE"
+    salvage_failure_code: str | None = None
+    remote_exit_code: int | None = (
+        process_result.return_code if process_result.return_code >= 0 else None
+    )
+    remote_signal: int | None = (
+        -process_result.return_code if process_result.return_code < 0 else None
+    )
+    succeeded = False
+
+    def remaining() -> float:
+        return min(timeout_seconds, FAILURE_SALVAGE_SECONDS) - (time.monotonic() - started)
+
+    try:
+        _require(remaining() > 0, "REMOTE_TRAINING_SALVAGE_TIMEOUT")
+        remote_archive = f"{remote_transfer}/failure-recovery.tar"
+        _run_command(
+            [
+                *ssh,
+                "bash",
+                "-lc",
+                shlex.quote(
+                    "test -d /workspace/phase3f-work/recovery "
+                    f"&& tar -C /workspace/phase3f-work -cf {remote_archive} recovery"
+                ),
+            ],
+            timeout_seconds=max(1.0, remaining()),
+        )
+        _run_command(
+            [*scp, f"root@{public_ip}:{remote_archive}", str(recovery_partial)],
+            timeout_seconds=max(1.0, remaining()),
+        )
+        recovery_digest = sha256_path(recovery_partial)
+        os.replace(recovery_partial, recovery_archive)
+        files = extract_recovery_archive(
+            recovery_archive,
+            attempt_root / f"recovery-{recovery_digest}",
+        )
+        _require(remaining() > 0, "REMOTE_TRAINING_SALVAGE_TIMEOUT")
+        artifact_count = len(files) + 1
+        failure_candidates = tuple(
+            path for path in files if path.name == "failure.json"
+        )
+        if len(failure_candidates) == 1:
+            failure = json.loads(failure_candidates[0].read_text(encoding="utf-8"))
+            candidate = failure.get("failure_code") if isinstance(failure, dict) else None
+            if isinstance(candidate, str) and re.fullmatch(r"REMOTE_TRAINING_[A-Z0-9_]+", candidate):
+                failure_code = candidate
+            exit_candidate = failure.get("process_exit_code")
+            signal_candidate = failure.get("process_signal")
+            remote_exit_code = (
+                exit_candidate
+                if isinstance(exit_candidate, int)
+                and not isinstance(exit_candidate, bool)
+                and 0 <= exit_candidate <= 255
+                else None
+            )
+            remote_signal = (
+                signal_candidate
+                if isinstance(signal_candidate, int)
+                and not isinstance(signal_candidate, bool)
+                and 1 <= signal_candidate <= 64
+                else None
+            )
+        checkpoint_synced = _sync_remote_checkpoint(
+            ssh,
+            scp,
+            public_ip=public_ip,
+            remote_transfer=remote_transfer,
+            checkpoint_store=checkpoint_store,
+            partial_path=checkpoint_partial,
+            run_id=run_id,
+            readiness_sha256=readiness_sha256,
+            sealed_assets_sha256=sealed_assets_sha256,
+            config_sha256=config_sha256,
+            timeout_seconds=max(1.0, remaining()),
+        )
+        checkpoint = inspect_local_checkpoint(
+            checkpoint_store,
+            expected_run_id=run_id,
+            expected_readiness_sha256=readiness_sha256,
+            expected_sealed_assets_sha256=sealed_assets_sha256,
+            expected_training_config_sha256=config_sha256,
+        )
+        checkpoint_present = checkpoint.valid
+        if checkpoint.valid:
+            checkpoint_sha256 = checkpoint.archive_sha256
+            artifact_count += int(checkpoint_synced)
+        succeeded = True
+    except (
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+        SupervisorExecutionError,
+        TrainingRecoveryError,
+    ) as exc:
+        if isinstance(exc, SupervisorExecutionError) and exc.code == "REMOTE_TRAINING_SALVAGE_TIMEOUT":
+            salvage_failure_code = exc.code
+        else:
+            salvage_failure_code = "REMOTE_TRAINING_SALVAGE_FAILED"
+    finally:
+        recovery_partial.unlink(missing_ok=True)
+        checkpoint_partial.unlink(missing_ok=True)
+        atomic_json(
+            attempt_root / "salvage-receipt.json",
+            {
+                "schema": SALVAGE_RECEIPT_SCHEMA,
+                "run_id": run_id,
+                "attempted": True,
+                "succeeded": succeeded,
+                "artifact_count": artifact_count,
+                "checkpoint_present": checkpoint_present,
+                "checkpoint_sha256": checkpoint_sha256,
+                "failure_code": failure_code,
+                "salvage_failure_code": salvage_failure_code,
+                "remote_process_exit_code": remote_exit_code,
+                "remote_process_signal": remote_signal,
+                "elapsed_seconds": time.monotonic() - started,
+                "secret_values_included": False,
+            },
+        )
+    return SalvageResult(
+        attempted=True,
+        succeeded=succeeded,
+        artifact_count=artifact_count,
+        checkpoint_present=checkpoint_present,
+        checkpoint_sha256=checkpoint_sha256,
+        failure_code=failure_code,
+    )
 
 
 def _operation(
@@ -485,6 +811,12 @@ def _operation(
     operator_receipt_path: Path,
     remote_job_seconds: int,
     training_dataset: Path | None = None,
+    checkpoint_store: Path | None = None,
+    resume_archive: Path | None = None,
+    recovery_attempt_root: Path | None = None,
+    readiness_sha256: str | None = None,
+    sealed_assets_sha256: str | None = None,
+    config_sha256: str | None = None,
 ) -> dict[str, object]:
     bound_receipt = read_operator_receipt(operator_receipt_path)
     _require(
@@ -528,6 +860,8 @@ def _operation(
     ]
     if training_dataset is not None:
         transfer_items.append((training_dataset, f"{remote_transfer}/sealed-acquisition.tar"))
+    if resume_archive is not None:
+        transfer_items.append((resume_archive, f"{remote_transfer}/resume-checkpoint.tar"))
     for local, remote in transfer_items:
         _run_command(
             [*scp, str(local), f"root@{connection.public_ip}:{remote}"],
@@ -542,8 +876,8 @@ def _operation(
     deadline = int(time.time() + remote_job_seconds)
     job_command = (
         (
-            "timeout --signal=TERM "
-            f"{remote_job_seconds} python /workspace/phase3f-repo/scripts/phase3f/training_job.py "
+            "ATLASLENS_PHASE3F_CHILD=training_job.py "
+            "python /workspace/phase3f-repo/scripts/phase3f/remote_training.py "
             "--repository-root /workspace/phase3f-repo "
             f"--run-id {run_id} "
             "--sealed-root /workspace/phase3f-dataset/sealed-acquisition "
@@ -551,7 +885,9 @@ def _operation(
             "--vendor-root /workspace/phase3f-transfer/vendor "
             "--work-root /workspace/phase3f-work "
             "--output-root /workspace/phase3f-output "
-            f"--deadline-epoch {deadline}"
+            "--recovery-root /workspace/phase3f-work/recovery "
+            f"--deadline-epoch {deadline} "
+            f"--timeout-seconds {remote_job_seconds}"
         )
         if training_dataset is not None
         else (
@@ -568,9 +904,16 @@ def _operation(
     )
     preparation = [
         "rm -rf /workspace/phase3f-repo /workspace/phase3f-output /workspace/phase3f-work /workspace/phase3f-dataset",
-            "mkdir -p /workspace/phase3f-repo",
-            "tar -xf /workspace/phase3f-transfer/source.tar -C /workspace/phase3f-repo",
-            f"python -m pip install --disable-pip-version-check --no-cache-dir {dependencies}",
+        "mkdir -p /workspace/phase3f-repo /workspace/phase3f-work/recovery",
+        "tar -xf /workspace/phase3f-transfer/source.tar -C /workspace/phase3f-repo",
+        (
+            f"python -m pip install --disable-pip-version-check --no-cache-dir {dependencies} "
+            ">/dev/null 2>/dev/null || (printf '%s\\n' "
+            "'{\"schema\":\"atlaslens-phase3f-remote-training-failure-v1\","
+            "\"failure_code\":\"REMOTE_TRAINING_DEPENDENCY_FAILED\","
+            "\"stdout_tail\":[],\"stderr_tail\":[],\"secrets_included\":false}' "
+            ">/workspace/phase3f-work/recovery/failure.json; exit 91)"
+        ),
     ]
     if training_dataset is not None:
         preparation.extend(
@@ -580,20 +923,81 @@ def _operation(
                 "unset MAPILLARY_ACCESS_TOKEN",
             )
         )
-    remote_command = " && ".join(
-        (
-            *preparation,
-            job_command,
-            "tar -C /workspace -cf /workspace/phase3f-transfer/output.tar phase3f-output",
-        )
+        if resume_archive is not None:
+            preparation.append(
+                "mkdir -p /workspace/phase3f-work/training-checkpoint "
+                "&& tar -xf /workspace/phase3f-transfer/resume-checkpoint.tar "
+                "-C /workspace/phase3f-work/training-checkpoint"
+            )
+    prepared = " && ".join(preparation)
+    remote_command = (
+        f"{prepared} && {job_command}; phase3f_rc=$?; "
+        "if [ $phase3f_rc -eq 0 ]; then "
+        "tar -C /workspace -cf /workspace/phase3f-transfer/output.tar phase3f-output; "
+        "fi; exit $phase3f_rc"
     )
     try:
         _emit("PHASE3F_CLOUD_JOB_STARTED", run_id=run_id)
-        _run_watched(
-            [*ssh, "bash", "-lc", shlex.quote(remote_command)],
-            lease=lease,
-            started=started,
+        checkpoint_enabled = all(
+            value is not None
+            for value in (
+                checkpoint_store,
+                recovery_attempt_root,
+                readiness_sha256,
+                sealed_assets_sha256,
+                config_sha256,
+            )
         )
+        partial = (
+            cast(Path, recovery_attempt_root).parent / ".checkpoint-sync.partial"
+            if checkpoint_enabled
+            else download_path.with_name(".checkpoint-sync.partial")
+        )
+        watched_arguments = [*ssh, "bash", "-lc", shlex.quote(remote_command)]
+        result = (
+            _run_watched(
+                watched_arguments,
+                lease=lease,
+                started=started,
+                periodic=lambda: _sync_remote_checkpoint(
+                    ssh,
+                    scp,
+                    public_ip=connection.public_ip,
+                    remote_transfer=remote_transfer,
+                    checkpoint_store=cast(Path, checkpoint_store),
+                    partial_path=partial,
+                    run_id=run_id,
+                    readiness_sha256=cast(str, readiness_sha256),
+                    sealed_assets_sha256=cast(str, sealed_assets_sha256),
+                    config_sha256=cast(str, config_sha256),
+                    timeout_seconds=min(120.0, max(1.0, remaining())),
+                ),
+            )
+            if checkpoint_enabled
+            else _run_watched(watched_arguments, lease=lease, started=started)
+        )
+        if result is None:  # Backward-compatible test seam for the command runner.
+            result = RemoteProcessResult(0, 0.0)
+        if result.return_code != 0:
+            salvage = (
+                _salvage_remote_failure(
+                    ssh,
+                    scp,
+                    public_ip=connection.public_ip,
+                    remote_transfer=remote_transfer,
+                    attempt_root=cast(Path, recovery_attempt_root),
+                    checkpoint_store=cast(Path, checkpoint_store),
+                    run_id=run_id,
+                    readiness_sha256=cast(str, readiness_sha256),
+                    sealed_assets_sha256=cast(str, sealed_assets_sha256),
+                    config_sha256=cast(str, config_sha256),
+                    process_result=result,
+                    timeout_seconds=min(FAILURE_SALVAGE_SECONDS, max(1.0, remaining())),
+                )
+                if checkpoint_enabled
+                else SalvageResult(True, False, 0, False, None, "REMOTE_TRAINING_UNKNOWN_FAILURE")
+            )
+            raise SupervisorExecutionError(salvage.failure_code)
         _run_command(
             [
                 *scp,
@@ -1411,6 +1815,12 @@ def _run_execute(
     full_inventory_restored = False
     budget_reconciliation: BudgetReconciliation | None = None
     budget_receipt_id: str | None = None
+    checkpoint_store: Path | None = None
+    resume_archive: Path | None = None
+    recovery_attempt_root: Path | None = None
+    readiness_sha256: str | None = None
+    sealed_assets_sha256: str | None = None
+    config_sha256: str | None = None
     try:
         _disk_gate()
         head, tracked = _preflight_repository()
@@ -1485,6 +1895,34 @@ def _run_execute(
             args.sealed_acquisition is None or bundle.dataset_archive is not None,
             "TRAINING_DATASET_ARCHIVE_MISSING",
         )
+        if args.sealed_acquisition is not None:
+            readiness_path = args.sealed_acquisition.parent / "training-readiness.json"
+            _require(
+                readiness_path.is_file() and not readiness_path.is_symlink(),
+                "TRAINING_READINESS_REPORT_MISSING",
+            )
+            readiness_sha256 = sha256_path(readiness_path, max_bytes=1024 * 1024)
+            sealed_assets_sha256 = sha256_path(
+                args.sealed_acquisition / "sealed-assets.json",
+                max_bytes=64 * 1024 * 1024,
+            )
+            config_sha256 = training_config_sha256(seed=20260720, max_epochs=8)
+            checkpoint_store = args.runtime_root / "_training" / run_id / "checkpoints"
+            recovery_attempt_root = (
+                args.runtime_root / "_training" / run_id / "attempts" / attempt_id
+            )
+            checkpoint = inspect_local_checkpoint(
+                checkpoint_store,
+                expected_run_id=run_id,
+                expected_readiness_sha256=readiness_sha256,
+                expected_sealed_assets_sha256=sealed_assets_sha256,
+                expected_training_config_sha256=config_sha256,
+            )
+            _require(
+                not checkpoint.present or checkpoint.valid,
+                checkpoint.failure_code or "TRAINING_CHECKPOINT_INVALID",
+            )
+            resume_archive = checkpoint.archive_path if checkpoint.valid else None
         config = RunPodConfig(
             image_name=IMAGE,
             gpu_type_preferences=GPU_PREFERENCES,
@@ -1574,6 +2012,12 @@ def _run_execute(
                             if bundle.dataset_archive is not None
                             else None
                         ),
+                        checkpoint_store=checkpoint_store,
+                        resume_archive=resume_archive,
+                        recovery_attempt_root=recovery_attempt_root,
+                        readiness_sha256=readiness_sha256,
+                        sealed_assets_sha256=sealed_assets_sha256,
+                        config_sha256=config_sha256,
                     ),
                 )
             except (Phase3FSafetyError, RunPodAPIError) as exc:
@@ -1702,6 +2146,7 @@ def _run_execute(
         Phase3FSupervisorError,
         RunPodAPIError,
         SupervisorExecutionError,
+        TrainingRecoveryError,
     ) as exc:
         if owns_operator_receipt:
             cleanup_verified = bool(
@@ -1790,6 +2235,7 @@ def main(argv: list[str] | None = None) -> int:
         Phase3FSupervisorError,
         RunPodAPIError,
         SupervisorExecutionError,
+        TrainingRecoveryError,
     ) as exc:
         print(exc.code)
         return 1
