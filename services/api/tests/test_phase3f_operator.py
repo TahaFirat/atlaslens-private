@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -7,18 +8,24 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
+from typing import cast
 
 import pytest
 
+import atlaslens_api.phase3f.operator as operator_module
 from atlaslens_api.phase3f.operator import (
     OperatorReceipt,
     Phase3FOperatorError,
     archive_completed_operator_receipt,
     inspect_operator_inventory,
+    prepare_operator_attempt,
     read_operator_receipt,
+    reconcile_operator_archive_index,
     require_startable_receipt,
     terminate_receipt_bound_pod,
     write_operator_receipt,
@@ -49,6 +56,7 @@ SUPERVISOR_PATH = ROOT / "scripts" / "phase3f" / "supervisor.py"
 def _receipt(*, pod_id: str | None = "phase3f-pod", stage: str = "running") -> OperatorReceipt:
     return OperatorReceipt(
         run_id="a" * 32,
+        attempt_id="b" * 32,
         run_marker=f"atlaslens-phase3f-{'a' * 32}",
         pod_id=pod_id,
         supervisor_pid=12345,
@@ -61,6 +69,25 @@ def _receipt(*, pod_id: str | None = "phase3f-pod", stage: str = "running") -> O
         max_gpu_hourly_usd=Decimal("0.50"),
         max_wall_minutes=345,
         cleanup_verified=False,
+    )
+
+
+def _terminal_attempt(
+    attempt: int,
+    *,
+    pod_id: str | None = None,
+    cleanup_verified: bool = True,
+) -> OperatorReceipt:
+    receipt = replace(
+        _receipt(pod_id=pod_id, stage="running" if pod_id else "preflight"),
+        attempt_id=f"{attempt:032x}",
+        supervisor_pid=12_000 + attempt,
+        started_at=f"2026-07-19T18:{attempt:02d}:00+00:00",
+    )
+    return receipt.update_lifecycle(
+        stage="terminated",
+        finished_at=f"2026-07-19T18:{attempt:02d}:30+00:00",
+        cleanup_verified=cleanup_verified,
     )
 
 
@@ -121,6 +148,7 @@ def test_create_id_is_atomically_bound_before_response_field_validation(
     module._bind_operator_pod(
         path,
         expected_run_id=receipt.run_id,
+        expected_attempt_id=cast(str, receipt.attempt_id),
         pod=pod,
     )
 
@@ -140,6 +168,7 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
     module._bind_operator_pod(
         path,
         expected_run_id=receipt.run_id,
+        expected_attempt_id=cast(str, receipt.attempt_id),
         pod=PodRecord("created-pod", receipt.run_marker),
     )
     attestation = PodRentalAttestationDiagnostic(
@@ -189,17 +218,20 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
     module._record_operator_gpu_attestation_progress(
         path,
         expected_run_id=receipt.run_id,
+        expected_attempt_id=cast(str, receipt.attempt_id),
         diagnostic=pending,
     )
 
     module._record_operator_rental_attestation(
         path,
         expected_run_id=receipt.run_id,
+        expected_attempt_id=cast(str, receipt.attempt_id),
         attestation=attestation,
     )
     module._record_operator_gpu_attestation_progress(
         path,
         expected_run_id=receipt.run_id,
+        expected_attempt_id=cast(str, receipt.attempt_id),
         diagnostic=PodGPUAttestationProgressDiagnostic(
             outcome="attested",
             failure_code=None,
@@ -222,6 +254,7 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
     module._record_operator_connectivity_progress(
         path,
         expected_run_id=receipt.run_id,
+        expected_attempt_id=cast(str, receipt.attempt_id),
         diagnostic=PodConnectivityProgressDiagnostic(
             outcome="ready",
             failure_code=None,
@@ -366,6 +399,7 @@ def test_legacy_operator_receipt_remains_readable(tmp_path: Path) -> None:
     payload["schema"] = "atlaslens-phase3f-operator-receipt-v1"
     for field in (
         "pod_bound_at",
+        "attempt_id",
         "rental_evidence",
         "request_interruptible",
         "selected_gpu_id",
@@ -423,6 +457,7 @@ def test_previous_v2_operator_receipt_remains_readable(tmp_path: Path) -> None:
     path = tmp_path / "phase3f-current.json"
     payload = _receipt().to_dict()
     for field in (
+        "attempt_id",
         "gpu_attestation_outcome",
         "gpu_attestation_failure_code",
         "normalized_gpu_path",
@@ -458,6 +493,7 @@ def test_previous_v2_operator_receipt_remains_readable(tmp_path: Path) -> None:
     assert restored.pod_id == "phase3f-pod"
     assert restored.gpu_attestation_outcome is None
     assert restored.create_http_class is None
+    assert restored.attempt_id is None
 
 
 def test_stale_or_live_operator_receipt_fails_closed(tmp_path: Path) -> None:
@@ -492,11 +528,245 @@ def test_completed_receipt_is_archived_without_fake_termination(tmp_path: Path) 
 
     archived = archive_completed_operator_receipt(path)
 
-    assert archived == path.parent / "archive" / f"{completed.run_id}.json"
     assert archived is not None
+    assert archived.name.startswith(
+        f"{completed.run_id}-{completed.attempt_id}-terminated-"
+    )
     assert read_operator_receipt(archived) == completed
     assert not path.exists()
     assert completed.pod_id is None
+
+
+def test_same_run_archives_eight_terminal_attempts_without_conflict(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "operator state with spaces" / "phase3f-current.json"
+    archived: set[str] = set()
+
+    for attempt in range(1, 9):
+        write_operator_receipt(current, _terminal_attempt(attempt))
+        destination = archive_completed_operator_receipt(current)
+        assert destination is not None
+        archived.add(destination.name)
+
+    index = reconcile_operator_archive_index(current.parent, write=False)
+    assert len(archived) == 8
+    assert index["archive_receipt_count"] == 8
+    assert index["legacy_attempt_count"] == 0
+    assert index["duplicate_receipt_count"] == 0
+    assert index["active_receipt_count"] == 0
+    assert index["unclean_receipt_count"] == 0
+    assert index["archive_conflicts"] == 0
+    assert not current.exists()
+
+
+def test_byte_identical_archive_retry_is_idempotent(tmp_path: Path) -> None:
+    current = tmp_path / "_operator" / "phase3f-current.json"
+    receipt = _terminal_attempt(1)
+    write_operator_receipt(current, receipt)
+    first = archive_completed_operator_receipt(current)
+    index_path = current.parent / "archive-index.json"
+    first_index = index_path.read_bytes()
+
+    write_operator_receipt(current, receipt)
+    second = archive_completed_operator_receipt(current)
+
+    assert first == second
+    assert first is not None
+    assert len(tuple((current.parent / "archive").glob("*.json"))) == 1
+    assert index_path.read_bytes() == first_index
+    assert not current.exists()
+
+
+def test_semantically_identical_legacy_receipts_form_duplicate_group(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "_operator" / "phase3f-current.json"
+    current.parent.mkdir(parents=True)
+    payload = _terminal_attempt(1).to_dict()
+    del payload["attempt_id"]
+    current.write_text(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    first = archive_completed_operator_receipt(current)
+    current.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    second = archive_completed_operator_receipt(current)
+
+    index = reconcile_operator_archive_index(current.parent, write=False)
+    assert first is not None and second is not None and first != second
+    assert index["archive_receipt_count"] == 2
+    assert index["legacy_attempt_count"] == 2
+    assert index["duplicate_group_count"] == 1
+    assert index["duplicate_receipt_count"] == 1
+
+
+def test_content_prefix_collision_never_overwrites_existing_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    real_sha256 = hashlib.sha256
+
+    class _SharedPrefixHash:
+        def __init__(self, payload: bytes = b"") -> None:
+            self.inner = real_sha256(payload)
+
+        def update(self, payload: bytes) -> None:
+            self.inner.update(payload)
+
+        def hexdigest(self) -> str:
+            return "0" * 16 + self.inner.hexdigest()[16:]
+
+    monkeypatch.setattr(operator_module.hashlib, "sha256", _SharedPrefixHash)
+    current = tmp_path / "_operator" / "phase3f-current.json"
+    first_receipt = _terminal_attempt(1)
+    second_receipt = replace(
+        _terminal_attempt(1),
+        supervisor_pid=99_999,
+        started_at="2026-07-19T19:01:00+00:00",
+        finished_at="2026-07-19T19:01:30+00:00",
+    )
+    write_operator_receipt(current, first_receipt)
+    first = archive_completed_operator_receipt(current)
+    assert first is not None
+    first_bytes = first.read_bytes()
+    write_operator_receipt(current, second_receipt)
+    second = archive_completed_operator_receipt(current)
+
+    assert second is not None and second != first
+    assert first.read_bytes() == first_bytes
+    assert read_operator_receipt(first) == first_receipt
+    assert read_operator_receipt(second) == second_receipt
+
+
+def test_archive_index_recovers_from_crash_partial_without_receipt_mutation(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "_operator" / "phase3f-current.json"
+    receipt = _terminal_attempt(1)
+    write_operator_receipt(current, receipt)
+    archived = archive_completed_operator_receipt(current)
+    assert archived is not None
+    before = archived.read_bytes()
+    index_path = current.parent / "archive-index.json"
+    index_path.write_bytes(b"crash-truncated")
+    partial = current.parent / ".archive-index.json.deadbeef.tmp"
+    partial.write_bytes(b"partial")
+
+    recovered = reconcile_operator_archive_index(current.parent, write=True)
+
+    assert archived.read_bytes() == before
+    assert recovered["archive_receipt_count"] == 1
+    assert recovered["partial_file_count"] == 1
+    assert json.loads(index_path.read_bytes())["index_sha256"] == recovered["index_sha256"]
+
+
+def test_stale_archive_lock_is_recovered_before_new_attempt(tmp_path: Path) -> None:
+    current = tmp_path / "_operator" / "phase3f-current.json"
+    current.parent.mkdir(parents=True)
+    lock = current.parent / ".archive.lock"
+    lock.write_text(
+        json.dumps(
+            {
+                "schema": "atlaslens-phase3f-operator-archive-lock-v1",
+                "pid": 999_999,
+                "nonce": "c" * 32,
+            }
+        ),
+        encoding="utf-8",
+    )
+    receipt = replace(_receipt(pod_id=None, stage="preflight"), attempt_id="d" * 32)
+
+    prepare_operator_attempt(
+        current,
+        receipt,
+        is_process_running=lambda _pid: False,
+    )
+
+    assert read_operator_receipt(current) == receipt
+    assert not lock.exists()
+
+
+def test_active_and_unclean_receipts_block_new_attempt(tmp_path: Path) -> None:
+    current = tmp_path / "_operator" / "phase3f-current.json"
+    next_receipt = replace(
+        _receipt(pod_id=None, stage="preflight"),
+        attempt_id="d" * 32,
+    )
+    write_operator_receipt(current, _receipt(pod_id=None, stage="preflight"))
+    with pytest.raises(Phase3FOperatorError, match="OPERATOR_PROCESS_ALREADY_RUNNING"):
+        prepare_operator_attempt(
+            current,
+            next_receipt,
+            is_process_running=lambda _pid: True,
+        )
+
+    unclean = _terminal_attempt(2, cleanup_verified=False)
+    write_operator_receipt(current, unclean)
+    with pytest.raises(
+        Phase3FOperatorError,
+        match="UNCLEAN_OPERATOR_RECEIPT_REQUIRES_TERMINATE",
+    ):
+        prepare_operator_attempt(
+            current,
+            next_receipt,
+            is_process_running=lambda _pid: False,
+        )
+
+
+def test_cleanup_verified_terminal_receipt_allows_new_attempt(tmp_path: Path) -> None:
+    current = tmp_path / "_operator" / "phase3f-current.json"
+    write_operator_receipt(current, _terminal_attempt(1))
+    next_receipt = replace(
+        _receipt(pod_id=None, stage="preflight"),
+        attempt_id="d" * 32,
+    )
+
+    archived = prepare_operator_attempt(
+        current,
+        next_receipt,
+        is_process_running=lambda _pid: False,
+    )
+
+    assert archived is not None
+    assert read_operator_receipt(current) == next_receipt
+    assert reconcile_operator_archive_index(current.parent)["archive_receipt_count"] == 1
+
+
+def test_parallel_archive_calls_create_one_immutable_receipt(tmp_path: Path) -> None:
+    current = tmp_path / "_operator" / "phase3f-current.json"
+    for attempt in range(1, 9):
+        receipt = _terminal_attempt(attempt)
+        write_operator_receipt(current, receipt)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(
+                executor.map(
+                    lambda _index: archive_completed_operator_receipt(current),
+                    range(2),
+                )
+            )
+
+        paths = tuple(path for path in results if path is not None)
+        assert len(paths) == 1
+        assert read_operator_receipt(paths[0]) == receipt
+    assert len(tuple((current.parent / "archive").glob("*.json"))) == 8
+    assert reconcile_operator_archive_index(current.parent)["archive_receipt_count"] == 8
+
+
+def test_archive_names_are_lowercase_and_refuse_case_ambiguous_legacy_name(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "Operator State With Spaces" / "phase3f-current.json"
+    write_operator_receipt(current, _terminal_attempt(1))
+    archived = archive_completed_operator_receipt(current)
+    assert archived is not None
+    assert archived.name == archived.name.lower()
+
+    ambiguous = current.parent / "archive" / f"{'A' * 32}.json"
+    write_operator_receipt(ambiguous, _terminal_attempt(2))
+    with pytest.raises(Phase3FOperatorError, match="OPERATOR_ARCHIVE_NAME_INVALID"):
+        reconcile_operator_archive_index(current.parent)
 
 
 def test_status_is_read_only_and_rejects_a_second_pod() -> None:

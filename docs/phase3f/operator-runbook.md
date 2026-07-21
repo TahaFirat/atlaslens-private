@@ -19,6 +19,7 @@ restored. Execute requires an explicit cloud-consent switch:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Preflight
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action CloudPlan
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Execute -CloudConsent
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Status
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Resume -CloudConsent
@@ -33,6 +34,42 @@ running or completed training receipt also returns idempotently without starting
 that phase again. Missing/tampered seal or readiness evidence fails with the
 typed artifact/field blocker before any cloud secret is requested. Only a real
 unsealed acquisition checkpoint requests the Mapillary token.
+
+`CloudPlan` is the mutation-free pre-cloud proof. It requests neither secret,
+makes no network call, and writes neither dataset nor live operator state. It
+validates the sealed/readiness binding, classifies current and archived operator
+receipts, verifies the latest sanitized empty-inventory budget snapshot, then
+copies only `_operator` to a temporary directory and simulates terminal archive,
+hash-chain index reconciliation, stale-lock recovery, attempt creation, and
+atomic current-receipt creation. Proceed only when
+`ready_for_live_inventory=true`, `ready_for_create_after_live_gates=true`,
+`local_blockers=[]`, both active/unclean counts are zero, and API/mutation counts
+are zero. Live authenticated inventory and billing still run again after the
+RunPod key is supplied and before any create.
+Because reconciliation is persisted immediately before the attempt receipt,
+the next plan accepts exactly one additional receipt only when removing that
+receipt reproduces the snapshot's recorded source count and SHA-256; replacement
+or multiple unbound additions fail closed.
+
+The dataset `run_id` is stable across retries; every cloud lifecycle receives a
+new 32-hex `attempt_id`. A terminal receipt is archived immutably by run,
+attempt, terminal stage, and receipt-content SHA prefix. The atomic archive
+index is deterministic and hash-chained. Legacy receipts remain byte-for-byte
+unchanged and receive synthetic content-derived identities only in the index.
+Byte-identical archive retries succeed without another copy; semantic legacy
+duplicates are retained as one duplicate group; a content-prefix collision
+extends the immutable name instead of overwriting history. Budget evidence and
+the create idempotency key use attempt identity. An active/stale receipt or a
+terminal receipt without verified cleanup blocks with a typed error.
+If SSH-key or transfer preparation fails after current-receipt creation but
+before create is entered, the attempt is safely terminal and cleanup-verified.
+After create entry, only receipt-bound termination plus restored inventory can
+set cleanup verification.
+An active-stage receipt is reported as running only while its supervisor PID is
+live. A dead PID fails before the RunPod prompt with
+`STALE_OPERATOR_RECEIPT_REQUIRES_TERMINATE`.
+Operator blockers are classified before the budget snapshot is required, so a
+missing snapshot cannot mask an active, stale, or unclean receipt.
 
 When acquisition is required, `Execute`/`Resume` read the Mapillary token and
 RunPod key separately with `Read-Host -AsSecureString`. The Mapillary token

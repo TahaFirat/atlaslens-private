@@ -26,8 +26,9 @@ if str(SOURCE) not in sys.path:
 from atlaslens_api.phase3f.operator import (  # noqa: E402
     OperatorReceipt,
     Phase3FOperatorError,
-    archive_completed_operator_receipt,
     inspect_operator_inventory,
+    operator_budget_linkage,
+    prepare_operator_attempt,
     read_operator_receipt,
     require_startable_receipt,
     terminate_receipt_bound_pod,
@@ -654,7 +655,14 @@ def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _receipt_key(run_id: str, pod_id_sha256: str | None) -> str:
+def _receipt_key(
+    run_id: str,
+    pod_id_sha256: str | None,
+    attempt_id: str | None = None,
+) -> str:
+    if attempt_id is not None:
+        _require(bool(_RUN_ID.fullmatch(attempt_id)), "HISTORICAL_RECEIPT_INVALID")
+        return f"attempt:{run_id}:{attempt_id}"
     if pod_id_sha256 is not None:
         _require(bool(_SHA256.fullmatch(pod_id_sha256)), "HISTORICAL_RECEIPT_INVALID")
         return f"pod:{pod_id_sha256}"
@@ -662,12 +670,7 @@ def _receipt_key(run_id: str, pod_id_sha256: str | None) -> str:
 
 
 def _operator_receipt_key(receipt: OperatorReceipt) -> str:
-    pod_id_sha256 = (
-        None
-        if receipt.pod_id is None
-        else hashlib.sha256(receipt.pod_id.encode("utf-8")).hexdigest()
-    )
-    return _receipt_key(receipt.run_id, pod_id_sha256)
+    return operator_budget_linkage(receipt)
 
 
 def _receipt_paths(runtime_root: Path) -> tuple[list[Path], list[Path]]:
@@ -750,11 +753,15 @@ def _historical_budget_evidence(
     closed_reservation_by_key: dict[str, Decimal] = {}
     source_hashes: list[str] = []
     duplicate_billing_records = 0
+    seen_budget_keys: set[str] = set()
 
     for path in operator_paths:
         source_hashes.append(_sha256_path(path))
         receipt = read_operator_receipt(path)
         key = _operator_receipt_key(receipt)
+        if key in seen_budget_keys:
+            duplicate_billing_records += 1
+        seen_budget_keys.add(key)
         closed = receipt.cleanup_verified and receipt.stage in {"failed", "terminated"}
         if closed:
             if receipt.pod_id is not None:
@@ -772,7 +779,6 @@ def _historical_budget_evidence(
                 receipt.max_spend_usd,
             )
 
-    seen_supervisor_keys: set[str] = set()
     for path in supervisor_paths:
         source_hashes.append(_sha256_path(path))
         try:
@@ -782,17 +788,19 @@ def _historical_budget_evidence(
         _require(isinstance(row, dict), "HISTORICAL_RECEIPT_INVALID")
         run_id = row.get("run_id")
         pod_id_sha256 = row.get("pod_id_sha256")
+        attempt_id = row.get("attempt_id")
         _require(
             row.get("schema") == _SUPERVISOR_RECEIPT_SCHEMA
             and isinstance(run_id, str)
             and bool(_RUN_ID.fullmatch(run_id))
-            and (pod_id_sha256 is None or isinstance(pod_id_sha256, str)),
+            and (pod_id_sha256 is None or isinstance(pod_id_sha256, str))
+            and (attempt_id is None or isinstance(attempt_id, str)),
             "HISTORICAL_RECEIPT_INVALID",
         )
-        key = _receipt_key(run_id, pod_id_sha256)
-        if key in seen_supervisor_keys:
+        key = _receipt_key(run_id, pod_id_sha256, attempt_id)
+        if key in seen_budget_keys:
             duplicate_billing_records += 1
-        seen_supervisor_keys.add(key)
+        seen_budget_keys.add(key)
         conservative = _budget_decimal(
             row.get("conservative_incremental_upper_usd"),
             "HISTORICAL_RECEIPT_INVALID",
@@ -1239,12 +1247,18 @@ def _bind_operator_pod(
     receipt_path: Path,
     *,
     expected_run_id: str,
+    expected_attempt_id: str,
     pod: PodRecord,
 ) -> None:
     receipt = read_operator_receipt(receipt_path)
     _require(
         hmac.compare_digest(receipt.run_id, expected_run_id),
         "OPERATOR_RECEIPT_RUN_ID_MISMATCH",
+    )
+    _require(
+        receipt.attempt_id is not None
+        and hmac.compare_digest(receipt.attempt_id, expected_attempt_id),
+        "OPERATOR_RECEIPT_ATTEMPT_ID_MISMATCH",
     )
     _require(
         pod.run_marker is not None
@@ -1269,7 +1283,9 @@ def _bind_operator_pod(
     _require(
         confirmed.stage == "running"
         and confirmed.pod_id is not None
+        and confirmed.attempt_id is not None
         and pod.run_marker is not None
+        and hmac.compare_digest(confirmed.attempt_id, expected_attempt_id)
         and hmac.compare_digest(confirmed.pod_id, pod.pod_id)
         and hmac.compare_digest(confirmed.run_marker, pod.run_marker),
         "OPERATOR_RECEIPT_POD_BINDING_MISSING",
@@ -1280,10 +1296,16 @@ def _record_operator_rental_attestation(
     receipt_path: Path,
     *,
     expected_run_id: str,
+    expected_attempt_id: str,
     attestation: PodRentalAttestationDiagnostic,
 ) -> None:
     receipt = read_operator_receipt(receipt_path)
     _require(receipt.run_id == expected_run_id, "OPERATOR_RECEIPT_RUN_ID_MISMATCH")
+    _require(
+        receipt.attempt_id is not None
+        and hmac.compare_digest(receipt.attempt_id, expected_attempt_id),
+        "OPERATOR_RECEIPT_ATTEMPT_ID_MISMATCH",
+    )
     _require(receipt.stage == "running", "OPERATOR_RECEIPT_STAGE_INVALID")
     _require(receipt.pod_id is not None, "OPERATOR_RECEIPT_POD_ID_MISSING")
     allocation_attested_at = datetime.now(UTC).isoformat()
@@ -1305,10 +1327,16 @@ def _record_operator_gpu_attestation_progress(
     receipt_path: Path,
     *,
     expected_run_id: str,
+    expected_attempt_id: str,
     diagnostic: PodGPUAttestationProgressDiagnostic,
 ) -> None:
     receipt = read_operator_receipt(receipt_path)
     _require(receipt.run_id == expected_run_id, "OPERATOR_RECEIPT_RUN_ID_MISMATCH")
+    _require(
+        receipt.attempt_id is not None
+        and hmac.compare_digest(receipt.attempt_id, expected_attempt_id),
+        "OPERATOR_RECEIPT_ATTEMPT_ID_MISMATCH",
+    )
     _require(receipt.stage == "running", "OPERATOR_RECEIPT_STAGE_INVALID")
     _require(receipt.pod_id is not None, "OPERATOR_RECEIPT_POD_ID_MISSING")
     write_operator_receipt(
@@ -1322,10 +1350,16 @@ def _record_operator_connectivity_progress(
     receipt_path: Path,
     *,
     expected_run_id: str,
+    expected_attempt_id: str,
     diagnostic: PodConnectivityProgressDiagnostic,
 ) -> None:
     receipt = read_operator_receipt(receipt_path)
     _require(receipt.run_id == expected_run_id, "OPERATOR_RECEIPT_RUN_ID_MISMATCH")
+    _require(
+        receipt.attempt_id is not None
+        and hmac.compare_digest(receipt.attempt_id, expected_attempt_id),
+        "OPERATOR_RECEIPT_ATTEMPT_ID_MISMATCH",
+    )
     _require(receipt.stage == "running", "OPERATOR_RECEIPT_STAGE_INVALID")
     _require(receipt.pod_id is not None, "OPERATOR_RECEIPT_POD_ID_MISSING")
     write_operator_receipt(
@@ -1353,8 +1387,10 @@ def _run_execute(
     extracted_parent = local_root / "extracted"
     started_at = datetime.now(UTC)
     started = time.monotonic()
+    attempt_id = os.urandom(16).hex()
     operator_receipt = OperatorReceipt(
         run_id=run_id,
+        attempt_id=attempt_id,
         run_marker=f"atlaslens-phase3f-{run_id}",
         pod_id=None,
         supervisor_pid=os.getpid(),
@@ -1369,6 +1405,7 @@ def _run_execute(
         cleanup_verified=False,
     )
     owns_operator_receipt = False
+    create_entered = False
     session: SinglePodSession | None = None
     capacity_race_inventory_verified = False
     full_inventory_restored = False
@@ -1415,9 +1452,7 @@ def _run_execute(
                     receipt_id=budget_receipt_id,
                     cloud_mutations=0,
                 )
-        require_startable_receipt(receipt_path)
-        archive_completed_operator_receipt(receipt_path)
-        write_operator_receipt(receipt_path, operator_receipt)
+        prepare_operator_attempt(receipt_path, operator_receipt)
         owns_operator_receipt = True
         _emit("PHASE3F_LOCAL_PREFLIGHT_OK", branch=REQUIRED_BRANCH, head=head)
         key_root.mkdir(parents=True, exist_ok=True)
@@ -1464,12 +1499,14 @@ def _run_execute(
             bind_created_pod=lambda pod: _bind_operator_pod(
                 receipt_path,
                 expected_run_id=run_id,
+                expected_attempt_id=attempt_id,
                 pod=pod,
             ),
             record_rental_attestation=lambda attestation: (
                 _record_operator_rental_attestation(
                     receipt_path,
                     expected_run_id=run_id,
+                    expected_attempt_id=attempt_id,
                     attestation=attestation,
                 )
             ),
@@ -1477,6 +1514,7 @@ def _run_execute(
                 _record_operator_gpu_attestation_progress(
                     receipt_path,
                     expected_run_id=run_id,
+                    expected_attempt_id=attempt_id,
                     diagnostic=diagnostic,
                 )
             ),
@@ -1484,6 +1522,7 @@ def _run_execute(
                 _record_operator_connectivity_progress(
                     receipt_path,
                     expected_run_id=run_id,
+                    expected_attempt_id=attempt_id,
                     diagnostic=diagnostic,
                 )
             ),
@@ -1499,7 +1538,7 @@ def _run_execute(
             )
             request = PodRequest(
                 run_marker=operator_receipt.run_marker,
-                idempotency_key=f"atlaslens-phase3f-create-{run_id}",
+                idempotency_key=f"atlaslens-phase3f-create-{attempt_id}",
                 hourly_cost_usd=policy.max_hourly_cost_usd,
                 max_runtime_seconds=policy.max_runtime_seconds,
                 gpu_type_id=offer.gpu_type_id,
@@ -1512,6 +1551,7 @@ def _run_execute(
                 cleanup_poll_seconds=3.0,
             )
             try:
+                create_entered = True
                 execution = session.execute(
                     request,
                     lambda lease: _operation(
@@ -1584,6 +1624,7 @@ def _run_execute(
         receipt = {
             "schema": "atlaslens-phase3f-local-supervisor-receipt-v1",
             "run_id": run_id,
+            "attempt_id": attempt_id,
             "outcome": verified.outcome,
             "pod_id_sha256": execution.value["pod_id_sha256"],
             "gpu": execution.value["gpu"],
@@ -1664,10 +1705,13 @@ def _run_execute(
     ) as exc:
         if owns_operator_receipt:
             cleanup_verified = bool(
-                session is not None
-                and session.last_audit is not None
-                and session.last_audit.termination_verified
-                and full_inventory_restored
+                not create_entered
+                or (
+                    session is not None
+                    and session.last_audit is not None
+                    and session.last_audit.termination_verified
+                    and full_inventory_restored
+                )
             )
             no_pod_capacity_race = bool(
                 isinstance(exc, (Phase3FSafetyError, RunPodAPIError))
@@ -1687,10 +1731,13 @@ def _run_execute(
     except BaseException:
         if owns_operator_receipt:
             cleanup_verified = bool(
-                session is not None
-                and session.last_audit is not None
-                and session.last_audit.termination_verified
-                and full_inventory_restored
+                not create_entered
+                or (
+                    session is not None
+                    and session.last_audit is not None
+                    and session.last_audit.termination_verified
+                    and full_inventory_restored
+                )
             )
             _record_failed_operator_state(
                 receipt_path,

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
+import stat
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -42,6 +45,13 @@ _GPU_ATTESTATION_STATUSES = frozenset({"RUNNING", "EXITED", "TERMINATED"})
 _GPU_ATTESTATION_COST = "graphql_uninterruptable_price_match"
 _CONNECTIVITY_OUTCOMES = frozenset({"pending", "ready", "failed"})
 _FAILURE_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
+_ARCHIVE_INDEX_SCHEMA = "atlaslens-phase3f-operator-archive-index-v1"
+_ARCHIVE_NAME = re.compile(
+    r"^(?P<run_id>[0-9a-f]{32})-(?P<attempt_id>[0-9a-f]{32})-"
+    r"(?P<stage>failed|terminated)-(?P<sha256>[0-9a-f]{16,64})\.json$"
+)
+_LEGACY_ARCHIVE_NAME = re.compile(r"^[0-9a-f]{32}\.json$")
+_PARTIAL_NAME = re.compile(r"^\.?[A-Za-z0-9_.-]{1,190}\.(?:partial|tmp)$")
 
 
 class Phase3FOperatorError(RuntimeError):
@@ -87,6 +97,7 @@ class OperatorReceipt:
     max_gpu_hourly_usd: Decimal
     max_wall_minutes: int
     cleanup_verified: bool
+    attempt_id: str | None = None
     pod_bound_at: str | None = None
     rental_evidence: str | None = None
     request_interruptible: bool | None = None
@@ -133,6 +144,11 @@ class OperatorReceipt:
 
     def __post_init__(self) -> None:
         _require(bool(_RUN_ID.fullmatch(self.run_id)), "OPERATOR_RECEIPT_RUN_ID_INVALID")
+        if self.attempt_id is not None:
+            _require(
+                bool(_RUN_ID.fullmatch(self.attempt_id)),
+                "OPERATOR_RECEIPT_ATTEMPT_ID_INVALID",
+            )
         _require(
             self.run_marker == f"atlaslens-phase3f-{self.run_id}",
             "OPERATOR_RECEIPT_MARKER_INVALID",
@@ -517,6 +533,7 @@ class OperatorReceipt:
         return {
             "schema": OPERATOR_RECEIPT_SCHEMA,
             "run_id": self.run_id,
+            "attempt_id": self.attempt_id,
             "run_marker": self.run_marker,
             "pod_id": self.pod_id,
             "pod_id_sha256": (
@@ -663,11 +680,13 @@ class OperatorReceipt:
         }
         schema = row.get("schema")
         is_legacy = schema == _LEGACY_OPERATOR_RECEIPT_SCHEMA
+        normalized_fields = set(row)
+        normalized_fields.discard("attempt_id")
         _require(
             (is_legacy and set(row) == legacy_expected)
             or (
                 schema == OPERATOR_RECEIPT_SCHEMA
-                and frozenset(row)
+                and frozenset(normalized_fields)
                 in {
                     frozenset(legacy_expected | evidence_fields),
                     frozenset(
@@ -689,6 +708,12 @@ class OperatorReceipt:
                 }
             ),
             "OPERATOR_RECEIPT_INVALID",
+        )
+        attempt_id = row.get("attempt_id") if not is_legacy else None
+        _require(
+            attempt_id is None
+            or (isinstance(attempt_id, str) and bool(_RUN_ID.fullmatch(attempt_id))),
+            "OPERATOR_RECEIPT_ATTEMPT_ID_INVALID",
         )
         pod_value = row.get("pod_id")
         _require(pod_value is None or isinstance(pod_value, str), "OPERATOR_RECEIPT_POD_ID_INVALID")
@@ -876,6 +901,7 @@ class OperatorReceipt:
         )
         return cls(
             run_id=_string(row.get("run_id"), "OPERATOR_RECEIPT_RUN_ID_INVALID"),
+            attempt_id=cast(str | None, attempt_id),
             run_marker=_string(row.get("run_marker"), "OPERATOR_RECEIPT_MARKER_INVALID"),
             pod_id=pod_id,
             supervisor_pid=cast(int, pid),
@@ -1095,6 +1121,8 @@ def write_operator_receipt(path: Path, receipt: OperatorReceipt) -> None:
 def process_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
+    if pid == os.getpid():
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1116,32 +1144,403 @@ def require_startable_receipt(
     receipt = read_operator_receipt(path)
     if receipt.cleanup_verified and receipt.stage in {"failed", "terminated"}:
         return
+    if receipt.stage in {"failed", "terminated"}:
+        raise Phase3FOperatorError("UNCLEAN_OPERATOR_RECEIPT_REQUIRES_TERMINATE")
     if is_process_running(receipt.supervisor_pid):
         raise Phase3FOperatorError("OPERATOR_PROCESS_ALREADY_RUNNING")
     raise Phase3FOperatorError("STALE_OPERATOR_RECEIPT_REQUIRES_TERMINATE")
 
 
-def archive_completed_operator_receipt(path: Path) -> Path | None:
+def _canonical_json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+
+
+def _receipt_bytes(path: Path) -> bytes:
+    _require(path.is_file() and not path.is_symlink(), "OPERATOR_RECEIPT_MISSING")
+    try:
+        size = path.stat().st_size
+        _require(0 < size <= _MAX_RECEIPT_BYTES, "OPERATOR_RECEIPT_INVALID")
+        return path.read_bytes()
+    except OSError as exc:
+        raise Phase3FOperatorError("OPERATOR_RECEIPT_INVALID") from exc
+
+
+def _receipt_semantic_sha256(receipt: OperatorReceipt) -> str:
+    return hashlib.sha256(_canonical_json_bytes(receipt.to_dict())).hexdigest()
+
+
+def operator_budget_linkage(receipt: OperatorReceipt) -> str:
+    if receipt.attempt_id is not None:
+        return f"attempt:{receipt.run_id}:{receipt.attempt_id}"
+    if receipt.pod_id is not None:
+        pod_hash = hashlib.sha256(receipt.pod_id.encode("utf-8")).hexdigest()
+        return f"pod:{pod_hash}"
+    return f"legacy:{receipt.run_id}:{_receipt_semantic_sha256(receipt)}"
+
+
+def _resolved_attempt_id(
+    receipt: OperatorReceipt,
+    semantic_sha256: str,
+) -> tuple[str, str]:
+    if receipt.attempt_id is not None:
+        return receipt.attempt_id, "explicit"
+    digest = hashlib.sha256(
+        f"atlaslens-phase3f-legacy-attempt-v1:{semantic_sha256}".encode("ascii")
+    ).hexdigest()
+    return digest[:32], "legacy_semantic_sha256"
+
+
+def _archive_entry(path: Path) -> dict[str, object]:
+    raw = _receipt_bytes(path)
+    receipt = read_operator_receipt(path)
+    content_sha256 = hashlib.sha256(raw).hexdigest()
+    semantic_sha256 = _receipt_semantic_sha256(receipt)
+    attempt_id, identity_source = _resolved_attempt_id(receipt, semantic_sha256)
+    classification = (
+        "terminal"
+        if receipt.stage in {"failed", "terminated"} and receipt.cleanup_verified
+        else "active"
+        if receipt.stage in {"preflight", "running"}
+        else "unclean"
+    )
+    return {
+        "archive_name": path.name,
+        "run_id": receipt.run_id,
+        "attempt_id": attempt_id,
+        "attempt_identity_source": identity_source,
+        "terminal_stage": receipt.stage,
+        "classification": classification,
+        "cleanup_verified": receipt.cleanup_verified,
+        "receipt_content_sha256": content_sha256,
+        "receipt_semantic_sha256": semantic_sha256,
+        "duplicate_group_sha256": semantic_sha256,
+        "budget_linkage": operator_budget_linkage(receipt),
+    }
+
+
+def _partial_receipts(operator_root: Path) -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    for parent in (operator_root, operator_root / "archive"):
+        if not parent.exists():
+            continue
+        _require(parent.is_dir() and not parent.is_symlink(), "OPERATOR_ARCHIVE_INVALID")
+        for path in parent.iterdir():
+            if not path.name.endswith((".partial", ".tmp")):
+                continue
+            _require(
+                bool(_PARTIAL_NAME.fullmatch(path.name))
+                and path.is_file()
+                and not path.is_symlink()
+                and path.stat().st_size <= _MAX_RECEIPT_BYTES,
+                "OPERATOR_ARCHIVE_PARTIAL_INVALID",
+            )
+            candidates.append(path)
+    return tuple(sorted(candidates, key=lambda item: str(item).casefold()))
+
+
+def reconcile_operator_archive_index(
+    operator_root: Path,
+    *,
+    write: bool = False,
+) -> dict[str, object]:
+    _require(not operator_root.is_symlink(), "OPERATOR_ARCHIVE_INVALID")
+    archive_root = operator_root / "archive"
+    if archive_root.exists():
+        _require(
+            archive_root.is_dir() and not archive_root.is_symlink(),
+            "OPERATOR_ARCHIVE_INVALID",
+        )
+        paths = tuple(sorted(archive_root.glob("*.json"), key=lambda item: item.name.casefold()))
+    else:
+        paths = ()
+        if write:
+            archive_root.mkdir(parents=True, exist_ok=True)
+    _require(len(paths) <= 10_000, "OPERATOR_ARCHIVE_CAP_EXCEEDED")
+    folded_names: set[str] = set()
+    entries: list[dict[str, object]] = []
+    for path in paths:
+        folded = path.name.casefold()
+        _require(folded not in folded_names, "OPERATOR_ARCHIVE_CASE_CONFLICT")
+        folded_names.add(folded)
+        entry = _archive_entry(path)
+        legacy_match = _LEGACY_ARCHIVE_NAME.fullmatch(path.name)
+        current_match = _ARCHIVE_NAME.fullmatch(path.name)
+        _require(
+            legacy_match is not None or current_match is not None,
+            "OPERATOR_ARCHIVE_NAME_INVALID",
+        )
+        if legacy_match is not None:
+            _require(
+                path.stem == entry["run_id"],
+                "OPERATOR_ARCHIVE_NAME_MISMATCH",
+            )
+        else:
+            _require(current_match is not None, "OPERATOR_ARCHIVE_NAME_INVALID")
+            match = cast(re.Match[str], current_match)
+            _require(
+                match.group("run_id") == entry["run_id"]
+                and match.group("attempt_id") == entry["attempt_id"]
+                and match.group("stage") == entry["terminal_stage"]
+                and cast(str, entry["receipt_content_sha256"]).startswith(
+                    match.group("sha256")
+                ),
+                "OPERATOR_ARCHIVE_NAME_MISMATCH",
+            )
+        entries.append(entry)
+
+    entries.sort(
+        key=lambda item: (
+            cast(str, item["run_id"]),
+            cast(str, item["attempt_id"]),
+            cast(str, item["receipt_content_sha256"]),
+            cast(str, item["archive_name"]).casefold(),
+        )
+    )
+    duplicate_sizes: dict[str, int] = {}
+    for entry in entries:
+        group = cast(str, entry["duplicate_group_sha256"])
+        duplicate_sizes[group] = duplicate_sizes.get(group, 0) + 1
+    previous = "0" * 64
+    chained_entries: list[dict[str, object]] = []
+    for entry in entries:
+        chained = {**entry, "previous_entry_sha256": previous}
+        entry_sha256 = hashlib.sha256(_canonical_json_bytes(chained)).hexdigest()
+        chained["entry_sha256"] = entry_sha256
+        chained_entries.append(chained)
+        previous = entry_sha256
+    partials = _partial_receipts(operator_root)
+    document_base: dict[str, object] = {
+        "schema": _ARCHIVE_INDEX_SCHEMA,
+        "entries": chained_entries,
+        "chain_head_sha256": previous,
+        "archive_receipt_count": len(entries),
+        "legacy_attempt_count": sum(
+            entry["attempt_identity_source"] == "legacy_semantic_sha256"
+            for entry in entries
+        ),
+        "duplicate_group_count": sum(size > 1 for size in duplicate_sizes.values()),
+        "duplicate_receipt_count": sum(max(0, size - 1) for size in duplicate_sizes.values()),
+        "active_receipt_count": sum(entry["classification"] == "active" for entry in entries),
+        "unclean_receipt_count": sum(entry["classification"] == "unclean" for entry in entries),
+        "partial_file_count": len(partials),
+        "archive_conflicts": 0,
+        "secret_values_included": False,
+    }
+    document = {
+        **document_base,
+        "index_sha256": hashlib.sha256(_canonical_json_bytes(document_base)).hexdigest(),
+    }
+    if write:
+        index_path = operator_root / "archive-index.json"
+        payload = _canonical_json_bytes(document)
+        try:
+            operator_root.mkdir(parents=True, exist_ok=True)
+            if index_path.exists():
+                _require(not index_path.is_symlink(), "OPERATOR_ARCHIVE_INDEX_INVALID")
+                if index_path.read_bytes() == payload:
+                    return document
+            temporary = index_path.with_name(
+                f".{index_path.name}.{uuid4().hex}.partial"
+            )
+            temporary.write_bytes(payload)
+            try:
+                os.chmod(temporary, 0o600)
+                os.replace(temporary, index_path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+        except OSError as exc:
+            raise Phase3FOperatorError("OPERATOR_ARCHIVE_INDEX_WRITE_FAILED") from exc
+    return document
+
+
+def _lock_state(
+    lock_path: Path,
+    *,
+    is_process_running: Callable[[int], bool],
+) -> str:
+    try:
+        lock_stat = lock_path.lstat()
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        raise Phase3FOperatorError("OPERATOR_ARCHIVE_LOCK_INVALID") from exc
+    _require(stat.S_ISREG(lock_stat.st_mode), "OPERATOR_ARCHIVE_LOCK_INVALID")
+    try:
+        raw = lock_path.read_bytes()
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        try:
+            age_seconds = time.time() - lock_path.stat().st_mtime
+        except FileNotFoundError:
+            return "absent"
+        return "initializing" if age_seconds < 5 else "invalid"
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema") != "atlaslens-phase3f-operator-archive-lock-v1"
+        or not isinstance(value.get("pid"), int)
+        or isinstance(value.get("pid"), bool)
+        or not isinstance(value.get("nonce"), str)
+        or not _RUN_ID.fullmatch(cast(str, value.get("nonce")))
+    ):
+        return "invalid"
+    return "active" if is_process_running(cast(int, value["pid"])) else "stale"
+
+
+@contextmanager
+def operator_lifecycle_lock(
+    operator_root: Path,
+    *,
+    is_process_running: Callable[[int], bool] = process_is_running,
+) -> Iterator[None]:
+    _require(not operator_root.is_symlink(), "OPERATOR_ARCHIVE_INVALID")
+    operator_root.mkdir(parents=True, exist_ok=True)
+    lock_path = operator_root / ".archive.lock"
+    nonce = uuid4().hex
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except (FileExistsError, PermissionError) as exc:
+            state = _lock_state(lock_path, is_process_running=is_process_running)
+            if state == "absent":
+                if isinstance(exc, PermissionError) and time.monotonic() >= deadline:
+                    raise Phase3FOperatorError("OPERATOR_ARCHIVE_LOCK_FAILED") from exc
+                time.sleep(0.01)
+                continue
+            if state == "stale":
+                with suppress(FileNotFoundError):
+                    lock_path.unlink()
+                continue
+            if state == "invalid":
+                raise Phase3FOperatorError("OPERATOR_ARCHIVE_LOCK_INVALID") from None
+            if time.monotonic() >= deadline:
+                raise Phase3FOperatorError("OPERATOR_ARCHIVE_LOCK_ACTIVE") from None
+            time.sleep(0.01)
+            continue
+        except OSError as exc:
+            raise Phase3FOperatorError("OPERATOR_ARCHIVE_LOCK_FAILED") from exc
+        try:
+            payload = _canonical_json_bytes(
+                {
+                    "schema": "atlaslens-phase3f-operator-archive-lock-v1",
+                    "pid": os.getpid(),
+                    "nonce": nonce,
+                }
+            )
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        break
+    try:
+        yield
+    finally:
+        release_deadline = time.monotonic() + 1
+        while True:
+            try:
+                row = json.loads(lock_path.read_bytes())
+                if not isinstance(row, Mapping) or not hmac.compare_digest(
+                    str(row.get("nonce", "")), nonce
+                ):
+                    break
+                lock_path.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                if time.monotonic() >= release_deadline:
+                    raise Phase3FOperatorError(
+                        "OPERATOR_ARCHIVE_LOCK_RELEASE_FAILED"
+                    ) from exc
+                time.sleep(0.01)
+
+
+def _archive_completed_locked(path: Path) -> Path | None:
     if not path.exists():
+        reconcile_operator_archive_index(path.parent, write=True)
         return None
+    raw = _receipt_bytes(path)
     receipt = read_operator_receipt(path)
     _require(
         receipt.cleanup_verified and receipt.stage in {"failed", "terminated"},
         "ACTIVE_OPERATOR_RECEIPT_NOT_ARCHIVABLE",
     )
-    archive_path = path.parent / "archive" / f"{receipt.run_id}.json"
-    if archive_path.exists():
-        _require(
-            read_operator_receipt(archive_path) == receipt,
-            "OPERATOR_RECEIPT_ARCHIVE_CONFLICT",
+    content_sha256 = hashlib.sha256(raw).hexdigest()
+    semantic_sha256 = _receipt_semantic_sha256(receipt)
+    attempt_id, _source = _resolved_attempt_id(receipt, semantic_sha256)
+    archive_root = path.parent / "archive"
+    _require(not archive_root.is_symlink(), "OPERATOR_ARCHIVE_INVALID")
+    archive_root.mkdir(parents=True, exist_ok=True)
+    destination: Path | None = None
+    for prefix_length in (16, 24, 32, 64):
+        candidate = archive_root / (
+            f"{receipt.run_id}-{attempt_id}-{receipt.stage}-"
+            f"{content_sha256[:prefix_length]}.json"
         )
-    else:
-        write_operator_receipt(archive_path, receipt)
+        if not candidate.exists():
+            destination = candidate
+            break
+        _require(candidate.is_file() and not candidate.is_symlink(), "OPERATOR_ARCHIVE_INVALID")
+        if candidate.read_bytes() == raw:
+            destination = candidate
+            break
+    _require(destination is not None, "OPERATOR_RECEIPT_CONTENT_HASH_COLLISION")
+    target = cast(Path, destination)
     try:
-        path.unlink()
+        if target.exists():
+            path.unlink()
+        else:
+            os.replace(path, target)
     except OSError as exc:
         raise Phase3FOperatorError("OPERATOR_RECEIPT_ARCHIVE_FAILED") from exc
-    return archive_path
+    reconcile_operator_archive_index(path.parent, write=True)
+    return target
+
+
+def archive_completed_operator_receipt(path: Path) -> Path | None:
+    with operator_lifecycle_lock(path.parent):
+        return _archive_completed_locked(path)
+
+
+def prepare_operator_attempt(
+    path: Path,
+    receipt: OperatorReceipt,
+    *,
+    is_process_running: Callable[[int], bool] = process_is_running,
+) -> Path | None:
+    _require(
+        receipt.attempt_id is not None
+        and receipt.stage == "preflight"
+        and receipt.pod_id is None
+        and receipt.cleanup_verified is False,
+        "OPERATOR_ATTEMPT_RECEIPT_INVALID",
+    )
+    with operator_lifecycle_lock(path.parent, is_process_running=is_process_running):
+        require_startable_receipt(path, is_process_running=is_process_running)
+        archived = _archive_completed_locked(path)
+        _require(not path.exists(), "OPERATOR_CURRENT_RECEIPT_CONFLICT")
+        index = reconcile_operator_archive_index(path.parent, write=True)
+        _require(
+            index["active_receipt_count"] == 0
+            and index["unclean_receipt_count"] == 0
+            and index["archive_conflicts"] == 0,
+            "OPERATOR_ARCHIVE_NOT_STARTABLE",
+        )
+        write_operator_receipt(path, receipt)
+        confirmed = read_operator_receipt(path)
+        _require(
+            confirmed.attempt_id is not None
+            and hmac.compare_digest(confirmed.attempt_id, cast(str, receipt.attempt_id))
+            and hmac.compare_digest(confirmed.run_id, receipt.run_id)
+            and confirmed.stage == "preflight"
+            and confirmed.pod_id is None,
+            "OPERATOR_ATTEMPT_RECEIPT_NOT_CONFIRMED",
+        )
+        return archived
 
 
 @dataclass(frozen=True, slots=True)
@@ -1252,8 +1651,12 @@ __all__ = [
     "Phase3FOperatorError",
     "archive_completed_operator_receipt",
     "inspect_operator_inventory",
+    "operator_budget_linkage",
+    "operator_lifecycle_lock",
+    "prepare_operator_attempt",
     "process_is_running",
     "read_operator_receipt",
+    "reconcile_operator_archive_index",
     "require_startable_receipt",
     "terminate_receipt_bound_pod",
     "write_operator_receipt",

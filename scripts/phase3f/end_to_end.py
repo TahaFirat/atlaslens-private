@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import cast
 
@@ -248,7 +252,7 @@ def readiness(repository: Path, runtime_root: Path) -> dict[str, object]:
     source = repository.resolve() / "services" / "api" / "src"
     _require(source.is_dir() and not source.is_symlink(), "PHASE3F_SOURCE_ROOT_INVALID")
     sys.path.insert(0, str(source))
-    from atlaslens_api.phase3f.training import (  # type: ignore[import-untyped] # noqa: PLC0415
+    from atlaslens_api.phase3f.training import (  # noqa: PLC0415
         require_training_ready,
     )
 
@@ -272,6 +276,22 @@ def readiness(repository: Path, runtime_root: Path) -> dict[str, object]:
         "cloud_mutations": 0,
         "secrets_included": False,
     }
+
+
+def _process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _cloud_training_phase(cloud_runtime: Path, run_id: str) -> str:
@@ -309,6 +329,23 @@ def _cloud_training_phase(cloud_runtime: Path, run_id: str) -> str:
                     "ACTIVE_CLOUD_RUN_CONFLICT",
                     artifact="phase3f-current.json",
                     field="run_id",
+                )
+            supervisor_pid = operator.get("supervisor_pid")
+            if (
+                isinstance(supervisor_pid, bool)
+                or not isinstance(supervisor_pid, int)
+                or supervisor_pid <= 0
+            ):
+                raise EndToEndError(
+                    "CLOUD_OPERATOR_STATE_INVALID",
+                    artifact="phase3f-current.json",
+                    field="supervisor_pid",
+                )
+            if not _process_is_running(supervisor_pid):
+                raise EndToEndError(
+                    "STALE_OPERATOR_RECEIPT_REQUIRES_TERMINATE",
+                    artifact="phase3f-current.json",
+                    field="supervisor_pid",
                 )
             return "training_running"
 
@@ -360,7 +397,7 @@ def resume_plan(
     source = repository.resolve() / "services" / "api" / "src"
     _require(source.is_dir() and not source.is_symlink(), "PHASE3F_SOURCE_ROOT_INVALID")
     sys.path.insert(0, str(source))
-    from atlaslens_api.phase3f.local_first import (  # type: ignore[import-untyped] # noqa: PLC0415
+    from atlaslens_api.phase3f.local_first import (  # noqa: PLC0415
         verify_sealed_acquisition,
     )
     from atlaslens_api.phase3f.training import (  # noqa: PLC0415
@@ -557,6 +594,316 @@ def resume_plan(
     }
 
 
+def _budget_decimal(value: object) -> Decimal:
+    if isinstance(value, bool):
+        raise EndToEndError("CLOUD_PLAN_BUDGET_RECEIPT_INVALID")
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise EndToEndError("CLOUD_PLAN_BUDGET_RECEIPT_INVALID") from exc
+    _require(parsed.is_finite() and parsed >= 0, "CLOUD_PLAN_BUDGET_RECEIPT_INVALID")
+    return parsed
+
+
+def _receipt_source_snapshot(cloud_runtime: Path) -> tuple[int, str, tuple[str, ...]]:
+    paths: list[Path] = []
+    supervisor_root = cloud_runtime / "_receipts"
+    if supervisor_root.exists():
+        _require(
+            supervisor_root.is_dir() and not supervisor_root.is_symlink(),
+            "CLOUD_PLAN_RECEIPT_STATE_INVALID",
+        )
+        paths.extend(sorted(supervisor_root.glob("*.json")))
+    operator_root = cloud_runtime / "_operator"
+    current = operator_root / "phase3f-current.json"
+    if current.exists():
+        paths.append(current)
+    archive = operator_root / "archive"
+    if archive.exists():
+        _require(
+            archive.is_dir() and not archive.is_symlink(),
+            "CLOUD_PLAN_RECEIPT_STATE_INVALID",
+        )
+        paths.extend(sorted(archive.glob("*.json")))
+    _require(len(paths) <= 10_000, "CLOUD_PLAN_RECEIPT_STATE_INVALID")
+    hashes: list[str] = []
+    for path in paths:
+        _require(
+            path.is_file()
+            and not path.is_symlink()
+            and 0 < path.stat().st_size <= 1024 * 1024,
+            "CLOUD_PLAN_RECEIPT_STATE_INVALID",
+        )
+        hashes.append(hashlib.sha256(path.read_bytes()).hexdigest())
+    ordered = tuple(sorted(hashes))
+    digest = hashlib.sha256(
+        json.dumps(ordered, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return len(ordered), digest, ordered
+
+
+def _source_snapshot_matches(
+    hashes: tuple[str, ...],
+    *,
+    expected_count: object,
+    expected_sha256: object,
+) -> bool:
+    if (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or not isinstance(expected_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        or expected_count < 0
+    ):
+        return False
+    if len(hashes) == expected_count:
+        return hashlib.sha256(
+            json.dumps(hashes, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest() == expected_sha256
+    if len(hashes) != expected_count + 1 or len(hashes) > 256:
+        return False
+    for index in range(len(hashes)):
+        prior = hashes[:index] + hashes[index + 1 :]
+        digest = hashlib.sha256(
+            json.dumps(prior, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        if digest == expected_sha256:
+            return True
+    return False
+
+
+def _latest_budget_snapshot(cloud_runtime: Path, run_id: str) -> dict[str, object]:
+    root = cloud_runtime / "_budget" / "reconciliations"
+    _require(root.is_dir() and not root.is_symlink(), "CLOUD_PLAN_BUDGET_RECEIPT_MISSING")
+    candidates: list[tuple[datetime, Path, dict[str, object]]] = []
+    for path in sorted(root.glob("*.json")):
+        row = _integrity_json(
+            path,
+            artifact="budget-reconciliation.json",
+            missing_code="CLOUD_PLAN_BUDGET_RECEIPT_MISSING",
+            invalid_code="CLOUD_PLAN_BUDGET_RECEIPT_INVALID",
+            max_bytes=1024 * 1024,
+        )
+        timestamp_value = row.get("reconciled_at")
+        _require(isinstance(timestamp_value, str), "CLOUD_PLAN_BUDGET_RECEIPT_INVALID")
+        timestamp = cast(str, timestamp_value)
+        try:
+            parsed = datetime.fromisoformat(timestamp)
+        except ValueError as exc:
+            raise EndToEndError("CLOUD_PLAN_BUDGET_RECEIPT_INVALID") from exc
+        _require(
+            parsed.tzinfo is not None and parsed.utcoffset() is not None,
+            "CLOUD_PLAN_BUDGET_RECEIPT_INVALID",
+        )
+        candidates.append((parsed.astimezone(UTC), path, row))
+    _require(bool(candidates), "CLOUD_PLAN_BUDGET_RECEIPT_MISSING")
+    _timestamp, path, row = max(candidates, key=lambda item: (item[0], item[1].name))
+    receipt_id = row.get("receipt_id")
+    receipt_sha256 = row.get("receipt_sha256")
+    _require(
+        row.get("schema") == "atlaslens-phase3f-budget-reconciliation-v1"
+        and isinstance(receipt_id, str)
+        and bool(_RUN_ID.fullmatch(receipt_id))
+        and path.stem == receipt_id
+        and isinstance(receipt_sha256, str)
+        and bool(re.fullmatch(r"[0-9a-f]{64}", receipt_sha256)),
+        "CLOUD_PLAN_BUDGET_RECEIPT_INVALID",
+    )
+    receipt_base = {
+        key: value
+        for key, value in row.items()
+        if key not in {"receipt_id", "receipt_sha256"}
+    }
+    computed = hashlib.sha256(
+        json.dumps(receipt_base, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    expected_run_hash = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    source_count, _source_sha256, source_hashes = _receipt_source_snapshot(cloud_runtime)
+    snapshot_source_count = row.get("source_receipt_count")
+    snapshot_source_sha256 = row.get("source_receipts_sha256")
+    inventory = row.get("inventory")
+    _require(
+        computed == receipt_sha256
+        and receipt_id == computed[:32]
+        and row.get("run_id_sha256") == expected_run_hash
+        and inventory
+        == {"pods": 0, "endpoints": 0, "network_volumes": 0, "templates": 0}
+        and row.get("cloud_mutations") == 0
+        and row.get("secret_values_included") is False
+        and row.get("provider_response_body_included") is False
+        and row.get("unrecognized_active_billing") is False
+        and _source_snapshot_matches(
+            source_hashes,
+            expected_count=snapshot_source_count,
+            expected_sha256=snapshot_source_sha256,
+        ),
+        "CLOUD_PLAN_BUDGET_RECEIPT_INVALID",
+    )
+    actual = _budget_decimal(row.get("actual_billed_usd"))
+    active = _budget_decimal(row.get("active_exposure_usd"))
+    unbilled = _budget_decimal(row.get("conservative_unbilled_estimate_usd"))
+    proposed = _budget_decimal(row.get("proposed_run_max_usd"))
+    remaining = _budget_decimal(row.get("remaining_authorized_usd"))
+    _require(
+        active == 0 and unbilled == 0 and proposed <= remaining,
+        "CLOUD_PLAN_BUDGET_BLOCKED",
+    )
+    return {
+        "receipt_id": receipt_id,
+        "actual_billed_usd": str(actual),
+        "active_exposure_usd": str(active),
+        "conservative_unbilled_estimate_usd": str(unbilled),
+        "proposed_run_max_usd": str(proposed),
+        "remaining_authorized_usd": str(remaining),
+        "source_receipt_count": snapshot_source_count,
+        "current_source_receipt_count": source_count,
+        "post_snapshot_receipt_count": source_count - cast(int, snapshot_source_count),
+        "duplicate_billing_record_count": row.get("duplicate_billing_record_count"),
+    }
+
+
+def cloud_plan(
+    repository: Path,
+    runtime_root: Path,
+    cloud_runtime: Path,
+) -> dict[str, object]:
+    local = resume_plan(repository, runtime_root, cloud_runtime)
+    _require(
+        local.get("acquisition_required") is False
+        and local.get("mapillary_required") is False,
+        "CLOUD_PLAN_DATASET_NOT_READY",
+    )
+    run_id = cast(str, local["run_id"])
+    source = repository.resolve() / "services" / "api" / "src"
+    if str(source) not in sys.path:
+        sys.path.insert(0, str(source))
+    from atlaslens_api.phase3f.operator import (  # noqa: PLC0415
+        OperatorReceipt,
+        Phase3FOperatorError,
+        prepare_operator_attempt,
+        read_operator_receipt,
+        reconcile_operator_archive_index,
+    )
+
+    real_operator_root = cloud_runtime / "_operator"
+    current_path = real_operator_root / "phase3f-current.json"
+    active_local_receipts = 0
+    unclean_local_receipts = 0
+    if current_path.exists():
+        current = read_operator_receipt(current_path)
+        active_local_receipts = int(current.stage in {"preflight", "running"})
+        unclean_local_receipts = int(
+            not current.cleanup_verified
+            and current.stage in {"failed", "terminated"}
+        )
+    initial_index = reconcile_operator_archive_index(real_operator_root, write=False)
+    active_local_receipts += cast(int, initial_index["active_receipt_count"])
+    unclean_local_receipts += cast(int, initial_index["unclean_receipt_count"])
+    local_blockers: list[str] = (
+        ["TRAINING_ALREADY_COMPLETED"]
+        if local.get("next_phase") == "training_completed"
+        else []
+    )
+    simulated_index = initial_index
+    attempt_id_ready = False
+    lock_released = False
+    with tempfile.TemporaryDirectory(prefix="atlaslens-phase3f-cloud-plan-") as temporary:
+        simulated_root = Path(temporary) / "_operator"
+        if real_operator_root.exists():
+            _require(
+                real_operator_root.is_dir() and not real_operator_root.is_symlink(),
+                "CLOUD_PLAN_RECEIPT_STATE_INVALID",
+            )
+            shutil.copytree(real_operator_root, simulated_root, symlinks=True)
+        else:
+            simulated_root.mkdir(parents=True)
+        simulated_current = simulated_root / "phase3f-current.json"
+        seed = hashlib.sha256(
+            (
+                "atlaslens-phase3f-cloud-plan-attempt-v1:"
+                + run_id
+                + ":"
+                + cast(str, initial_index["chain_head_sha256"])
+                + ":"
+                + cast(str, local["readiness_sha256"])
+            ).encode("ascii")
+        ).hexdigest()
+        simulated_receipt = OperatorReceipt(
+            run_id=run_id,
+            attempt_id=seed[:32],
+            run_marker=f"atlaslens-phase3f-{run_id}",
+            pod_id=None,
+            supervisor_pid=os.getpid(),
+            stage="preflight",
+            started_at="1970-01-01T00:00:00+00:00",
+            finished_at=None,
+            max_spend_usd=Decimal("3"),
+            soft_stop_usd=Decimal("2.95"),
+            hard_stop_usd=Decimal("2.99"),
+            max_gpu_hourly_usd=Decimal("0.50"),
+            max_wall_minutes=345,
+            cleanup_verified=False,
+        )
+        try:
+            prepare_operator_attempt(
+                simulated_current,
+                simulated_receipt,
+            )
+            confirmed = read_operator_receipt(simulated_current)
+            attempt_id_ready = confirmed.attempt_id == simulated_receipt.attempt_id
+            simulated_index = reconcile_operator_archive_index(
+                simulated_root,
+                write=False,
+            )
+            lock_released = not (simulated_root / ".archive.lock").exists()
+        except Phase3FOperatorError as exc:
+            local_blockers.append(exc.code)
+
+    local_blockers.extend(
+        code
+        for condition, code in (
+            (active_local_receipts > 0, "ACTIVE_LOCAL_OPERATOR_RECEIPT"),
+            (unclean_local_receipts > 0, "UNCLEAN_LOCAL_OPERATOR_RECEIPT"),
+            (not attempt_id_ready, "ATTEMPT_ID_NOT_READY"),
+            (not lock_released, "OPERATOR_LOCK_NOT_RELEASED"),
+        )
+        if condition and code not in local_blockers
+    )
+    archive_conflicts = cast(int, simulated_index["archive_conflicts"])
+    if archive_conflicts and "OPERATOR_ARCHIVE_CONFLICT" not in local_blockers:
+        local_blockers.append("OPERATOR_ARCHIVE_CONFLICT")
+    budget = None if local_blockers else _latest_budget_snapshot(cloud_runtime, run_id)
+    ready = not local_blockers
+    return {
+        "schema": "atlaslens-phase3f-cloud-plan-v1",
+        "action": "cloud-plan",
+        "run_id": run_id,
+        "ready_for_live_inventory": ready,
+        "ready_for_create_after_live_gates": ready,
+        "live_inventory_required": True,
+        "local_blockers": local_blockers,
+        "archive_conflicts": archive_conflicts,
+        "active_local_receipts": active_local_receipts,
+        "unclean_local_receipts": unclean_local_receipts,
+        "dataset_asset_count": local["asset_count"],
+        "readiness_sha256": local["readiness_sha256"],
+        "sealed_assets_sha256": local["sealed_assets_sha256"],
+        "archive_receipt_count": simulated_index["archive_receipt_count"],
+        "legacy_attempt_count": simulated_index["legacy_attempt_count"],
+        "duplicate_group_count": simulated_index["duplicate_group_count"],
+        "duplicate_receipt_count": simulated_index["duplicate_receipt_count"],
+        "recoverable_partial_file_count": simulated_index["partial_file_count"],
+        "attempt_id_ready": attempt_id_ready,
+        "operator_lock_released": lock_released,
+        "budget_snapshot": budget,
+        "dataset_write_count": 0,
+        "secret_prompt_count": 0,
+        "runpod_api_calls": 0,
+        "cloud_mutations": 0,
+        "secrets_included": False,
+    }
+
+
 def status(repository: Path, local_runtime: Path, cloud_runtime: Path) -> dict[str, object]:
     source = repository.resolve() / "services" / "api" / "src"
     _require(source.is_dir(), "PHASE3F_SOURCE_ROOT_INVALID")
@@ -593,7 +940,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="atlaslens-phase3f-end-to-end")
     parser.add_argument(
         "action",
-        choices=("preflight", "readiness", "resume-plan", "status"),
+        choices=("preflight", "readiness", "resume-plan", "cloud-plan", "status"),
     )
     parser.add_argument("--repository-root", type=Path, required=True)
     parser.add_argument("--runtime-root", type=Path, required=True)
@@ -611,6 +958,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "resume-plan":
             _require(args.cloud_runtime_root is not None, "CLOUD_RUNTIME_ROOT_MISSING")
             result = resume_plan(
+                args.repository_root,
+                args.runtime_root,
+                args.cloud_runtime_root,
+            )
+        elif args.action == "cloud-plan":
+            _require(args.cloud_runtime_root is not None, "CLOUD_RUNTIME_ROOT_MISSING")
+            result = cloud_plan(
                 args.repository_root,
                 args.runtime_root,
                 args.cloud_runtime_root,

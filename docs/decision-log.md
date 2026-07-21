@@ -1,5 +1,42 @@
 # Decision log
 
+## 2026-07-21 - Phase 3F archives cloud lifecycle attempts independently
+
+- Context: A second terminated, cleanup-verified lifecycle for the same sealed
+  dataset run reached budget reconciliation, then collided with the first
+  lifecycle because the operator archive destination was only `<run_id>.json`.
+  The two receipts were neither byte-identical nor semantically identical; the
+  dataset run ID therefore could not also serve as a lifecycle-attempt identity.
+- Decision: Keep `run_id` as the dataset/training identity and generate a fresh
+  immutable 32-hex `attempt_id` before every cloud lifecycle. Atomically create
+  the current receipt under a PID/nonce lock before create, bind the create
+  idempotency key and every callback to that attempt, and archive terminal
+  receipts as run, attempt, terminal stage, and content-SHA-prefix names. Build
+  an atomic deterministic hash-chained index without rewriting legacy receipts;
+  legacy attempt identities derive from canonical receipt content. De-duplicate
+  budget evidence by explicit attempt, then legacy Pod or semantic identity.
+  `CloudPlan` validates the sealed dataset and sanitized budget snapshot and
+  simulates archive/index/lock/current-receipt transitions only in a temporary
+  copy before the RunPod secret can be requested. A reconciliation snapshot may
+  precede its attempt receipt by exactly one receipt only when the preserved
+  source subset still reproduces its recorded count and SHA-256.
+- Alternatives: Overwrite the run-named receipt; clear archive or budget
+  history; append timestamps; reuse the dataset run ID as a create idempotency
+  key; or discover each local blocker during successive paid Resume attempts.
+- Consequences: One dataset run supports multiple immutable attempts while only
+  one attempt may be active. Clean terminal receipts no longer block a retry;
+  active, stale, cleanup-unverified, invalid-lock, and invalid-archive states
+  remain typed blockers. Byte-identical retries are idempotent, semantic legacy
+  duplicates remain preserved and indexed, content-prefix collisions extend the
+  immutable name, and Windows lock/release races are bounded. A local failure
+  after current-receipt creation but before create entry is cleanup-verified;
+  once create is entered, real receipt-bound termination and restored inventory
+  remain mandatory. Resume treats active stages as running only while their
+  supervisor PID is live; a dead PID is a typed stale-receipt blocker before any
+  cloud secret. Operator blockers take precedence over budget-snapshot absence.
+  No budget limit or receipt history is reset.
+- Target phase: Product Phase 3F bounded private fine-tuning only.
+
 ## 2026-07-21 - Phase 3F distinguishes the receipt-bound Pod from independent inventory
 
 - Context: Post-create allocation attestation accepted only one account Pod, but

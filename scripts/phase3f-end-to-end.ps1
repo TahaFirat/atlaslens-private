@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Preflight", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
+    [ValidateSet("Preflight", "CloudPlan", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
     [string]$Action,
     [ValidateNotNullOrEmpty()]
     [string]$RuntimeRoot = "D:\AtlasLensRuntime\phase3f-local",
@@ -135,7 +135,7 @@ function Invoke-Control {
         "--repository-root", $repoRoot,
         "--runtime-root", $resolvedRuntime
     )
-    if ($ControlAction -in @("resume-plan", "status")) {
+    if ($ControlAction -in @("resume-plan", "cloud-plan", "status")) {
         $arguments += @("--cloud-runtime-root", $resolvedCloudRuntime)
     }
     $controlOutput = @(& $resolvedPython @arguments)
@@ -248,6 +248,9 @@ switch ($Action) {
     "Status" {
         Invoke-Control -ControlAction "status"
     }
+    "CloudPlan" {
+        Invoke-Control -ControlAction "cloud-plan"
+    }
     { $_ -in @("Execute", "Resume") } {
         $null = Invoke-Control -ControlAction "preflight"
         $currentPath = Join-Path $resolvedRuntime "current.json"
@@ -294,6 +297,22 @@ switch ($Action) {
             [string]$plan.next_phase -ne "cloud_inventory"
         ) {
             throw "PHASE3F_RESUME_PLAN_INVALID"
+        }
+        $cloudPlanOutput = @(Invoke-Control -ControlAction "cloud-plan")
+        $cloudPlan = Convert-ControlResult `
+            -ControlOutput $cloudPlanOutput `
+            -ExpectedAction "cloud-plan"
+        if (
+            $cloudPlan.ready_for_live_inventory -ne $true -or
+            $cloudPlan.ready_for_create_after_live_gates -ne $true -or
+            @($cloudPlan.local_blockers).Count -ne 0 -or
+            [int]$cloudPlan.archive_conflicts -ne 0 -or
+            [int]$cloudPlan.active_local_receipts -ne 0 -or
+            [int]$cloudPlan.unclean_local_receipts -ne 0 -or
+            [int]$cloudPlan.cloud_mutations -ne 0 -or
+            [int]$cloudPlan.runpod_api_calls -ne 0
+        ) {
+            throw "PHASE3F_CLOUD_PLAN_BLOCKED"
         }
         $runId = [string]$plan.run_id
         $sealedRoot = Join-Path (Join-Path $resolvedRuntime $runId) "sealed-acquisition"

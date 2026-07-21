@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import os
 import subprocess
 from decimal import Decimal
 from pathlib import Path
@@ -150,12 +151,14 @@ def _closed_operator_receipt(
     *,
     run_id: str,
     pod_id: str,
+    attempt_id: str | None = None,
     max_spend_usd: str = "3",
     duration_seconds: int = 120,
     cleanup_verified: bool = True,
 ) -> object:
     return module.OperatorReceipt(
         run_id=run_id,
+        attempt_id=attempt_id,
         run_marker=f"atlaslens-phase3f-{run_id}",
         pod_id=pod_id,
         supervisor_pid=1234,
@@ -169,6 +172,49 @@ def _closed_operator_receipt(
         max_wall_minutes=345,
         cleanup_verified=cleanup_verified,
     )
+
+
+def _write_budget_snapshot(cloud: Path, *, run_id: str) -> Path:
+    source_paths = list((cloud / "_operator" / "archive").glob("*.json"))
+    current = cloud / "_operator" / "phase3f-current.json"
+    if current.exists():
+        source_paths.append(current)
+    source_hashes = sorted(
+        hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths
+    )
+    source_sha256 = hashlib.sha256(
+        json.dumps(source_hashes, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    base = {
+        "schema": "atlaslens-phase3f-budget-reconciliation-v1",
+        "reconciled_at": "2026-07-21T12:00:00+00:00",
+        "run_id_sha256": hashlib.sha256(run_id.encode()).hexdigest(),
+        "actual_billed_usd": "0.8379813398",
+        "active_exposure_usd": "0",
+        "conservative_unbilled_estimate_usd": "0",
+        "proposed_run_max_usd": "3",
+        "remaining_authorized_usd": "9.1620186602",
+        "inventory": {"pods": 0, "endpoints": 0, "network_volumes": 0, "templates": 0},
+        "cloud_mutations": 0,
+        "secret_values_included": False,
+        "provider_response_body_included": False,
+        "unrecognized_active_billing": False,
+        "source_receipt_count": len(source_hashes),
+        "source_receipts_sha256": source_sha256,
+        "duplicate_billing_record_count": 0,
+    }
+    receipt_sha256 = hashlib.sha256(
+        json.dumps(base, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    document = {
+        **base,
+        "receipt_id": receipt_sha256[:32],
+        "receipt_sha256": receipt_sha256,
+    }
+    path = cloud / "_budget" / "reconciliations" / f"{receipt_sha256[:32]}.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(_canonical_bytes(document))
+    return path
 
 
 def _asset(index: int, *, sequence: str, city: str = "Ankara") -> SplitAsset:
@@ -354,9 +400,17 @@ def test_training_and_operator_contracts_are_real_and_secret_safe() -> None:
         execute_source.index("_require_e2e_budget")
     )
     assert execute_source.index("_require_e2e_budget") < execute_source.index(
-        "archive_completed_operator_receipt"
+        "prepare_operator_attempt"
     )
     assert execute_source.index("_require_e2e_budget") < execute_source.index("ssh-keygen")
+    assert execute_source.index("prepare_operator_attempt") < execute_source.index(
+        "session.execute"
+    )
+    assert execute_source.index("create_entered = True") < execute_source.index(
+        "session.execute"
+    )
+    assert "not create_entered" in execute_source
+    assert 'idempotency_key=f"atlaslens-phase3f-create-{attempt_id}"' in execute_source
     assert execute_source.index("prepare_transfer_bundle") < execute_source.index(
         "select_gpu_offer"
     )
@@ -364,6 +418,7 @@ def test_training_and_operator_contracts_are_real_and_secret_safe() -> None:
     assert "automatic_promotion_performed" in job_source
     for action in (
         "Preflight",
+        "CloudPlan",
         "Execute",
         "Status",
         "Resume",
@@ -444,6 +499,146 @@ def test_repeated_sealed_resume_keeps_hash_and_state_unchanged(
     assert first == second
     assert before == middle == _tree_sha256(runtime)
     assert first["acquisition_required"] is False
+
+
+def test_cloud_plan_simulates_all_local_gates_without_runtime_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _load_control()
+    supervisor = _load_supervisor()
+    runtime = tmp_path / "runtime"
+    cloud = tmp_path / "cloud"
+    run_id, _run_root, report = _write_resume_runtime(runtime)
+    _patch_valid_seal(monkeypatch, run_id=run_id, report=report)
+    operator_root = cloud / "_operator"
+    archive = operator_root / "archive"
+    archive.mkdir(parents=True)
+    supervisor.write_operator_receipt(
+        archive / f"{run_id}.json",
+        _closed_operator_receipt(
+            supervisor,
+            run_id=run_id,
+            pod_id="legacy-attempt-one",
+        ),
+    )
+    _write_budget_snapshot(cloud, run_id=run_id)
+    supervisor.write_operator_receipt(
+        operator_root / "phase3f-current.json",
+        _closed_operator_receipt(
+            supervisor,
+            run_id=run_id,
+            pod_id="legacy-attempt-two",
+            duration_seconds=121,
+        ),
+    )
+    runtime_before = _tree_sha256(runtime)
+    cloud_before = _tree_sha256(cloud)
+
+    plan = control.cloud_plan(ROOT, runtime, cloud)
+
+    assert plan["ready_for_live_inventory"] is True
+    assert plan["ready_for_create_after_live_gates"] is True
+    assert plan["local_blockers"] == []
+    assert plan["archive_conflicts"] == 0
+    assert plan["active_local_receipts"] == 0
+    assert plan["unclean_local_receipts"] == 0
+    assert plan["dataset_asset_count"] == 830
+    assert plan["archive_receipt_count"] == 2
+    assert plan["legacy_attempt_count"] == 2
+    assert plan["attempt_id_ready"] is True
+    assert plan["operator_lock_released"] is True
+    assert plan["dataset_write_count"] == 0
+    assert plan["secret_prompt_count"] == 0
+    assert plan["runpod_api_calls"] == 0
+    assert plan["cloud_mutations"] == 0
+    assert plan["live_inventory_required"] is True
+    assert cast(dict[str, object], plan["budget_snapshot"])[
+        "post_snapshot_receipt_count"
+    ] == 1
+    assert _tree_sha256(runtime) == runtime_before
+    assert _tree_sha256(cloud) == cloud_before
+
+
+def test_budget_snapshot_allows_only_one_preserved_post_snapshot_receipt() -> None:
+    control = _load_control()
+    prior = ("a" * 64,)
+    expected = hashlib.sha256(
+        json.dumps(prior, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+
+    assert control._source_snapshot_matches(
+        prior + ("b" * 64,),
+        expected_count=1,
+        expected_sha256=expected,
+    )
+    assert not control._source_snapshot_matches(
+        ("b" * 64, "c" * 64),
+        expected_count=1,
+        expected_sha256=expected,
+    )
+    assert not control._source_snapshot_matches(
+        prior + ("b" * 64, "c" * 64),
+        expected_count=1,
+        expected_sha256=expected,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_blocker"),
+    (
+        ("active", "OPERATOR_PROCESS_ALREADY_RUNNING"),
+        ("unclean", "UNCLEAN_OPERATOR_RECEIPT_REQUIRES_TERMINATE"),
+    ),
+)
+def test_cloud_plan_preserves_operator_blocker_before_budget_requirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_blocker: str,
+) -> None:
+    control = _load_control()
+    supervisor = _load_supervisor()
+    runtime = tmp_path / "runtime"
+    cloud = tmp_path / "cloud"
+    run_id, _run_root, report = _write_resume_runtime(runtime)
+    _patch_valid_seal(monkeypatch, run_id=run_id, report=report)
+    if mode == "active":
+        receipt = supervisor.OperatorReceipt(
+            run_id=run_id,
+            attempt_id="b" * 32,
+            run_marker=f"atlaslens-phase3f-{run_id}",
+            pod_id=None,
+            supervisor_pid=os.getpid(),
+            stage="preflight",
+            started_at="2026-07-21T12:00:00+00:00",
+            finished_at=None,
+            max_spend_usd=Decimal("3"),
+            soft_stop_usd=Decimal("2.95"),
+            hard_stop_usd=Decimal("2.99"),
+            max_gpu_hourly_usd=Decimal("0.50"),
+            max_wall_minutes=345,
+            cleanup_verified=False,
+        )
+    else:
+        receipt = _closed_operator_receipt(
+            supervisor,
+            run_id=run_id,
+            attempt_id="b" * 32,
+            pod_id="unclean-attempt",
+            cleanup_verified=False,
+        )
+    current = cloud / "_operator" / "phase3f-current.json"
+    supervisor.write_operator_receipt(current, receipt)
+
+    plan = control.cloud_plan(ROOT, runtime, cloud)
+
+    assert expected_blocker in plan["local_blockers"]
+    assert plan["ready_for_live_inventory"] is False
+    assert plan["ready_for_create_after_live_gates"] is False
+    assert plan["budget_snapshot"] is None
+    assert plan["runpod_api_calls"] == 0
+    assert plan["cloud_mutations"] == 0
 
 
 def test_resume_missing_seal_is_exact_typed_blocker(tmp_path: Path) -> None:
@@ -534,7 +729,14 @@ def test_resume_does_not_restart_running_training(
     operator = cloud / "_operator" / "phase3f-current.json"
     operator.parent.mkdir(parents=True)
     operator.write_bytes(
-        _canonical_bytes({"run_id": run_id, "stage": "running", "secrets_included": False})
+        _canonical_bytes(
+            {
+                "run_id": run_id,
+                "stage": "running",
+                "supervisor_pid": os.getpid(),
+                "secrets_included": False,
+            }
+        )
     )
 
     plan = control.resume_plan(ROOT, runtime, cloud)
@@ -542,6 +744,37 @@ def test_resume_does_not_restart_running_training(
     assert plan["next_phase"] == "training_running"
     assert plan["cloud_readiness_transition_count"] == 0
     assert plan["acquisition_required"] is False
+
+
+def test_resume_rejects_stale_training_receipt_before_cloud_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _load_control()
+    runtime = tmp_path / "runtime"
+    cloud = tmp_path / "cloud"
+    run_id, _run_root, report = _write_resume_runtime(runtime)
+    _patch_valid_seal(monkeypatch, run_id=run_id, report=report)
+    operator = cloud / "_operator" / "phase3f-current.json"
+    operator.parent.mkdir(parents=True)
+    operator.write_bytes(
+        _canonical_bytes(
+            {
+                "run_id": run_id,
+                "stage": "running",
+                "supervisor_pid": 999_999,
+                "secrets_included": False,
+            }
+        )
+    )
+    monkeypatch.setattr(control, "_process_is_running", lambda _pid: False)
+
+    with pytest.raises(control.EndToEndError) as error:
+        control.resume_plan(ROOT, runtime, cloud)
+
+    assert error.value.code == "STALE_OPERATOR_RECEIPT_REQUIRES_TERMINATE"
+    assert error.value.artifact == "phase3f-current.json"
+    assert error.value.field == "supervisor_pid"
 
 
 def test_resume_does_not_restart_completed_training(
@@ -869,6 +1102,53 @@ def test_duplicate_provider_billing_receipt_is_counted_once(tmp_path: Path) -> N
     assert reconciliation.actual_billed_usd == Decimal("0.25")
     assert reconciliation.local_conservative_historical_usd == Decimal("0.25")
     assert reconciliation.duplicate_billing_record_count == 1
+
+
+def test_attempt_budget_linkage_deduplicates_operator_and_supervisor_receipts(
+    tmp_path: Path,
+) -> None:
+    module = _load_supervisor()
+    run_id = "9" * 32
+    attempt_id = "a" * 32
+    archive = tmp_path / "_operator" / "archive"
+    archive.mkdir(parents=True)
+    for index, duration in enumerate((120, 180), start=1):
+        module.write_operator_receipt(
+            archive / f"attempt-{index}.json",
+            _closed_operator_receipt(
+                module,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                pod_id=f"attempt-pod-{index}",
+                duration_seconds=duration,
+            ),
+        )
+    receipts = tmp_path / "_receipts"
+    receipts.mkdir()
+    (receipts / "completed.json").write_text(
+        json.dumps(
+            {
+                "schema": "atlaslens-phase3f-local-supervisor-receipt-v1",
+                "run_id": run_id,
+                "attempt_id": attempt_id,
+                "pod_id_sha256": "b" * 64,
+                "conservative_incremental_upper_usd": "0.25",
+                "actual_spend_available": False,
+                "actual_spend_usd": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reconciliation = module._budget_reconciliation(
+        _budget_policy(module),
+        tmp_path,
+        _billing_snapshot(module),
+    )
+
+    assert reconciliation.legacy_closed_reservation_total_usd == Decimal("3")
+    assert reconciliation.local_conservative_historical_usd == Decimal("0.25")
+    assert reconciliation.duplicate_billing_record_count == 2
 
 
 def test_cleanup_unverified_run_keeps_full_active_exposure(tmp_path: Path) -> None:

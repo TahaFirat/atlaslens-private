@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-21T16:30:21+03:00
+last_verified_at: 2026-07-21T18:27:29+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: phase3f_receipt_bound_post_create_inventory_repaired_live_sealed_830_preserved
+product_phase_status: phase3f_attempt_archive_idempotent_cloudplan_live_readonly_pass_sealed_830_preserved
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -479,6 +479,22 @@ phase_3f_post_create_tests: pass_292_phase3f
 phase_3f_post_create_static: pass_ruff_strict_mypy_3_changed_sources_powershell5_diff_secret_scan
 phase_3f_post_create_broader_mypy: phase3f20_sources_preexisting2_unused_ignores_full260_preexisting54_errors_35_files
 phase_3f_post_create_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_resume_zero_execute_zero_dataset_runtime_mutation
+phase_3f_attempt_archive_conflict: run_id_only_destination_existing_ce23_receipts_different_bytes_and_semantics
+phase_3f_attempt_identity: explicit_random32hex_per_lifecycle_legacy_deterministic_semantic_sha256
+phase_3f_attempt_archive_name: run_id_attempt_id_terminal_stage_content_sha_prefix_immutable
+phase_3f_attempt_archive_index: atomic_deterministic_hash_chain_legacy_receipts_unchanged
+phase_3f_attempt_budget_linkage: explicit_attempt_then_legacy_pod_or_semantic_identity_deduplicated
+phase_3f_attempt_create_binding: attempt_current_atomic_before_create_callbacks_and_idempotency_key
+phase_3f_attempt_precreate_failure: before_create_entry_terminal_cleanup_true_after_entry_requires_bound_cleanup
+phase_3f_attempt_stale_pid: active_stage_requires_live_supervisor_else_typed_presecret_blocker
+phase_3f_attempt_blocker_priority: active_stale_unclean_operator_before_budget_snapshot_requirement
+phase_3f_attempt_live_receipts: same_run_create_lifecycles2_total_legacy_attempts8_duplicate_groups0
+phase_3f_attempt_cloudplan: pass_ready_live_inventory_true_ready_create_after_live_gates_true_blockers0_conflicts0_active0_unclean0
+phase_3f_attempt_cloudplan_counts: dataset830_secret_prompts0_runpod_calls0_cloud_mutations0_archive_receipts8
+phase_3f_attempt_budget_live_values: actual_0_8379813398_active0_unbilled0_proposed3_remaining9_1620186602
+phase_3f_attempt_tests: pass_307_phase3f_parallel_windows_archive_budget_snapshot_stale_pid_and_blocker_priority
+phase_3f_attempt_static: pass_ruff_strict_mypy20_phase3f_and259_api_sources_powershell5_diff_secret_scan
+phase_3f_attempt_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_resume_zero_execute_zero_dataset_receipt_budget_runtime_mutation
 phase_3f_next_action: run_exact_resume_ce23_with_explicit_cloud_consent
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
@@ -534,6 +550,71 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F idempotent lifecycle-attempt archive
+
+Status: **REPAIRED AND LIVE CLOUDPLAN VERIFIED - LIVE RESUME NOT EXECUTED**.
+
+The exact collision was `_operator/archive/ce23d58c42bf76e6de0b0117725e3ea7.json`.
+The live current receipt and that destination both belong to run
+`ce23d58c42bf76e6de0b0117725e3ea7`, are terminal and cleanup-verified, but
+represent two distinct create lifecycles. Their bytes and canonical receipt
+semantics differ. The old destination algorithm used only `run_id`; it therefore
+rejected the second valid lifecycle after budget reconciliation. The read-only
+inventory contains two create/terminated receipts for this run, eight legacy
+attempt receipts in total, and no semantic duplicate group.
+
+`run_id` remains the sealed dataset/training identity. Every new cloud lifecycle
+now receives a fresh immutable 32-hex `attempt_id`; the atomic current receipt,
+create idempotency key, Pod binding and all progress callbacks are tied to it.
+Terminal archives use run ID, attempt ID, terminal stage and a receipt-content
+SHA prefix. Existing bytes are never overwritten. Byte-identical retries are
+idempotent; semantic legacy duplicates are retained and grouped; prefix
+collisions extend the content-addressed name. A deterministic atomic hash-chain
+index gives unchanged legacy receipts synthetic semantic identities,
+classification, cleanup status, duplicate group and attempt-aware budget
+linkage. Active/stale, unclean, invalid-lock and invalid-archive states remain
+typed blockers. Windows lock creation/deletion races use bounded contention and
+verified nonce release.
+
+The mutation-free live `CloudPlan` returned 830 assets, eight archived-after-
+simulation legacy receipts, zero duplicates/conflicts/active/unclean receipts,
+an atomically ready attempt ID, released operator lock, zero dataset writes,
+zero secret prompts, zero RunPod calls, zero cloud mutations,
+`ready_for_live_inventory=true`, `ready_for_create_after_live_gates=true`, and
+`local_blockers=[]`. Its sanitized budget snapshot preserved actual billed USD
+`0.8379813398`, active exposure `0`, conservative unbilled estimate `0`, proposed
+maximum `3`, and remaining authorized USD `9.1620186602` from eight source
+receipts. It used only a temporary `_operator` copy and did not create the live
+archive index or lock.
+
+Budget reconciliation is persisted immediately before its attempt receipt. The
+next `CloudPlan` therefore accepts one post-snapshot receipt only if removing it
+reproduces the recorded source count and SHA-256 exactly; a replaced source,
+more than one unbound addition, or an invalid digest remains a typed fail-closed
+budget blocker.
+
+The live post-plan audit remains `ACQUISITION_SEALED`, 830 assets,
+`model_loaded=false`, `gpu_started=false`, and `cloud_mutations=0`. Readiness,
+sealed-assets and checksum-inventory SHA-256 values remain respectively
+`2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9`,
+`b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1`, and
+`f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93`.
+The established sealed metadata/media inventory hashes remain
+`3ccac5be7232e7d6afb205eba384c4ac6772e2d8a0b463c066dfe4d1fd82d742` and
+`da189be7feb70643d6579b0cfb61c0a7e7b9878f28ed19b501082f6b59ee7cae`.
+Current operator, colliding legacy archive and latest budget receipt SHA-256
+values also remain `1690a5c8cf564239a0a3ae9bf6eee069e75a6e1391db3c85838e37786ba2e4bb`,
+`3834a88db7b6e08cc3f7f1d921befeaaba690f0774cab97f652f12a338313a68`, and
+`c39d58b4416b0ebe25b2abf0abd1d07b497ca92779daeb1e0504e6e22028d106`.
+
+All 307 Phase 3F tests pass, including repeated/parallel Windows archive,
+attempt-based budget and post-snapshot source-binding coverage. Ruff passes the
+complete Phase 3F scope; strict
+mypy passes all 20 Phase 3F and all 259 API source files; all five PowerShell
+parsers, diff validation and the high-confidence secret scan pass. No network,
+Mapillary, RunPod/GPU, Resume/Execute, dataset, receipt, budget-history,
+live-runtime, budget-limit, push or remote mutation occurred.
 
 ## Product Phase 3F RunPod budget reconciliation
 
