@@ -34,6 +34,10 @@ POD_VOLUME_GB: Final = 20
 ON_DEMAND_PRICE_TOLERANCE_USD: Final = Decimal("0.005")
 POD_GPU_ATTESTATION_TIMEOUT_SECONDS: Final = 180.0
 POD_GPU_ATTESTATION_POLL_SECONDS: Final = 5.0
+POD_CONNECTIVITY_TIMEOUT_SECONDS: Final = 180.0
+POD_CONNECTIVITY_FAST_POLL_WINDOW_SECONDS: Final = 30.0
+POD_CONNECTIVITY_FAST_POLL_SECONDS: Final = 2.0
+POD_CONNECTIVITY_SLOW_POLL_SECONDS: Final = 5.0
 MIN_GPU_MEMORY_GB: Final = 16
 MAX_RESPONSE_BYTES: Final = 2 * 1024 * 1024
 _RESOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,190}$")
@@ -691,6 +695,30 @@ class PodGPUAttestationProgressDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class PodConnectivityProgressDiagnostic:
+    outcome: str
+    failure_code: str | None
+    public_ip_present: bool
+    tcp_port_present: bool
+    poll_count: int
+    elapsed_seconds: float
+    ssh_ready: bool
+    secret_free: bool = True
+
+    def to_public_dict(self) -> dict[str, object]:
+        return {
+            "connectivity_outcome": self.outcome,
+            "connectivity_failure_code": self.failure_code,
+            "public_ip_present": self.public_ip_present,
+            "tcp_port_present": self.tcp_port_present,
+            "connectivity_poll_count": self.poll_count,
+            "connectivity_elapsed_seconds": self.elapsed_seconds,
+            "ssh_ready": self.ssh_ready,
+            "secret_free": self.secret_free,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RunPodInventory:
     pods: tuple[PodRecord, ...]
     endpoint_ids: tuple[str, ...]
@@ -743,8 +771,12 @@ class RunPodV1Client:
         record_gpu_attestation_progress: (
             Callable[[PodGPUAttestationProgressDiagnostic], None] | None
         ) = None,
+        record_connectivity_progress: (
+            Callable[[PodConnectivityProgressDiagnostic], None] | None
+        ) = None,
         attestation_timeout_seconds: float = POD_GPU_ATTESTATION_TIMEOUT_SECONDS,
         attestation_poll_seconds: float = POD_GPU_ATTESTATION_POLL_SECONDS,
+        connectivity_timeout_seconds: float = POD_CONNECTIVITY_TIMEOUT_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -764,6 +796,10 @@ class RunPodV1Client:
             0 < attestation_poll_seconds <= 30,
             "attestation_poll_invalid",
         )
+        _require(
+            0 < connectivity_timeout_seconds <= POD_CONNECTIVITY_TIMEOUT_SECONDS,
+            "connectivity_timeout_invalid",
+        )
         self._api_token = api_token
         self._config = config
         self._last_offer: GPUOffer | None = None
@@ -775,11 +811,14 @@ class RunPodV1Client:
         self._last_gpu_attestation_progress: (
             PodGPUAttestationProgressDiagnostic | None
         ) = None
+        self._last_connectivity_progress: PodConnectivityProgressDiagnostic | None = None
         self._bind_created_pod = bind_created_pod
         self._record_rental_attestation = record_rental_attestation
         self._record_gpu_attestation_progress = record_gpu_attestation_progress
+        self._record_connectivity_progress = record_connectivity_progress
         self._attestation_timeout_seconds = attestation_timeout_seconds
         self._attestation_poll_seconds = attestation_poll_seconds
+        self._connectivity_timeout_seconds = connectivity_timeout_seconds
         self._monotonic = monotonic
         self._sleep = sleep
         self._api_request_count = 0
@@ -833,6 +872,10 @@ class RunPodV1Client:
         self,
     ) -> PodGPUAttestationProgressDiagnostic | None:
         return self._last_gpu_attestation_progress
+
+    @property
+    def last_connectivity_progress(self) -> PodConnectivityProgressDiagnostic | None:
+        return self._last_connectivity_progress
 
     @property
     def api_request_count(self) -> int:
@@ -1685,13 +1728,6 @@ class RunPodV1Client:
                 )
             actual_price = observed_price if observed_price is not None else create_price
 
-            public_ip = verified.get("publicIp", _MISSING)
-            if public_ip is not _MISSING and public_ip is not None:
-                _require(
-                    isinstance(public_ip, str) and bool(public_ip.strip()),
-                    "pod_gpu_attestation_public_ip_invalid",
-                )
-
             _require(
                 verified.get("endpointId") is None,
                 "pod_attestation_related_resource_present",
@@ -1732,8 +1768,6 @@ class RunPodV1Client:
                 and gpu_path is not None
                 and gpu_count == 1
                 and actual_price is not None
-                and isinstance(public_ip, str)
-                and bool(public_ip.strip())
                 and len(inventory.pods) == 1
                 and inventory.pods[0].pod_id == created.pod_id
             )
@@ -2080,6 +2114,249 @@ class RunPodV1Client:
             hourly_price=hourly_price,
         )
 
+    def await_pod_connectivity(
+        self,
+        pod: PodRecord,
+        request: PodRequest,
+        *,
+        ssh_probe: Callable[[PodConnection, float], bool],
+    ) -> PodConnection:
+        """Await IP, SSH port mapping, and an actual SSH probe on one bound Pod."""
+
+        safe_id = _resource_id(pod.pod_id, "POD_CONNECTIVITY_POD_ID_INVALID")
+        _require(pod.run_marker == request.run_marker, "POD_CONNECTIVITY_MARKER_MISMATCH")
+        offer = self._last_offer
+        attestation = self._last_rental_attestation
+        if (
+            offer is None
+            or attestation is None
+            or request.gpu_type_id != offer.gpu_type_id
+        ):
+            raise RunPodAPIError("POD_CONNECTIVITY_ALLOCATION_NOT_ATTESTED")
+        started = self._monotonic()
+        deadline = started + self._connectivity_timeout_seconds
+        poll_count = 0
+        ssh_attempted = False
+        self._record_connectivity(
+            PodConnectivityProgressDiagnostic(
+                outcome="pending",
+                failure_code=None,
+                public_ip_present=False,
+                tcp_port_present=False,
+                poll_count=0,
+                elapsed_seconds=0.0,
+                ssh_ready=False,
+            )
+        )
+        try:
+            while True:
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise RunPodAPIError(
+                        "POD_SSH_READINESS_TIMEOUT"
+                        if ssh_attempted
+                        else "POD_CONNECTIVITY_TIMEOUT"
+                    )
+                poll_count += 1
+                try:
+                    payload = self._request_json(
+                        "GET",
+                        f"pods/{safe_id}",
+                        expected_status=200,
+                        params={
+                            "includeMachine": "true",
+                            "includeNetworkVolume": "true",
+                        },
+                        timeout_seconds=min(remaining, 30.0),
+                    )
+                except RunPodAPIError as exc:
+                    if exc.code == "unexpected_status_404":
+                        raise RunPodAPIError("POD_CONNECTIVITY_POD_MISSING") from None
+                    raise
+                row = _object(payload, "POD_CONNECTIVITY_RESPONSE_INVALID")
+                _require(row.get("id") == safe_id, "POD_CONNECTIVITY_ID_MISMATCH")
+                marker = row.get("name", _MISSING)
+                if marker is not _MISSING and marker is not None:
+                    _require(
+                        marker == request.run_marker,
+                        "POD_CONNECTIVITY_MARKER_MISMATCH",
+                    )
+
+                desired = row.get("desiredStatus", _MISSING)
+                if desired in {"FAILED", "EXITED", "TERMINATED"}:
+                    raise RunPodAPIError(f"POD_CONNECTIVITY_TERMINAL_{desired}")
+                if desired is not _MISSING and desired is not None:
+                    _require(desired == "RUNNING", "POD_CONNECTIVITY_STATUS_INVALID")
+
+                interruptible = row.get("interruptible", _MISSING)
+                _require(
+                    _json_type(interruptible) in {"boolean", "missing", "null", "string"},
+                    "POD_CONNECTIVITY_INTERRUPTIBLE_INVALID",
+                )
+                if interruptible is True:
+                    raise RunPodAPIError("POD_CONNECTIVITY_INTERRUPTIBLE_TRUE")
+
+                gpu_id, _gpu_path, gpu_count = self._normalized_gpu(row)
+                if gpu_id is not None:
+                    _require(gpu_id == offer.gpu_type_id, "POD_CONNECTIVITY_GPU_MISMATCH")
+                if gpu_count is not None:
+                    _require(gpu_count == 1, "POD_CONNECTIVITY_GPU_COUNT_MISMATCH")
+
+                machine_value = row.get("machine", _MISSING)
+                if isinstance(machine_value, Mapping):
+                    secure_cloud = machine_value.get("secureCloud", _MISSING)
+                    if secure_cloud is not _MISSING and secure_cloud is not None:
+                        _require(
+                            isinstance(secure_cloud, bool)
+                            and secure_cloud == (offer.cloud_type == "SECURE"),
+                            "POD_CONNECTIVITY_CLOUD_TYPE_MISMATCH",
+                        )
+
+                price_value = row.get("costPerHr", _MISSING)
+                if price_value is not _MISSING and price_value is not None:
+                    price = _decimal(price_value, "POD_CONNECTIVITY_PRICE_INVALID")
+                    _require(
+                        Decimal("0") < price <= request.hourly_cost_usd
+                        and abs(price - offer.hourly_price)
+                        <= ON_DEMAND_PRICE_TOLERANCE_USD,
+                        "POD_CONNECTIVITY_PRICE_MISMATCH",
+                    )
+                else:
+                    price = attestation.create_cost_per_hr
+
+                _require(
+                    row.get("endpointId") is None
+                    and row.get("networkVolume") is None
+                    and row.get("networkVolumeId") is None
+                    and row.get("templateId") is None,
+                    "POD_CONNECTIVITY_RELATED_RESOURCE_PRESENT",
+                )
+
+                ip_value = row.get("publicIp", _MISSING)
+                public_ip_present = isinstance(ip_value, str) and bool(ip_value.strip())
+                public_ip: str | None = None
+                if public_ip_present:
+                    try:
+                        public_ip = str(ipaddress.ip_address(cast(str, ip_value).strip()))
+                    except ValueError as exc:
+                        raise RunPodAPIError("POD_CONNECTIVITY_PUBLIC_IP_INVALID") from exc
+                elif (
+                    ip_value is not _MISSING
+                    and ip_value is not None
+                    and not (isinstance(ip_value, str) and not ip_value.strip())
+                ):
+                    raise RunPodAPIError("POD_CONNECTIVITY_PUBLIC_IP_INVALID")
+
+                ports_value = row.get("ports", _MISSING)
+                if ports_value is not _MISSING and ports_value is not None:
+                    ports = _sequence(ports_value, "POD_CONNECTIVITY_PORTS_INVALID")
+                    _require(set(ports) == {"22/tcp"}, "POD_CONNECTIVITY_PORTS_INVALID")
+                mappings_value = row.get("portMappings", _MISSING)
+                public_port: int | None = None
+                if mappings_value is not _MISSING and mappings_value is not None:
+                    mappings = _object(
+                        mappings_value,
+                        "POD_CONNECTIVITY_TCP_PORT_INVALID",
+                    )
+                    mapped = mappings.get("22", _MISSING)
+                    if mapped is not _MISSING and mapped is not None:
+                        _require(
+                            isinstance(mapped, int)
+                            and not isinstance(mapped, bool)
+                            and 1 <= mapped <= 65_535,
+                            "POD_CONNECTIVITY_TCP_PORT_INVALID",
+                        )
+                        public_port = cast(int, mapped)
+                tcp_port_present = public_port is not None
+                allocation_safe = (
+                    desired == "RUNNING"
+                    and gpu_id == offer.gpu_type_id
+                    and gpu_count == 1
+                )
+                ssh_ready = False
+                connection: PodConnection | None = None
+                if (
+                    allocation_safe
+                    and public_ip is not None
+                    and public_port is not None
+                ):
+                    connection = PodConnection(
+                        pod_id=safe_id,
+                        public_ip=public_ip,
+                        public_ssh_port=public_port,
+                        gpu_display_name=offer.display_name,
+                        hourly_price=price,
+                    )
+                    ssh_attempted = True
+                    try:
+                        ssh_ready = bool(
+                            ssh_probe(connection, min(max(remaining, 0.001), 15.0))
+                        )
+                    except Exception:
+                        ssh_ready = False
+
+                elapsed = min(
+                    max(0.0, self._monotonic() - started),
+                    self._connectivity_timeout_seconds,
+                )
+                progress = PodConnectivityProgressDiagnostic(
+                    outcome="ready" if ssh_ready else "pending",
+                    failure_code=None,
+                    public_ip_present=public_ip_present,
+                    tcp_port_present=tcp_port_present,
+                    poll_count=poll_count,
+                    elapsed_seconds=elapsed,
+                    ssh_ready=ssh_ready,
+                )
+                self._record_connectivity(progress)
+                if ssh_ready and connection is not None:
+                    return connection
+
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise RunPodAPIError(
+                        "POD_SSH_READINESS_TIMEOUT"
+                        if ssh_attempted
+                        else "POD_CONNECTIVITY_TIMEOUT"
+                    )
+                poll_seconds = (
+                    POD_CONNECTIVITY_FAST_POLL_SECONDS
+                    if elapsed < POD_CONNECTIVITY_FAST_POLL_WINDOW_SECONDS
+                    else POD_CONNECTIVITY_SLOW_POLL_SECONDS
+                )
+                self._sleep(min(poll_seconds, remaining))
+        except RunPodAPIError as exc:
+            self._fail_connectivity_progress(exc.code)
+            raise
+
+    def _record_connectivity(
+        self,
+        diagnostic: PodConnectivityProgressDiagnostic,
+    ) -> None:
+        self._last_connectivity_progress = diagnostic
+        if self._record_connectivity_progress is not None:
+            self._record_connectivity_progress(diagnostic)
+
+    def _fail_connectivity_progress(self, failure_code: str) -> None:
+        current = self._last_connectivity_progress
+        if current is None or current.outcome == "failed":
+            return
+        failed = replace(
+            current,
+            outcome="failed",
+            failure_code=failure_code,
+            elapsed_seconds=(
+                self._connectivity_timeout_seconds
+                if failure_code
+                in {"POD_CONNECTIVITY_TIMEOUT", "POD_SSH_READINESS_TIMEOUT"}
+                else current.elapsed_seconds
+            ),
+        )
+        self._last_connectivity_progress = failed
+        if self._record_connectivity_progress is not None:
+            with suppress(BaseException):
+                self._record_connectivity_progress(failed)
+
     def _list_ids(self, path: str, code: str) -> tuple[str, ...]:
         rows = self._get_collection(path)
         return tuple(sorted(_resource_id(row.get("id"), code) for row in rows))
@@ -2394,10 +2671,15 @@ __all__ = [
     "MAX_CONTAINER_DISK_GB",
     "MIN_GPU_MEMORY_GB",
     "ON_DEMAND_PRICE_TOLERANCE_USD",
+    "POD_CONNECTIVITY_FAST_POLL_SECONDS",
+    "POD_CONNECTIVITY_FAST_POLL_WINDOW_SECONDS",
+    "POD_CONNECTIVITY_SLOW_POLL_SECONDS",
+    "POD_CONNECTIVITY_TIMEOUT_SECONDS",
     "POD_GPU_ATTESTATION_POLL_SECONDS",
     "POD_GPU_ATTESTATION_TIMEOUT_SECONDS",
     "POD_VOLUME_GB",
     "PodConnection",
+    "PodConnectivityProgressDiagnostic",
     "PodGPUAttestationProgressDiagnostic",
     "PodRentalAttestationDiagnostic",
     "REST_BASE_URL",

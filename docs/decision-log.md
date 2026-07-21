@@ -1,5 +1,32 @@
 # Decision log
 
+## 2026-07-21 - Phase 3F separates RunPod allocation from connectivity readiness
+
+- Context: RunPod returned HTTP 201, the receipt-bound Pod was `RUNNING`, and
+  exact `NVIDIA L4` allocation was visible at `machine.gpuTypeId`, but `publicIp`
+  was not populated during the first authenticated poll. The allocation poll
+  treated that eventual field as a terminal invariant and failed after 0.547
+  seconds with `pod_gpu_attestation_public_ip_invalid`; cleanup correctly removed
+  the one bound Pod before training started.
+- Decision: Complete allocation attestation from exact Pod ID, safe status, exact
+  GPU/count, on-demand price/cloud and absence of boolean `interruptible=true`.
+  Then await IP, exposed SSH mapping and a real bounded SSH probe on the same Pod
+  under a separate 180-second monotonic deadline. Poll every two seconds for 30
+  seconds, then every five seconds, using only authenticated bound-Pod GETs and
+  never a second create. Re-attest safety invariants on every connectivity poll.
+- Alternatives: Keep public IP in allocation success; accept IP without port or
+  SSH; retry create on timeout; or use the older ten-minute field-only connection
+  loop.
+- Consequences: Eventual IP/port/SSH state no longer causes an early allocation
+  failure. Missing connectivity and SSH receive distinct typed timeouts; drift,
+  terminal state or disappearance fails immediately. Every failure still reaches
+  receipt-bound termination and must restore Pod/endpoint/volume/template
+  inventory to `0/0/0/0`. Emitted telemetry is presence-only and never exposes IP,
+  port, Pod ID, host key or credentials; the private receipt keeps its existing
+  exact Pod ID only for cleanup binding. Budget limits and reconciliation are
+  unchanged.
+- Target phase: Product Phase 3F bounded private fine-tuning only.
+
 ## 2026-07-21 - Phase 3F Resume is a read-only idempotent phase machine
 
 - Context: The end-to-end wrapper treated any `current.json` as an unfinished

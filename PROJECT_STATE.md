@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-21T14:59:46+03:00
+last_verified_at: 2026-07-21T15:42:35+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: phase3f_resume_idempotency_repaired_live_sealed_830_preserved
+product_phase_status: phase3f_runpod_connectivity_wait_repaired_live_sealed_830_preserved
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -456,6 +456,16 @@ phase_3f_resume_media_inventory_sha256: da189be7feb70643d6579b0cfb61c0a7e7b9878f
 phase_3f_resume_tests: pass_266_phase3f
 phase_3f_resume_static: pass_ruff_strict_mypy_259_sources_and_control_powershell5_diff_secret_scan
 phase_3f_resume_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_resume_zero_dataset_runtime_mutation
+phase_3f_connectivity_masked_error: pod_gpu_attestation_public_ip_invalid_after_0_547_seconds
+phase_3f_connectivity_root_cause: eventual_public_ip_was_a_terminal_allocation_invariant
+phase_3f_connectivity_machine: allocation_attestation_then_bound_pod_connectivity_then_transfer_training
+phase_3f_connectivity_deadline: monotonic180s_poll2s_first30_then5s_ip_port_then_bounded_ssh
+phase_3f_connectivity_create_invariant: one_post_max_zero_recreate_on_pending_timeout_or_failure
+phase_3f_connectivity_cleanup: receipt_bound_pod_only_full_inventory_0_0_0_0_required
+phase_3f_connectivity_budget_live_values: actual_0_8365359555_active0_unbilled0_proposed3_remaining9_1634640445
+phase_3f_connectivity_tests: pass_282_phase3f
+phase_3f_connectivity_static: pass_ruff_strict_mypy_260_sources_powershell5_diff_secret_scan
+phase_3f_connectivity_live_actions: zero_network_zero_mapillary_zero_runpod_zero_gpu_zero_resume_zero_dataset_runtime_mutation
 phase_3f_next_action: run_exact_resume_ce23_with_explicit_cloud_consent
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
@@ -549,6 +559,54 @@ true, `gpu_started=false`, and `cloud_mutations=0`; its readiness SHA-256 is
 All 254 Phase 3F tests pass. Ruff, strict mypy on both changed sources, all five
 Phase 3F PowerShell parsers, diff validation, and the high-confidence secret scan
 pass. No network, RunPod/GPU, Resume, dataset, media, or runtime mutation occurred.
+
+## Product Phase 3F receipt-bound RunPod connectivity readiness
+
+Status: **REPAIRED AND OFFLINE VERIFIED - LIVE RESUME NOT EXECUTED**.
+
+The reported HTTP-201 Pod had exact `NVIDIA L4` allocation at
+`machine.gpuTypeId`, count one and `desiredStatus=RUNNING`, but `publicIp` was
+not yet populated. The allocation loop treated an eventual connectivity field as
+a terminal invariant and emitted `pod_gpu_attestation_public_ip_invalid` after
+0.547 seconds. The existing receipt-bound cleanup then correctly restored Pod,
+endpoint, network-volume and template inventory to `0/0/0/0`; training never
+started.
+
+Allocation now completes independently from connectivity using only the exact
+receipt-bound Pod ID, safe status, exact GPU ID/count, on-demand price/cloud and
+absence of boolean `interruptible=true`. Connectivity then polls only that Pod
+with authenticated GETs under a 180-second monotonic deadline: every two seconds
+for the first 30 seconds and every five seconds thereafter. Missing/null/empty IP,
+missing SSH port mapping and a not-yet-ready SSH probe stay pending. IP plus port
+is insufficient; a bounded batch-mode SSH probe must pass before transfer and
+training. Every poll re-attests GPU/count, interruptible, price, cloud and terminal
+status. No path performs a second create/POST.
+
+Connectivity timeout codes are `POD_CONNECTIVITY_TIMEOUT` for unavailable IP/port
+and `POD_SSH_READINESS_TIMEOUT` after connectivity exists but SSH does not become
+ready. A vanished Pod is `POD_CONNECTIVITY_POD_MISSING`; GPU/count,
+interruptible, price/cloud drift and terminal states fail immediately. All failures
+flow through the existing one-Pod `finally`, and cleanup is successful only after
+all four inventories match the empty baseline. The private operator receipt keeps
+the exact Pod ID solely for deletion binding; emitted telemetry records only
+allocation time, IP/port presence booleans, poll count/elapsed time, SSH readiness
+and the typed code.
+
+The live budget evidence remains exactly `actual_billed_usd=0.8365359555`,
+`active_exposure_usd=0`, `conservative_unbilled_estimate_usd=0`,
+`proposed_run_max_usd=3`, and `remaining_authorized_usd=9.1634640445`; no limit
+changed. The sealed corpus remains 830 assets with readiness
+`2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9`,
+sealed-assets
+`b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1`,
+metadata inventory
+`3ccac5be7232e7d6afb205eba384c4ac6772e2d8a0b463c066dfe4d1fd82d742`,
+and media inventory
+`da189be7feb70643d6579b0cfb61c0a7e7b9878f28ed19b501082f6b59ee7cae`.
+All 282 Phase 3F tests pass. Ruff, strict mypy for 260 source files, all five
+Phase 3F PowerShell parsers, diff validation and the high-confidence secret scan
+pass. This repair made no network, Mapillary, RunPod/GPU, Resume/Execute, dataset,
+media or live-runtime mutation.
 
 ## Product Phase 3F idempotent sealed-corpus Resume
 

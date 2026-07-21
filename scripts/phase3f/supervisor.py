@@ -34,9 +34,10 @@ from atlaslens_api.phase3f.operator import (  # noqa: E402
 )
 from atlaslens_api.phase3f.runpod import (  # noqa: E402
     GPUOffer,
+    PodConnection,
+    PodConnectivityProgressDiagnostic,
     PodGPUAttestationProgressDiagnostic,
     PodRentalAttestationDiagnostic,
-    PodConnection,
     RunPodAPIError,
     RunPodBillingSnapshot,
     RunPodConfig,
@@ -392,19 +393,46 @@ def _scp_arguments(key: Path, known_hosts: Path, connection: PodConnection) -> l
 
 def _wait_connection(
     client: RunPodV1Client,
-    pod_id: str,
     lease: RunPodLease,
     started: float,
+    *,
+    key: Path,
+    known_hosts: Path,
 ) -> PodConnection:
-    for _ in range(120):
-        lease.assert_within_limits(elapsed_seconds=int(time.monotonic() - started))
-        try:
-            return client.pod_connection(pod_id)
-        except RunPodAPIError as exc:
-            if exc.code not in {"pod_connection_pending", "pod_not_running"}:
-                raise
-        time.sleep(5)
-    raise SupervisorExecutionError("POD_SSH_UNAVAILABLE")
+    lease.assert_within_limits(elapsed_seconds=int(time.monotonic() - started))
+    connection = client.await_pod_connectivity(
+        lease.pod,
+        lease.request,
+        ssh_probe=lambda candidate, timeout_seconds: _probe_ssh(
+            key,
+            known_hosts,
+            candidate,
+            timeout_seconds=timeout_seconds,
+        ),
+    )
+    lease.assert_within_limits(elapsed_seconds=int(time.monotonic() - started))
+    return connection
+
+
+def _probe_ssh(
+    key: Path,
+    known_hosts: Path,
+    connection: PodConnection,
+    *,
+    timeout_seconds: float,
+) -> bool:
+    try:
+        completed = subprocess.run(
+            [*_ssh_arguments(key, known_hosts, connection), "true"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=max(0.1, min(timeout_seconds, 15.0)),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
 
 
 def _run_watched(
@@ -466,7 +494,13 @@ def _operation(
     )
     _emit("PHASE3F_POD_CREATED", run_id=run_id)
     _emit("PHASE3F_WAITING_FOR_SSH", run_id=run_id)
-    connection = _wait_connection(client, lease.pod.pod_id, lease, started)
+    connection = _wait_connection(
+        client,
+        lease,
+        started,
+        key=key,
+        known_hosts=known_hosts,
+    )
     _emit(
         "PHASE3F_SSH_READY",
         gpu=connection.gpu_display_name,
@@ -1232,11 +1266,19 @@ def _record_operator_rental_attestation(
     _require(receipt.run_id == expected_run_id, "OPERATOR_RECEIPT_RUN_ID_MISMATCH")
     _require(receipt.stage == "running", "OPERATOR_RECEIPT_STAGE_INVALID")
     _require(receipt.pod_id is not None, "OPERATOR_RECEIPT_POD_ID_MISSING")
+    allocation_attested_at = datetime.now(UTC).isoformat()
     write_operator_receipt(
         receipt_path,
-        receipt.record_rental_attestation(attestation),
+        receipt.record_rental_attestation(
+            attestation,
+            allocation_attested_at=allocation_attested_at,
+        ),
     )
-    _emit("PHASE3F_POD_RENTAL_EVIDENCE", **attestation.to_public_dict())
+    _emit(
+        "PHASE3F_POD_RENTAL_EVIDENCE",
+        allocation_attested_at=allocation_attested_at,
+        **attestation.to_public_dict(),
+    )
 
 
 def _record_operator_gpu_attestation_progress(
@@ -1254,6 +1296,23 @@ def _record_operator_gpu_attestation_progress(
         receipt.record_gpu_attestation_progress(diagnostic),
     )
     _emit("PHASE3F_POD_GPU_ATTESTATION", **diagnostic.to_public_dict())
+
+
+def _record_operator_connectivity_progress(
+    receipt_path: Path,
+    *,
+    expected_run_id: str,
+    diagnostic: PodConnectivityProgressDiagnostic,
+) -> None:
+    receipt = read_operator_receipt(receipt_path)
+    _require(receipt.run_id == expected_run_id, "OPERATOR_RECEIPT_RUN_ID_MISMATCH")
+    _require(receipt.stage == "running", "OPERATOR_RECEIPT_STAGE_INVALID")
+    _require(receipt.pod_id is not None, "OPERATOR_RECEIPT_POD_ID_MISSING")
+    write_operator_receipt(
+        receipt_path,
+        receipt.record_connectivity_progress(diagnostic),
+    )
+    _emit("PHASE3F_POD_CONNECTIVITY", **diagnostic.to_public_dict())
 
 
 def _run_execute(
@@ -1395,6 +1454,13 @@ def _run_execute(
             ),
             record_gpu_attestation_progress=lambda diagnostic: (
                 _record_operator_gpu_attestation_progress(
+                    receipt_path,
+                    expected_run_id=run_id,
+                    diagnostic=diagnostic,
+                )
+            ),
+            record_connectivity_progress=lambda diagnostic: (
+                _record_operator_connectivity_progress(
                     receipt_path,
                     expected_run_id=run_id,
                     diagnostic=diagnostic,

@@ -288,13 +288,34 @@ GET-only allocation polling, not a create retry. Exact GPU ID evidence is accept
 only from `gpu.id`, `machine.gpuTypeId`, or `machine.gpuType.id`; assigned count
 comes only from `gpu.count` or `machine.gpuType.count`. All simultaneously present
 paths must agree, and display names or `machine.minPodGpuCount` are not allocation
-evidence. Missing/null machine, GPU, status or public-IP values remain pending.
-Success requires the exact bound ID and run name, `RUNNING`, count one, selected
-GPU ID, valid on-demand price/rental evidence, a public allocation and only the
-bound Pod with no endpoint, network volume or template. A mismatch terminates
-immediately; expiration raises `POD_GPU_ATTESTATION_TIMEOUT`. Receipt v2 stores
+evidence. Missing/null machine, GPU or status values remain pending. Allocation
+success requires the exact bound ID and run name, `RUNNING`, count one, selected
+GPU ID, valid on-demand price/rental evidence, no proof of `interruptible=true`,
+and only the bound Pod with no endpoint, network volume or template. Public IP and
+port mapping are eventual connectivity fields and are not allocation invariants.
+A mismatch terminates immediately; expiration raises
+`POD_GPU_ATTESTATION_TIMEOUT`. Receipt v2 stores
 only allowlisted fields or a hash for mismatching GPU text, plus poll count/time
 and outcome, and remains able to read receipts written before these fields.
+
+After `allocation_attested_at` is recorded, connectivity uses authenticated
+`GET /pods/{receipt-bound-id}` only; it never issues another create/POST. The
+default monotonic deadline is 180 seconds. Polling is every two seconds for the
+first 30 seconds and every five seconds thereafter. Missing, null, empty or
+whitespace `publicIp`, a missing `22/tcp` exposed port mapping, or an SSH probe
+that is not ready remains pending on the same Pod. Each poll rechecks exact GPU
+ID/count, terminal status, cloud type, on-demand price and absence of boolean
+`interruptible=true`. Once a syntactically valid IP and port mapping exist, a
+bounded batch-mode SSH `true` probe must pass before transfer starts. Probe output,
+host keys, IP, port, Pod ID and credentials are never printed. The private operator
+receipt retains its pre-existing exact Pod ID solely as the termination binding;
+new connectivity telemetry contains only `public_ip_present`, `tcp_port_present`,
+poll count, elapsed time, `ssh_ready`, outcome and a typed failure code. Missing IP/port at the deadline is
+`POD_CONNECTIVITY_TIMEOUT`; a reached endpoint whose SSH probe never succeeds is
+`POD_SSH_READINESS_TIMEOUT`; a vanished Pod is
+`POD_CONNECTIVITY_POD_MISSING`. GPU/count, interruptible, cloud or price drift and
+`FAILED`/`EXITED`/`TERMINATED` status fail immediately and enter the same
+receipt-bound cleanup path.
 The create request is validated offline before POST against the bounded official
 GPU Pod contract. It contains only name, digest-pinned image, cloud/compute type,
 the exact selected GPU ID with custom priority, one non-interruptible GPU, a
@@ -320,6 +341,8 @@ Stop on these operator blockers: `ACTIVE_POD_INVENTORY_NOT_ZERO`,
 `RUNPOD_AUTH_INVALID`, `RUNPOD_PERMISSION_DENIED`, `RUNPOD_RATE_LIMITED`,
 `RUNPOD_PROVIDER_ERROR`,
 `POD_GPU_ATTESTATION_TIMEOUT`, `POD_GPU_ATTESTATION_POD_MISSING`,
+`POD_CONNECTIVITY_TIMEOUT`, `POD_SSH_READINESS_TIMEOUT`,
+`POD_CONNECTIVITY_POD_MISSING`,
 `projected_cost_exceeds_target`,
 `soft_stop_budget_reached`, `termination_budget_reached`,
 `absolute_budget_reached`, `runtime_limit_reached`,

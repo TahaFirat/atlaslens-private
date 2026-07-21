@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from atlaslens_api.phase3f.runpod import (
     ON_DEMAND_PRICE_TOLERANCE_USD,
+    PodConnectivityProgressDiagnostic,
     PodGPUAttestationProgressDiagnostic,
     PodRentalAttestationDiagnostic,
     RunPodInventory,
@@ -39,6 +40,7 @@ _GPU_ATTESTATION_PATHS = frozenset(
 )
 _GPU_ATTESTATION_STATUSES = frozenset({"RUNNING", "EXITED", "TERMINATED"})
 _GPU_ATTESTATION_COST = "graphql_uninterruptable_price_match"
+_CONNECTIVITY_OUTCOMES = frozenset({"pending", "ready", "failed"})
 _FAILURE_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 
 
@@ -114,6 +116,14 @@ class OperatorReceipt:
     gpu_count: int | None = None
     cost_attestation: str | None = None
     create_http_class: str | None = None
+    allocation_attested_at: str | None = None
+    connectivity_outcome: str | None = None
+    connectivity_failure_code: str | None = None
+    public_ip_present: bool | None = None
+    tcp_port_present: bool | None = None
+    connectivity_poll_count: int | None = None
+    connectivity_elapsed_seconds: float | None = None
+    ssh_ready: bool | None = None
 
     def __post_init__(self) -> None:
         _require(bool(_RUN_ID.fullmatch(self.run_id)), "OPERATOR_RECEIPT_RUN_ID_INVALID")
@@ -151,6 +161,13 @@ class OperatorReceipt:
                 bool(self.pod_bound_at)
                 and "\r" not in self.pod_bound_at
                 and "\n" not in self.pod_bound_at,
+                "OPERATOR_RECEIPT_TIME_INVALID",
+            )
+        if self.allocation_attested_at is not None:
+            _require(
+                bool(self.allocation_attested_at)
+                and "\r" not in self.allocation_attested_at
+                and "\n" not in self.allocation_attested_at,
                 "OPERATOR_RECEIPT_TIME_INVALID",
             )
         maximum = _decimal(self.max_spend_usd, "OPERATOR_RECEIPT_BUDGET_INVALID")
@@ -385,6 +402,64 @@ class OperatorReceipt:
                 ),
                 "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
             )
+        if self.connectivity_outcome is not None:
+            _require(
+                self.pod_id is not None
+                and self.pod_bound_at is not None
+                and self.rental_evidence is not None
+                and self.connectivity_outcome in _CONNECTIVITY_OUTCOMES,
+                "OPERATOR_RECEIPT_CONNECTIVITY_INVALID",
+            )
+            _require(
+                self.connectivity_failure_code is None
+                or bool(_FAILURE_CODE.fullmatch(self.connectivity_failure_code)),
+                "OPERATOR_RECEIPT_CONNECTIVITY_INVALID",
+            )
+            _require(
+                (self.connectivity_outcome == "failed")
+                == (self.connectivity_failure_code is not None),
+                "OPERATOR_RECEIPT_CONNECTIVITY_INVALID",
+            )
+            _require(
+                isinstance(self.public_ip_present, bool)
+                and isinstance(self.tcp_port_present, bool)
+                and isinstance(self.ssh_ready, bool),
+                "OPERATOR_RECEIPT_CONNECTIVITY_INVALID",
+            )
+            _require(
+                isinstance(self.connectivity_poll_count, int)
+                and not isinstance(self.connectivity_poll_count, bool)
+                and 0 <= self.connectivity_poll_count <= 10_000,
+                "OPERATOR_RECEIPT_CONNECTIVITY_INVALID",
+            )
+            _require(
+                isinstance(self.connectivity_elapsed_seconds, int | float)
+                and not isinstance(self.connectivity_elapsed_seconds, bool)
+                and 0 <= self.connectivity_elapsed_seconds <= 180,
+                "OPERATOR_RECEIPT_CONNECTIVITY_INVALID",
+            )
+            if self.connectivity_outcome == "ready":
+                _require(
+                    self.public_ip_present is True
+                    and self.tcp_port_present is True
+                    and self.ssh_ready is True,
+                    "OPERATOR_RECEIPT_CONNECTIVITY_INVALID",
+                )
+        else:
+            _require(
+                all(
+                    value is None
+                    for value in (
+                        self.connectivity_failure_code,
+                        self.public_ip_present,
+                        self.tcp_port_present,
+                        self.connectivity_poll_count,
+                        self.connectivity_elapsed_seconds,
+                        self.ssh_ready,
+                    )
+                ),
+                "OPERATOR_RECEIPT_CONNECTIVITY_INVALID",
+            )
         object.__setattr__(self, "max_spend_usd", maximum)
         object.__setattr__(self, "soft_stop_usd", soft)
         object.__setattr__(self, "hard_stop_usd", hard)
@@ -448,6 +523,14 @@ class OperatorReceipt:
             "gpu_count": self.gpu_count,
             "cost_attestation": self.cost_attestation,
             "create_http_class": self.create_http_class,
+            "allocation_attested_at": self.allocation_attested_at,
+            "connectivity_outcome": self.connectivity_outcome,
+            "connectivity_failure_code": self.connectivity_failure_code,
+            "public_ip_present": self.public_ip_present,
+            "tcp_port_present": self.tcp_port_present,
+            "connectivity_poll_count": self.connectivity_poll_count,
+            "connectivity_elapsed_seconds": self.connectivity_elapsed_seconds,
+            "ssh_ready": self.ssh_ready,
             "secret_values_included": False,
         }
 
@@ -506,6 +589,16 @@ class OperatorReceipt:
             "cost_attestation",
             "create_http_class",
         }
+        connectivity_fields = {
+            "allocation_attested_at",
+            "connectivity_outcome",
+            "connectivity_failure_code",
+            "public_ip_present",
+            "tcp_port_present",
+            "connectivity_poll_count",
+            "connectivity_elapsed_seconds",
+            "ssh_ready",
+        }
         schema = row.get("schema")
         is_legacy = schema == _LEGACY_OPERATOR_RECEIPT_SCHEMA
         _require(
@@ -517,6 +610,12 @@ class OperatorReceipt:
                     frozenset(legacy_expected | evidence_fields),
                     frozenset(
                         legacy_expected | evidence_fields | gpu_attestation_fields
+                    ),
+                    frozenset(
+                        legacy_expected
+                        | evidence_fields
+                        | gpu_attestation_fields
+                        | connectivity_fields
                     ),
                 }
             ),
@@ -586,6 +685,23 @@ class OperatorReceipt:
         gpu_count = row.get("gpu_count") if has_gpu_attestation else None
         cost_attestation = row.get("cost_attestation") if has_gpu_attestation else None
         create_http_class = row.get("create_http_class") if has_gpu_attestation else None
+        has_connectivity = "connectivity_outcome" in row
+        allocation_attested_at = (
+            row.get("allocation_attested_at") if has_connectivity else None
+        )
+        connectivity_outcome = row.get("connectivity_outcome") if has_connectivity else None
+        connectivity_failure_code = (
+            row.get("connectivity_failure_code") if has_connectivity else None
+        )
+        public_ip_present = row.get("public_ip_present") if has_connectivity else None
+        tcp_port_present = row.get("tcp_port_present") if has_connectivity else None
+        connectivity_poll_count = (
+            row.get("connectivity_poll_count") if has_connectivity else None
+        )
+        connectivity_elapsed_seconds = (
+            row.get("connectivity_elapsed_seconds") if has_connectivity else None
+        )
+        ssh_ready = row.get("ssh_ready") if has_connectivity else None
         for optional_string in (
             pod_bound_at,
             rental_evidence,
@@ -604,12 +720,22 @@ class OperatorReceipt:
             observed_gpu_id_sha256,
             cost_attestation,
             create_http_class,
+            allocation_attested_at,
+            connectivity_outcome,
+            connectivity_failure_code,
         ):
             _require(
                 optional_string is None or isinstance(optional_string, str),
                 "OPERATOR_RECEIPT_EVIDENCE_INVALID",
             )
-        for optional_boolean in (request_interruptible, create_present, get_present):
+        for optional_boolean in (
+            request_interruptible,
+            create_present,
+            get_present,
+            public_ip_present,
+            tcp_port_present,
+            ssh_ready,
+        ):
             _require(
                 optional_boolean is None or isinstance(optional_boolean, bool),
                 "OPERATOR_RECEIPT_EVIDENCE_INVALID",
@@ -637,6 +763,22 @@ class OperatorReceipt:
             gpu_count is None
             or (isinstance(gpu_count, int) and not isinstance(gpu_count, bool)),
             "OPERATOR_RECEIPT_GPU_ATTESTATION_INVALID",
+        )
+        _require(
+            connectivity_poll_count is None
+            or (
+                isinstance(connectivity_poll_count, int)
+                and not isinstance(connectivity_poll_count, bool)
+            ),
+            "OPERATOR_RECEIPT_CONNECTIVITY_INVALID",
+        )
+        _require(
+            connectivity_elapsed_seconds is None
+            or (
+                isinstance(connectivity_elapsed_seconds, int | float)
+                and not isinstance(connectivity_elapsed_seconds, bool)
+            ),
+            "OPERATOR_RECEIPT_CONNECTIVITY_INVALID",
         )
         return cls(
             run_id=_string(row.get("run_id"), "OPERATOR_RECEIPT_RUN_ID_INVALID"),
@@ -700,6 +842,16 @@ class OperatorReceipt:
             gpu_count=cast(int | None, gpu_count),
             cost_attestation=cast(str | None, cost_attestation),
             create_http_class=cast(str | None, create_http_class),
+            allocation_attested_at=cast(str | None, allocation_attested_at),
+            connectivity_outcome=cast(str | None, connectivity_outcome),
+            connectivity_failure_code=cast(str | None, connectivity_failure_code),
+            public_ip_present=cast(bool | None, public_ip_present),
+            tcp_port_present=cast(bool | None, tcp_port_present),
+            connectivity_poll_count=cast(int | None, connectivity_poll_count),
+            connectivity_elapsed_seconds=cast(
+                float | None, connectivity_elapsed_seconds
+            ),
+            ssh_ready=cast(bool | None, ssh_ready),
         )
 
     def update_lifecycle(
@@ -725,6 +877,8 @@ class OperatorReceipt:
     def record_rental_attestation(
         self,
         attestation: PodRentalAttestationDiagnostic,
+        *,
+        allocation_attested_at: str | None = None,
     ) -> OperatorReceipt:
         _require(
             self.stage == "running"
@@ -750,6 +904,7 @@ class OperatorReceipt:
             get_interruptible_json_type=attestation.get_interruptible_json_type,
             pod_inventory_count=attestation.pod_inventory_count,
             explicit_false_source=attestation.explicit_false_source,
+            allocation_attested_at=allocation_attested_at,
         )
 
     def record_gpu_attestation_progress(
@@ -776,6 +931,28 @@ class OperatorReceipt:
             gpu_count=diagnostic.gpu_count,
             cost_attestation=diagnostic.cost_attestation,
             create_http_class=diagnostic.create_http_class,
+        )
+
+    def record_connectivity_progress(
+        self,
+        diagnostic: PodConnectivityProgressDiagnostic,
+    ) -> OperatorReceipt:
+        _require(
+            self.stage == "running"
+            and self.pod_id is not None
+            and self.pod_bound_at is not None
+            and self.rental_evidence is not None,
+            "OPERATOR_RECEIPT_STAGE_INVALID",
+        )
+        return replace(
+            self,
+            connectivity_outcome=diagnostic.outcome,
+            connectivity_failure_code=diagnostic.failure_code,
+            public_ip_present=diagnostic.public_ip_present,
+            tcp_port_present=diagnostic.tcp_port_present,
+            connectivity_poll_count=diagnostic.poll_count,
+            connectivity_elapsed_seconds=diagnostic.elapsed_seconds,
+            ssh_ready=diagnostic.ssh_ready,
         )
 
 

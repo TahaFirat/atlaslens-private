@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -25,11 +26,18 @@ from atlaslens_api.phase3f.operator import (
 from atlaslens_api.phase3f.runpod import (
     GPUAvailabilityReport,
     GPUOffer,
+    PodConnection,
+    PodConnectivityProgressDiagnostic,
     PodGPUAttestationProgressDiagnostic,
     PodRentalAttestationDiagnostic,
     RunPodInventory,
 )
-from atlaslens_api.phase3f.safety import PodRecord
+from atlaslens_api.phase3f.safety import (
+    BudgetPolicy,
+    PodRecord,
+    PodRequest,
+    RunPodLease,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 START_PATH = ROOT / "scripts" / "start-phase3f-runpod.ps1"
@@ -199,6 +207,19 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
             cost_attestation="graphql_uninterruptable_price_match",
         ),
     )
+    module._record_operator_connectivity_progress(
+        path,
+        expected_run_id=receipt.run_id,
+        diagnostic=PodConnectivityProgressDiagnostic(
+            outcome="ready",
+            failure_code=None,
+            public_ip_present=True,
+            tcp_port_present=True,
+            poll_count=4,
+            elapsed_seconds=6.0,
+            ssh_ready=True,
+        ),
+    )
 
     recorded = read_operator_receipt(path)
     assert recorded.pod_id == "created-pod"
@@ -216,9 +237,108 @@ def test_attestation_is_atomically_recorded_after_pod_binding(tmp_path: Path) ->
     assert recorded.observed_gpu_id == "NVIDIA RTX A5000"
     assert recorded.gpu_count == 1
     assert recorded.cost_attestation == "graphql_uninterruptable_price_match"
+    assert recorded.allocation_attested_at is not None
+    assert recorded.connectivity_outcome == "ready"
+    assert recorded.public_ip_present is True
+    assert recorded.tcp_port_present is True
+    assert recorded.connectivity_poll_count == 4
+    assert recorded.connectivity_elapsed_seconds == 6.0
+    assert recorded.ssh_ready is True
     assert recorded.to_dict()["secret_values_included"] is False
     assert "interruptible_field_verified" not in recorded.to_dict()
+    assert "192.0.2.10" not in repr(recorded.to_dict())
+    assert "10341" not in repr(recorded.to_dict())
     assert not tuple(path.parent.glob("*.partial"))
+
+
+def test_ready_allocation_advances_to_transfer_and_training_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_supervisor()
+    receipt = _receipt()
+    receipt_path = tmp_path / "operator" / "phase3f-current.json"
+    write_operator_receipt(receipt_path, receipt)
+    request = PodRequest(
+        run_marker=receipt.run_marker,
+        idempotency_key="phase3f-connectivity-test",
+        hourly_cost_usd=Decimal("0.50"),
+        max_runtime_seconds=60,
+        gpu_type_id="NVIDIA L4",
+        public_ports=(22,),
+    )
+    lease = RunPodLease(
+        PodRecord("phase3f-pod", receipt.run_marker),
+        request,
+        BudgetPolicy(),
+    )
+    transitions: list[str] = []
+    watched: list[list[str]] = []
+
+    class _ReadyClient:
+        def await_pod_connectivity(
+            self,
+            pod: PodRecord,
+            observed_request: PodRequest,
+            *,
+            ssh_probe: object,
+        ) -> PodConnection:
+            assert pod == lease.pod
+            assert observed_request == request
+            assert callable(ssh_probe)
+            transitions.append("connectivity_ready")
+            return PodConnection(
+                pod_id=pod.pod_id,
+                public_ip="192.0.2.10",
+                public_ssh_port=10341,
+                gpu_display_name="NVIDIA L4",
+                hourly_price=Decimal("0.39"),
+            )
+
+    def fake_run_command(arguments: list[str], *, timeout_seconds: float) -> None:
+        assert timeout_seconds > 0
+        transitions.append("transfer_command")
+        assert arguments
+
+    def fake_run_watched(
+        arguments: list[str],
+        *,
+        lease: RunPodLease,
+        started: float,
+    ) -> None:
+        assert lease.pod.pod_id == "phase3f-pod"
+        assert started > 0
+        transitions.append("training_started")
+        watched.append(arguments)
+
+    monkeypatch.setattr(module, "_run_command", fake_run_command)
+    monkeypatch.setattr(module, "_run_watched", fake_run_watched)
+    started = time.monotonic()
+
+    result = module._operation(
+        _ReadyClient(),
+        lease,
+        bundle_root=tmp_path / "bundle",
+        key=tmp_path / "key",
+        known_hosts=tmp_path / "known-hosts",
+        download_path=tmp_path / "output.tar",
+        run_id=receipt.run_id,
+        started=started,
+        operator_receipt=receipt,
+        operator_receipt_path=receipt_path,
+        remote_job_seconds=60,
+        training_dataset=tmp_path / "sealed-acquisition.tar",
+    )
+
+    assert transitions.index("connectivity_ready") < transitions.index("transfer_command")
+    assert transitions.index("transfer_command") < transitions.index("training_started")
+    assert len(watched) == 1
+    assert "training_job.py" in " ".join(watched[0])
+    assert result["gpu"] == "NVIDIA L4"
+    events = [json.loads(line)["event"] for line in capsys.readouterr().out.splitlines()]
+    assert events.index("PHASE3F_SSH_READY") < events.index("PHASE3F_TRANSFER_STARTED")
+    assert events.index("PHASE3F_TRANSFER_VERIFIED") < events.index("PHASE3F_CLOUD_JOB_STARTED")
 
 
 def test_legacy_operator_receipt_remains_readable(tmp_path: Path) -> None:
@@ -256,6 +376,14 @@ def test_legacy_operator_receipt_remains_readable(tmp_path: Path) -> None:
         "gpu_count",
         "cost_attestation",
         "create_http_class",
+        "allocation_attested_at",
+        "connectivity_outcome",
+        "connectivity_failure_code",
+        "public_ip_present",
+        "tcp_port_present",
+        "connectivity_poll_count",
+        "connectivity_elapsed_seconds",
+        "ssh_ready",
     ):
         del payload[field]
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -283,6 +411,14 @@ def test_previous_v2_operator_receipt_remains_readable(tmp_path: Path) -> None:
         "gpu_count",
         "cost_attestation",
         "create_http_class",
+        "allocation_attested_at",
+        "connectivity_outcome",
+        "connectivity_failure_code",
+        "public_ip_present",
+        "tcp_port_present",
+        "connectivity_poll_count",
+        "connectivity_elapsed_seconds",
+        "ssh_ready",
     ):
         del payload[field]
     path.write_text(json.dumps(payload), encoding="utf-8")

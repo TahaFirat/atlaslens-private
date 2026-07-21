@@ -12,9 +12,12 @@ import pytest
 from atlaslens_api.phase3f.runpod import (
     GRAPHQL_URL,
     MAPILLARY_ENV_REFERENCE,
+    POD_CONNECTIVITY_TIMEOUT_SECONDS,
     POD_VOLUME_GB,
     REST_BASE_URL,
     GPUOffer,
+    PodConnection,
+    PodConnectivityProgressDiagnostic,
     PodGPUAttestationProgressDiagnostic,
     RunPodAPIError,
     RunPodConfig,
@@ -261,11 +264,13 @@ def _assert_secret_safe(request: httpx.Request) -> None:
 class _FakeClock:
     def __init__(self) -> None:
         self.now = 0.0
+        self.sleeps: list[float] = []
 
     def monotonic(self) -> float:
         return self.now
 
     def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
         self.now += seconds
 
 
@@ -1997,6 +2002,336 @@ def test_connection_requires_running_ssh_only_pod() -> None:
     assert connection.public_ssh_port == 10341
     assert connection.gpu_display_name == "NVIDIA L4"
     assert connection.hourly_price == Decimal("0.39")
+
+
+@pytest.mark.parametrize("public_ip", [None, "", "   "])
+def test_allocation_attestation_does_not_require_eventual_public_ip(
+    public_ip: object,
+) -> None:
+    rest_create_calls = 0
+    exact_get_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal rest_create_calls, exact_get_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            rest_create_calls += 1
+            return httpx.Response(201, json=_created_payload())
+        if request.url.path.endswith("/pods/created-pod"):
+            exact_get_calls += 1
+            payload = _attested_pod_payload(gpu_shape="machine.gpuTypeId")
+            payload["publicIp"] = public_ip
+            return httpx.Response(200, json=payload)
+        if request.url.path.endswith("/pods"):
+            return httpx.Response(
+                200,
+                json=[{"id": "created-pod", "name": "phase3f-run-001"}],
+            )
+        return httpx.Response(200, json=[])
+
+    with _client(handler) as client:
+        created = client.create_pod(_request())
+
+    assert created == PodRecord("created-pod", "phase3f-run-001")
+    assert rest_create_calls == 1
+    assert exact_get_calls == 1
+
+
+def test_connectivity_waits_for_ip_port_and_ssh_on_same_bound_pod() -> None:
+    clock = _FakeClock()
+    exact_get_calls = 0
+    rest_create_calls = 0
+    exact_get_paths: list[str] = []
+    probes: list[tuple[str, int]] = []
+    progress: list[PodConnectivityProgressDiagnostic] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal exact_get_calls, rest_create_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            rest_create_calls += 1
+            return httpx.Response(201, json=_created_payload())
+        if request.url.path.endswith("/pods/created-pod"):
+            exact_get_calls += 1
+            exact_get_paths.append(request.url.path)
+            payload = _attested_pod_payload(gpu_shape="machine.gpuTypeId")
+            if exact_get_calls <= 2:
+                payload["publicIp"] = None
+            elif exact_get_calls == 3:
+                payload["portMappings"] = None
+            else:
+                payload["portMappings"] = {"22": 10341}
+            return httpx.Response(200, json=payload)
+        if request.url.path.endswith("/pods"):
+            return httpx.Response(
+                200,
+                json=[{"id": "created-pod", "name": "phase3f-run-001"}],
+            )
+        return httpx.Response(200, json=[])
+
+    def probe(connection: PodConnection, _timeout_seconds: float) -> bool:
+        probes.append((connection.public_ip, connection.public_ssh_port))
+        return len(probes) == 2
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        record_connectivity_progress=progress.append,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    ) as client:
+        pod = client.create_pod(_request())
+        connection = client.await_pod_connectivity(
+            pod,
+            _request(),
+            ssh_probe=probe,
+        )
+
+    assert rest_create_calls == 1
+    assert exact_get_calls == 5
+    assert set(exact_get_paths) == {"/v1/pods/created-pod"}
+    assert probes == [("192.0.2.10", 10341), ("192.0.2.10", 10341)]
+    assert clock.now == 6
+    assert connection.public_ip == "192.0.2.10"
+    assert connection.public_ssh_port == 10341
+    assert [item.public_ip_present for item in progress[-4:]] == [False, True, True, True]
+    assert [item.tcp_port_present for item in progress[-4:]] == [False, False, True, True]
+    assert progress[-1].outcome == "ready"
+    assert progress[-1].poll_count == 4
+    assert progress[-1].ssh_ready is True
+
+
+@pytest.mark.parametrize(
+    ("fields_ready", "expected_code"),
+    [
+        (False, "POD_CONNECTIVITY_TIMEOUT"),
+        (True, "POD_SSH_READINESS_TIMEOUT"),
+    ],
+)
+def test_connectivity_timeout_is_monotonic_and_never_recreates(
+    fields_ready: bool,
+    expected_code: str,
+) -> None:
+    clock = _FakeClock()
+    rest_create_calls = 0
+    pod_present = False
+    deleted: list[str] = []
+    exact_get_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal rest_create_calls, pod_present, exact_get_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            rest_create_calls += 1
+            pod_present = True
+            return httpx.Response(201, json=_created_payload())
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            pod_present = False
+            return httpx.Response(204)
+        if request.url.path.endswith("/pods/created-pod"):
+            exact_get_calls += 1
+            payload = _attested_pod_payload(gpu_shape="machine.gpuTypeId")
+            if fields_ready:
+                payload["portMappings"] = {"22": 10341}
+            else:
+                payload["publicIp"] = None
+            return httpx.Response(200, json=payload)
+        if request.url.path.endswith("/pods"):
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        return httpx.Response(200, json=[])
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        connectivity_timeout_seconds=10,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(RunPodAPIError, match=expected_code):
+            session.execute(
+                _request(),
+                lambda lease: client.await_pod_connectivity(
+                    lease.pod,
+                    lease.request,
+                    ssh_probe=lambda _connection, _timeout: False,
+                ),
+            )
+        final = client.last_connectivity_progress
+
+    assert rest_create_calls == 1
+    assert exact_get_calls == 6  # one allocation GET plus five connectivity GETs
+    assert deleted == ["/v1/pods/created-pod"]
+    assert final is not None
+    assert final.outcome == "failed"
+    assert final.failure_code == expected_code
+    assert final.elapsed_seconds == 10
+    assert POD_CONNECTIVITY_TIMEOUT_SECONDS == 180
+    assert session.last_audit is not None
+    assert session.last_audit.create_attempts == 1
+    assert session.last_audit.termination_verified is True
+
+
+def test_connectivity_poll_schedule_switches_from_two_to_five_seconds() -> None:
+    clock = _FakeClock()
+    exact_get_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal exact_get_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            return httpx.Response(201, json=_created_payload())
+        if request.url.path.endswith("/pods/created-pod"):
+            exact_get_calls += 1
+            payload = _attested_pod_payload(gpu_shape="machine.gpuTypeId")
+            payload["publicIp"] = None
+            return httpx.Response(200, json=payload)
+        if request.url.path.endswith("/pods"):
+            return httpx.Response(
+                200,
+                json=[{"id": "created-pod", "name": "phase3f-run-001"}],
+            )
+        return httpx.Response(200, json=[])
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+        connectivity_timeout_seconds=35,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    ) as client:
+        pod = client.create_pod(_request())
+        with pytest.raises(RunPodAPIError, match="POD_CONNECTIVITY_TIMEOUT"):
+            client.await_pod_connectivity(
+                pod,
+                _request(),
+                ssh_probe=lambda _connection, _timeout: False,
+            )
+
+    assert clock.sleeps == [2.0] * 15 + [5.0]
+    assert clock.now == 35
+    assert exact_get_calls == 17  # one allocation GET plus sixteen connectivity GETs
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("gpu", "POD_CONNECTIVITY_GPU_MISMATCH"),
+        ("missing", "POD_CONNECTIVITY_POD_MISSING"),
+        ("interruptible", "POD_CONNECTIVITY_INTERRUPTIBLE_TRUE"),
+        ("price", "POD_CONNECTIVITY_PRICE_MISMATCH"),
+        ("cloud", "POD_CONNECTIVITY_CLOUD_TYPE_MISMATCH"),
+        ("exited", "POD_CONNECTIVITY_TERMINAL_EXITED"),
+    ],
+)
+def test_connectivity_terminal_failure_cleans_only_receipt_bound_pod(
+    failure: str,
+    expected_code: str,
+) -> None:
+    pod_present = False
+    rest_create_calls = 0
+    exact_get_calls = 0
+    deleted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pod_present, rest_create_calls, exact_get_calls
+        if str(request.url) == GRAPHQL_URL:
+            return _graphql_response(request)
+        if request.method == "POST":
+            rest_create_calls += 1
+            pod_present = True
+            return httpx.Response(201, json=_created_payload())
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            pod_present = False
+            return httpx.Response(204)
+        if request.url.path.endswith("/pods/created-pod"):
+            exact_get_calls += 1
+            if exact_get_calls > 1 and failure == "missing":
+                return httpx.Response(404, json={"code": "NOT_FOUND"})
+            payload = _attested_pod_payload(gpu_shape="machine.gpuTypeId")
+            payload["portMappings"] = {"22": 10341}
+            if exact_get_calls > 1 and failure == "gpu":
+                payload["machine"] = {
+                    "gpuTypeId": "NVIDIA L4",
+                    "gpuType": {"count": 1},
+                }
+            if exact_get_calls > 1 and failure == "interruptible":
+                payload["interruptible"] = True
+            if exact_get_calls > 1 and failure == "price":
+                payload["costPerHr"] = "0.46"
+            if exact_get_calls > 1 and failure == "cloud":
+                payload["machine"] = {
+                    "gpuTypeId": "NVIDIA RTX A5000",
+                    "gpuType": {"count": 1},
+                    "secureCloud": False,
+                }
+            if exact_get_calls > 1 and failure == "exited":
+                payload["desiredStatus"] = "EXITED"
+            return httpx.Response(200, json=payload)
+        if request.url.path.endswith("/pods"):
+            rows = (
+                [{"id": "created-pod", "name": "phase3f-run-001"}]
+                if pod_present
+                else []
+            )
+            return httpx.Response(200, json=rows)
+        return httpx.Response(200, json=[])
+
+    with RunPodV1Client(
+        api_token=TOKEN,
+        config=_config(),
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        session = SinglePodSession(client)
+        with pytest.raises(RunPodAPIError, match=expected_code):
+            session.execute(
+                _request(),
+                lambda lease: client.await_pod_connectivity(
+                    lease.pod,
+                    lease.request,
+                    ssh_probe=lambda _connection, _timeout: True,
+                ),
+            )
+        final = client.last_connectivity_progress
+
+    assert rest_create_calls == 1
+    assert deleted == ["/v1/pods/created-pod"]
+    assert final is not None
+    assert final.failure_code == expected_code
+    assert session.last_audit is not None
+    assert session.last_audit.termination_verified is True
+
+
+def test_connectivity_diagnostic_redacts_ip_port_pod_and_secrets() -> None:
+    diagnostic = PodConnectivityProgressDiagnostic(
+        outcome="ready",
+        failure_code=None,
+        public_ip_present=True,
+        tcp_port_present=True,
+        poll_count=4,
+        elapsed_seconds=6.0,
+        ssh_ready=True,
+    )
+
+    public = repr(diagnostic.to_public_dict())
+    assert "203.0.113.8" not in public
+    assert "10341" not in public
+    assert "created-pod" not in public
+    assert TOKEN not in public
 
 
 @pytest.mark.parametrize("container_disk_gb", [0, 41])

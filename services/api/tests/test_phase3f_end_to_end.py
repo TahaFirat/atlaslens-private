@@ -813,6 +813,22 @@ def test_billing_lag_keeps_local_lifecycle_estimate_nonzero(tmp_path: Path) -> N
     assert reconciliation.projected_total_usd > Decimal("3.11")
 
 
+def test_live_budget_reconciliation_values_remain_exact(tmp_path: Path) -> None:
+    module = _load_supervisor()
+
+    reconciliation = module._budget_reconciliation(
+        _budget_policy(module),
+        tmp_path,
+        _billing_snapshot(module, balance="9.1634640445", current_spend="0"),
+    )
+
+    assert reconciliation.actual_billed_usd == Decimal("0.8365359555")
+    assert reconciliation.active_exposure_usd == Decimal("0")
+    assert reconciliation.conservative_unbilled_estimate_usd == Decimal("0")
+    assert reconciliation.proposed_run_max_usd == Decimal("3")
+    assert reconciliation.remaining_authorized_usd == Decimal("9.1634640445")
+
+
 def test_duplicate_provider_billing_receipt_is_counted_once(tmp_path: Path) -> None:
     module = _load_supervisor()
     receipts = tmp_path / "_receipts"
