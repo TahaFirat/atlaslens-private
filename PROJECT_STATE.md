@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-22T10:50:56+03:00
+last_verified_at: 2026-07-22T15:07:47+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: phase3f_actual_runpod_torch_environment_gate_ready_for_live_bootstrap
+product_phase_status: phase3f_offline_torchvision_companion_gate_ready_for_review
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -564,7 +564,17 @@ phase_3f_torch_tests: pass_396_phase3f
 phase_3f_torch_static: pass_ruff_strict_mypy261_and_control5_powershell5_diff_secret_scan
 phase_3f_torch_dataset_hashes: readiness_2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9_sealed_b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1_manifest_f30d8de3f1331a03553895d16c281e6691698700fa6ae8993afdd5d98f26d2d4_inventory_f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93_assets830
 phase_3f_torch_live_actions: zero_resume_zero_execute_zero_network_zero_runpod_zero_mapillary_zero_cloud_mutation_zero_dataset_runtime_write
-phase_3f_next_action: run_exact_resume_ce23_with_explicit_cloud_consent_after_review
+phase_3f_companion_live_attempt: 3ec1d887e8f5eede96aaa1f89ca1337d_exit91_torch2_9_1_cu128_cuda12_8_torchvision_missing_training_false_cleanup0_0_0_0
+phase_3f_companion_wheel: torchvision0_24_1_cu128_cp312_manylinux2_28_x86_64_sha256_cf84eae1d2d12a7d261a7496eca00dd927b71792011b1e84d4162c950eb3201d
+phase_3f_companion_wheelhouse: artifacts17_lock_ad830821871642321c5ceb3704a51d339dfec6782e30d95236ae8d7a1fc32011_inventory_eb9cf6cad5d30f67b16955be7a376a5af54ea8649ab08d7f21680adc06d48cc0
+phase_3f_companion_contract: 779ca3ae54e653429dfe739260c3a81c338f0124b312af346004c6c3b5dd5b07
+phase_3f_companion_identity: torch_version_cuda_cp312_module_file_pathhash_device_inode_exact_before_after
+phase_3f_companion_plan: pass_transfer_ready_blockers0_create0_network0_runpod0_cloud_mutations0_dataset_writes0
+phase_3f_companion_tests: pass_403_phase3f_skip1_offline_container_docker_unavailable
+phase_3f_companion_static: pass_ruff_strict_mypy261_and_control5_powershell5
+phase_3f_companion_dataset_hashes: readiness_2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9_sealed_b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1_inventory_f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93_assets830
+phase_3f_companion_live_actions: zero_resume_zero_execute_zero_runpod_zero_mapillary_zero_cloud_mutation_zero_dataset_runtime_write
+phase_3f_next_action: read_only_remote_environment_plan_review
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
 phase_6c_dataset_qa_ui_gate: pass
@@ -619,6 +629,49 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F offline torchvision companion gate
+
+Status: **OFFLINE VERIFIED - LIVE BOOTSTRAP/RETRY NOT EXECUTED**.
+
+Live attempt `3ec1d887e8f5eede96aaa1f89ca1337d` reached the exact pinned
+RunPod image with Python 3.12, Torch `2.9.1+cu128` and CUDA 12.8, but torchvision
+was absent. Base preflight exited 91 with `REMOTE_DEPENDENCY_MODULE_MISSING`,
+`failed_module=torchvision`; training never started, no checkpoint exists, and
+receipt-bound cleanup restored Pod/endpoint/network-volume/template inventory to
+0/0/0/0. The image cannot repair that omission on an unchanged Resume.
+
+The local framework wheelhouse now contains the official CPython 3.12 Linux
+x86-64 CUDA 12.8 `torchvision 0.24.1+cu128` wheel with SHA-256
+`cf84eae1d2d12a7d261a7496eca00dd927b71792011b1e84d4162c950eb3201d`,
+plus all 16 lightweight project wheels. The 17-artifact lock SHA-256 is
+`ad830821871642321c5ceb3704a51d339dfec6782e30d95236ae8d7a1fc32011`;
+the canonical transfer inventory SHA-256 is
+`eb9cf6cad5d30f67b16955be7a376a5af54ea8649ab08d7f21680adc06d48cc0`.
+Every artifact is rehashed before and after staging, and the Pod is forbidden to
+resolve an index or download Torch. Missing/corrupt material blocks before RunPod
+credentials or mutation with an exact torchvision typed error.
+
+Bootstrap records Torch version, CUDA version, CPython ABI, module-file SHA-256,
+hashed resolved module path, device and inode before installing only the companion
+with `--no-index --no-deps`. The project preflight requires an identical identity
+after installation, then requires torchvision compiled ops, CUDA allocation and
+the bounded MegaLoc AMP forward/backward/optimizer smoke before training can
+start. A local same-shape state-machine simulation reaches that final gate without
+Torch download; no local Docker copy of the pinned image was available, so real
+compiled-op/CUDA success is intentionally not claimed offline.
+
+The mutation-free `RemoteEnvironmentPlan` reports 17 verified artifacts, transfer
+ready, no local blockers, no package-index resolution on Pod, and zero create,
+network, RunPod, cloud-mutation and dataset-write counts. All 403 runnable Phase
+3F tests pass; one offline-container test is skipped because local Docker is
+unavailable. Ruff, strict mypy for 261 service source files and five control scripts,
+all five PowerShell parsers, diff validation and changed-file secret scanning pass.
+No Resume/Execute, RunPod/Mapillary call, Pod/resource mutation or corpus/runtime
+write occurred. The sealed corpus remains 830 assets with readiness
+`2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9`
+and sealed-assets
+`b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1`.
 
 ## Product Phase 3F observed RunPod training environment compatibility
 

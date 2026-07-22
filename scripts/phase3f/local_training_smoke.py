@@ -61,6 +61,9 @@ GRADIENT_ACCUMULATION: Final = 4
 MINIMUM_TEMP_FREE_BYTES: Final = 12 * 1024**3
 _RUN_ID = set("0123456789abcdef")
 _CHECKPOINT_GENERATION = re.compile(r"^generation-[0-9]{8}-[0-9a-f]{16}$")
+_LOCAL_ENVIRONMENT_IDENTITY_SHA256: Final = hashlib.sha256(
+    b"atlaslens-phase3f-local-unbound-environment-v1"
+).hexdigest()
 
 
 class SmokeError(RuntimeError):
@@ -347,6 +350,7 @@ def _worker_initial(args: argparse.Namespace) -> int:
             dataset_readiness_sha256=readiness_sha256,
             sealed_assets_sha256=sealed_assets_sha256,
             training_config_sha256_value=config_sha256,
+            environment_identity_sha256=_LOCAL_ENVIRONMENT_IDENTITY_SHA256,
         )
         rng_probe = _rng_probe(runtime)
         pointer = json.loads((checkpoint_root / "latest.json").read_text(encoding="utf-8"))
@@ -409,6 +413,7 @@ def _worker_resume(args: argparse.Namespace) -> int:
             dataset_readiness_sha256=readiness_sha256,
             sealed_assets_sha256=sealed_assets_sha256,
             training_config_sha256_value=config_sha256,
+            environment_identity_sha256=_LOCAL_ENVIRONMENT_IDENTITY_SHA256,
         )
         _require(state["next_epoch"] == 1, "SMOKE_RESUME_EPOCH_INVALID")
         _require(
@@ -454,6 +459,7 @@ def _worker_resume(args: argparse.Namespace) -> int:
             dataset_readiness_sha256=readiness_sha256,
             sealed_assets_sha256=sealed_assets_sha256,
             training_config_sha256_value=config_sha256,
+            environment_identity_sha256=_LOCAL_ENVIRONMENT_IDENTITY_SHA256,
         )
         reference_matrix = runtime.describe(
             [sealed.root / item.relative_path for item in references[:16]],

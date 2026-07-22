@@ -8,10 +8,17 @@ from pathlib import Path
 
 import pytest
 
+from atlaslens_api.phase3f import supervisor as supervisor_module
+from atlaslens_api.phase3f.packaging import SourceArchive, SourceManifest
+from atlaslens_api.phase3f.remote_environment import (
+    FrameworkWheelArtifact,
+    FrameworkWheelhouse,
+)
 from atlaslens_api.phase3f.runpod import RunPodInventory
 from atlaslens_api.phase3f.safety import PodRecord
 from atlaslens_api.phase3f.supervisor import (
     Phase3FSupervisorError,
+    prepare_transfer_bundle,
     require_empty_inventory,
     require_inventory_restored,
     verify_output_archive,
@@ -20,6 +27,82 @@ from atlaslens_api.phase3f.supervisor import (
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def test_transfer_bundle_checksum_binds_offline_framework_wheels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"model")
+    model_sha = _sha256(b"model")
+    wheel = tmp_path / "wheel.whl"
+    wheel.write_bytes(b"wheel")
+    wheel_sha = _sha256(b"wheel")
+    artifact = FrameworkWheelArtifact(
+        path=wheel,
+        distribution="torchvision",
+        version="0.24.1+cu128",
+        filename="torchvision-fixture.whl",
+        size_bytes=5,
+        sha256=wheel_sha,
+        source="official_pytorch",
+    )
+    inventory = {
+        "schema": "atlaslens-phase3f-framework-transfer-inventory-v1",
+        "artifact_count": 1,
+        "artifacts": [{"filename": artifact.filename, "sha256": wheel_sha}],
+    }
+    wheelhouse = FrameworkWheelhouse(
+        root=tmp_path,
+        artifacts=(artifact,),
+        inventory=inventory,
+        inventory_sha256=_sha256(
+            json.dumps(inventory, separators=(",", ":"), sort_keys=True).encode()
+        ),
+        companion=artifact,
+    )
+    monkeypatch.setattr(supervisor_module, "MODEL_SIZE", 5)
+    monkeypatch.setattr(supervisor_module, "MODEL_SHA256", model_sha)
+    monkeypatch.setattr(supervisor_module, "SOURCE_LF_SHA256", "1" * 64)
+    monkeypatch.setattr(supervisor_module, "LICENSE_LF_SHA256", "2" * 64)
+    monkeypatch.setattr(
+        supervisor_module,
+        "build_source_manifest",
+        lambda *_args, **_kwargs: SourceManifest("a" * 40, (), 0),
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "write_source_archive",
+        lambda *_args, **_kwargs: SourceArchive("source.tar", "3" * 64, 1, "4" * 64, 0),
+    )
+    monkeypatch.setattr(supervisor_module, "verify_artifact", lambda *_a, **_k: None)
+
+    def materialize(
+        _source: Path,
+        _name: str,
+        destination: Path,
+        output_name: str,
+        _trust: object,
+    ) -> object:
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / output_name).write_text("fixture", encoding="ascii")
+        digest = "1" * 64 if output_name.endswith(".py") else "2" * 64
+        return type("Result", (), {"canonical_lf_sha256": digest})()
+
+    monkeypatch.setattr(supervisor_module, "materialize_trusted_lf", materialize)
+    bundle = prepare_transfer_bundle(
+        tmp_path,
+        tmp_path / "transfer",
+        commit_sha="a" * 40,
+        tracked_paths=(),
+        model_path=model,
+        vendor_root=tmp_path,
+        framework_wheelhouse=wheelhouse,
+    )
+    assert bundle.framework_wheelhouse_path is not None
+    assert (bundle.framework_wheelhouse_path / artifact.filename).read_bytes() == b"wheel"
+    assert bundle.framework_inventory_path is not None
+    assert json.loads(bundle.framework_inventory_path.read_text()) == inventory
 
 
 def _valid_output_tar(path: Path) -> tuple[str, int]:

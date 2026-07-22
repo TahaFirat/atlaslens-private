@@ -52,9 +52,11 @@ from atlaslens_api.phase3f.remote_environment import (  # noqa: E402
     DEPENDENCY_FAILURE_CODES,
     REMOTE_DEPENDENCY_REPORT_SCHEMA,
     REMOTE_ENVIRONMENT_RECEIPT_SCHEMA,
+    FrameworkWheelhouse,
     RemoteEnvironmentError,
     load_remote_environment_contract,
     sha256_file as environment_sha256_file,
+    verify_framework_wheelhouse,
 )
 from atlaslens_api.phase3f.safety import (  # noqa: E402
     BudgetPolicy,
@@ -115,6 +117,9 @@ FAILURE_SALVAGE_SECONDS = 5 * 60
 DEPENDENCY_BOOTSTRAP_SECONDS = 10 * 60
 REMOTE_ENVIRONMENT_CONTRACT = ROOT / "config" / "phase3f-remote-environment.json"
 REMOTE_REQUIREMENTS_LOCK = ROOT / "config" / "phase3f-training-requirements.lock"
+REMOTE_FRAMEWORK_WHEELHOUSE = (
+    ROOT / ".local" / "phase3f" / "wheelhouse" / "linux-cp312-cu128"
+)
 _SUPERVISOR_RECEIPT_SCHEMA = "atlaslens-phase3f-local-supervisor-receipt-v1"
 _BUDGET_RECONCILIATION_SCHEMA = "atlaslens-phase3f-budget-reconciliation-v1"
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -359,16 +364,17 @@ def _verify_local_readiness() -> None:
     _require_model_receipt(model_root / "receipt.json")
 
 
-def _remote_environment_hashes() -> tuple[str, str]:
+def _remote_environment_preflight() -> tuple[str, str, FrameworkWheelhouse]:
     contract_sha256 = environment_sha256_file(REMOTE_ENVIRONMENT_CONTRACT)
     lock_sha256 = environment_sha256_file(REMOTE_REQUIREMENTS_LOCK)
-    load_remote_environment_contract(
+    contract = load_remote_environment_contract(
         REMOTE_ENVIRONMENT_CONTRACT,
         REMOTE_REQUIREMENTS_LOCK,
         expected_contract_sha256=contract_sha256,
         expected_lock_sha256=lock_sha256,
     )
-    return contract_sha256, lock_sha256
+    wheelhouse = verify_framework_wheelhouse(contract, REMOTE_FRAMEWORK_WHEELHOUSE)
+    return contract_sha256, lock_sha256, wheelhouse
 
 
 def _require_safe_runtime_path(path: Path) -> Path:
@@ -972,8 +978,19 @@ def _operation(
 
     remote_transfer = "/workspace/phase3f-transfer"
     _emit("PHASE3F_TRANSFER_STARTED", run_id=run_id)
+    _require(
+        bundle_root.joinpath("wheelhouse").is_dir()
+        and bundle_root.joinpath(
+            "wheelhouse", "framework-checksum-inventory.json"
+        ).is_file(),
+        "REMOTE_TORCHVISION_COMPANION_MISSING",
+    )
     _run_command(
-        [*ssh, "mkdir -p /workspace/phase3f-transfer/vendor"],
+        [
+            *ssh,
+            "mkdir -p /workspace/phase3f-transfer/vendor "
+            "/workspace/phase3f-transfer/wheelhouse",
+        ],
         timeout_seconds=remaining(),
     )
     transfer_items = [
@@ -982,6 +999,13 @@ def _operation(
         (bundle_root / "vendor" / "megaloc_model.py", f"{remote_transfer}/vendor/megaloc_model.py"),
         (bundle_root / "vendor" / "LICENSE", f"{remote_transfer}/vendor/LICENSE"),
     ]
+    transfer_items.extend(
+        (path, f"{remote_transfer}/wheelhouse/{path.name}")
+        for path in sorted(
+            (bundle_root / "wheelhouse").iterdir(), key=lambda item: item.name
+        )
+        if path.is_file() and not path.is_symlink()
+    )
     if training_dataset is not None:
         transfer_items.append((training_dataset, f"{remote_transfer}/sealed-acquisition.tar"))
     if resume_archive is not None:
@@ -1047,6 +1071,9 @@ def _operation(
         f"--requirements-lock {remote_lock} "
         f"--expected-contract-sha256 {environment_contract_sha256} "
         f"--expected-lock-sha256 {dependency_lock_sha256} "
+        "--wheelhouse /workspace/phase3f-transfer/wheelhouse "
+        "--wheelhouse-inventory "
+        "/workspace/phase3f-transfer/wheelhouse/framework-checksum-inventory.json "
         "--vendor-root /workspace/phase3f-transfer/vendor "
         "--model /workspace/phase3f-transfer/model.safetensors "
         f"--venv-root {remote_venv} "
@@ -1138,6 +1165,9 @@ def _operation(
             "PHASE3F_REMOTE_LIGHTWEIGHT_DEPENDENCIES_READY",
             run_id=run_id,
             torch_downloaded=False,
+            torchvision_companion_source="transferred_hash_pinned_wheel",
+            package_index_resolution_on_pod=False,
+            torch_identity_unchanged=True,
         )
         _emit(
             "PHASE3F_REMOTE_TRAINING_SMOKE_PASSED",
@@ -1774,6 +1804,7 @@ def _run_dry_run(
     _disk_gate()
     head, _tracked = _preflight_repository()
     _verify_local_readiness()
+    contract_sha256, lock_sha256, wheelhouse = _remote_environment_preflight()
     require_startable_receipt(receipt_path)
     config = RunPodConfig(
         image_name=IMAGE,
@@ -1799,6 +1830,13 @@ def _run_dry_run(
                 "max_wall_minutes": policy.max_runtime_seconds // 60,
                 "model_sha256": MODEL_SHA256,
                 "vendor_canonical_lf_sha256": SOURCE_LF_SHA256,
+                "environment_contract_sha256": contract_sha256,
+                "dependency_lock_sha256": lock_sha256,
+                "framework_wheelhouse_inventory_sha256": (
+                    wheelhouse.inventory_sha256
+                ),
+                "torchvision_companion_sha256": wheelhouse.companion.sha256,
+                "package_index_resolution_on_pod": False,
                 "runpod_api_calls": 0,
                 "cloud_mutations": 0,
                 "create_attempts": 0,
@@ -2098,12 +2136,13 @@ def _run_execute(
     config_sha256: str | None = None
     environment_contract_sha256: str | None = None
     dependency_lock_sha256: str | None = None
+    framework_wheelhouse: FrameworkWheelhouse | None = None
     try:
         _disk_gate()
         head, tracked = _preflight_repository()
         _verify_local_readiness()
-        environment_contract_sha256, dependency_lock_sha256 = (
-            _remote_environment_hashes()
+        environment_contract_sha256, dependency_lock_sha256, framework_wheelhouse = (
+            _remote_environment_preflight()
         )
         if args.sealed_acquisition is not None:
             billing_config = RunPodConfig(
@@ -2170,6 +2209,7 @@ def _run_execute(
             model_path=ROOT / ".local" / "models" / "phase6c" / "megaloc" / "model.safetensors",
             vendor_root=ROOT / ".local" / "vendor" / "megaloc",
             sealed_root=args.sealed_acquisition,
+            framework_wheelhouse=framework_wheelhouse,
         )
         _require(
             args.sealed_acquisition is None or bundle.dataset_archive is not None,

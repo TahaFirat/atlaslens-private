@@ -482,6 +482,13 @@ def test_training_and_operator_contracts_are_real_and_secret_safe() -> None:
     assert execute_source.index("prepare_transfer_bundle") < execute_source.index(
         "select_gpu_offer"
     )
+    assert execute_source.index("_remote_environment_preflight") < execute_source.index(
+        "reconciliation_inventory = billing_client.inventory()"
+    )
+    assert "framework_wheelhouse=framework_wheelhouse" in execute_source
+    operation_source = inspect.getsource(supervisor._operation)
+    assert "framework-checksum-inventory.json" in operation_source
+    assert "--wheelhouse-inventory" in operation_source
     assert 'os.environ.pop("MAPILLARY_ACCESS_TOKEN", None)' in job_source
     assert "automatic_promotion_performed" in job_source
     for action in (

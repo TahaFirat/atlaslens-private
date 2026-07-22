@@ -1003,9 +1003,11 @@ def remote_environment_plan(repository: Path) -> dict[str, object]:
         sys.path.insert(0, str(source))
     from atlaslens_api.phase3f.remote_environment import (  # noqa: PLC0415
         REMOTE_ENVIRONMENT_PLAN_SCHEMA,
+        RemoteEnvironmentError,
         evaluate_remote_environment,
         load_remote_environment_contract,
         sha256_file,
+        verify_framework_wheelhouse,
     )
 
     contract_path = resolved / "config" / "phase3f-remote-environment.json"
@@ -1041,9 +1043,19 @@ def remote_environment_plan(repository: Path) -> dict[str, object]:
                 linux_status = "cached_image_present_live_contract_not_executed"
         except (OSError, subprocess.TimeoutExpired):
             linux_status = "not_verified_cache_unavailable"
-    blockers = [] if local.passed else [
-        local.failure_code or "REMOTE_DEPENDENCY_IMPORT_FAILED"
-    ]
+    blockers = (
+        []
+        if local.passed
+        else [local.failure_code or "REMOTE_DEPENDENCY_IMPORT_FAILED"]
+    )
+    wheelhouse = None
+    try:
+        wheelhouse = verify_framework_wheelhouse(
+            contract,
+            resolved.joinpath(*contract.framework_wheelhouse_local_path.split("/")),
+        )
+    except RemoteEnvironmentError as exc:
+        blockers.append(exc.code)
     return {
         "schema": REMOTE_ENVIRONMENT_PLAN_SCHEMA,
         "action": "remote-environment-plan",
@@ -1063,6 +1075,23 @@ def remote_environment_plan(repository: Path) -> dict[str, object]:
         "cuda_requirement": contract.cuda_requirement,
         "environment_contract_sha256": contract.contract_sha256,
         "dependency_lock_sha256": contract.requirements_lock_sha256,
+        "framework_wheelhouse_lock_sha256": (
+            contract.framework_wheelhouse_lock_sha256
+        ),
+        "framework_wheelhouse_present": wheelhouse is not None,
+        "framework_wheelhouse_artifact_count": (
+            len(wheelhouse.artifacts) if wheelhouse is not None else 0
+        ),
+        "framework_wheelhouse_inventory_sha256": (
+            wheelhouse.inventory_sha256 if wheelhouse is not None else None
+        ),
+        "framework_transfer_ready": wheelhouse is not None,
+        "torchvision_companion_filename": contract.torchvision_companion_filename,
+        "torchvision_companion_version": contract.torchvision_companion_version,
+        "torchvision_companion_sha256": contract.torchvision_companion_sha256,
+        "torchvision_companion_source": contract.torchvision_companion_source_url,
+        "torchvision_companion_present": wheelhouse is not None,
+        "package_index_resolution_on_pod": False,
         "module_count": len(contract.checks),
         "full_report_check_count": len(contract.checks) + 11 + 11,
         "local_dependency_check_count": local.report["check_count"],
@@ -1081,8 +1110,10 @@ def remote_environment_plan(repository: Path) -> dict[str, object]:
         "local_blockers": blockers,
         "ready_for_live_bootstrap": not blockers,
         "runpod_api_calls": 0,
+        "create_attempts": 0,
         "cloud_mutations": 0,
         "network_calls": 0,
+        "dataset_writes": 0,
         "secrets_included": False,
     }
 

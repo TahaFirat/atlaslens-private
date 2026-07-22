@@ -1969,3 +1969,25 @@
   different observed environment unless it passes the explicit compatibility
   policy and exact environment binding.
 - Target phase: Product Phase 3F cloud training pilot.
+
+## 2026-07-22 - Phase 3F transfers a pinned torchvision companion offline
+
+- Context: Live attempt `3ec1d887e8f5eede96aaa1f89ca1337d` proved the exact
+  digest-pinned image contains Python 3.12, Torch `2.9.1+cu128` and CUDA 12.8 but
+  no torchvision. Base preflight therefore exited 91 with
+  `REMOTE_DEPENDENCY_MODULE_MISSING` before lightweight bootstrap, CUDA smoke or
+  training; retrying the same image could not change that state.
+- Decision: Keep the image Torch byte identity authoritative and pre-transfer the
+  official CPython 3.12 Linux x86-64 CUDA 12.8 torchvision `0.24.1+cu128` wheel,
+  plus the existing lightweight lock, in one exact-hash inventory. Install the
+  companion with `--no-index --no-deps`, prohibit every Pod-side package-index or
+  Torch download, and compare the imported Torch version, CUDA version, ABI,
+  module-file hash, hashed resolved path, device and inode before and after the
+  install. Only the final compiled-op, CUDA and MegaLoc smoke may start training.
+- Alternatives: Retry the unchanged image; resolve packages from an index on the
+  Pod; replace or reinstall Torch; accept import-only torchvision evidence.
+- Consequences: Missing or corrupt local wheel material blocks before credentials
+  and cloud mutation, transfer is bound to the checksum inventory, Torch drift and
+  install failures retain exact typed codes, and live CUDA compatibility remains a
+  required paid-runtime observation rather than an offline claim.
+- Target phase: Product Phase 3F cloud training pilot.

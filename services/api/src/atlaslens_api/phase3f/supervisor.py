@@ -23,6 +23,7 @@ from atlaslens_api.phase3f.packaging import (
     write_source_archive,
 )
 from atlaslens_api.phase3f.pipeline import MAX_LOCAL_DERIVED_ARTIFACT_BYTES
+from atlaslens_api.phase3f.remote_environment import FrameworkWheelhouse
 from atlaslens_api.phase3f.runpod import RunPodInventory
 from atlaslens_api.phase3f.training import DatasetArchive, write_dataset_archive
 
@@ -64,6 +65,8 @@ class TransferBundle:
     canonical_source_path: Path
     canonical_license_path: Path
     dataset_archive: DatasetArchive | None = None
+    framework_wheelhouse_path: Path | None = None
+    framework_inventory_path: Path | None = None
 
 
 def prepare_transfer_bundle(
@@ -75,6 +78,7 @@ def prepare_transfer_bundle(
     model_path: Path,
     vendor_root: Path,
     sealed_root: Path | None = None,
+    framework_wheelhouse: FrameworkWheelhouse | None = None,
 ) -> TransferBundle:
     transfer = transfer_root.resolve()
     _require(not transfer.exists(), "TRANSFER_ROOT_ALREADY_EXISTS")
@@ -133,6 +137,36 @@ def prepare_transfer_bundle(
         if sealed_root is not None
         else None
     )
+    transferred_wheelhouse: Path | None = None
+    framework_inventory_path: Path | None = None
+    if framework_wheelhouse is not None:
+        transferred_wheelhouse = transfer / "wheelhouse"
+        transferred_wheelhouse.mkdir()
+        for artifact in framework_wheelhouse.artifacts:
+            destination = transferred_wheelhouse / artifact.filename
+            shutil.copy2(artifact.path, destination)
+            _require(
+                destination.stat().st_size == artifact.size_bytes
+                and _sha256_path(destination) == artifact.sha256,
+                (
+                    "REMOTE_TORCHVISION_WHEEL_HASH_MISMATCH"
+                    if artifact.source == "official_pytorch"
+                    else "REMOTE_DEPENDENCY_LOCK_MISMATCH"
+                ),
+            )
+        framework_inventory_path = (
+            transferred_wheelhouse / "framework-checksum-inventory.json"
+        )
+        framework_inventory_path.write_text(
+            json.dumps(
+                framework_wheelhouse.inventory,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="ascii",
+        )
     return TransferBundle(
         root=transfer,
         source_archive=archive,
@@ -141,6 +175,8 @@ def prepare_transfer_bundle(
         canonical_source_path=canonical_vendor / "megaloc_model.py",
         canonical_license_path=canonical_vendor / "LICENSE",
         dataset_archive=dataset_archive,
+        framework_wheelhouse_path=transferred_wheelhouse,
+        framework_inventory_path=framework_inventory_path,
     )
 
 

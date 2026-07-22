@@ -379,6 +379,11 @@ def test_nonzero_remote_code_is_not_masked_and_cleanup_still_runs(
             True, True, 2, False, None, "REMOTE_TRAINING_NONFINITE_LOSS"
         ),
     )
+    wheelhouse = tmp_path / "bundle" / "wheelhouse"
+    wheelhouse.mkdir(parents=True)
+    (wheelhouse / "framework-checksum-inventory.json").write_text(
+        "{}\n", encoding="ascii"
+    )
     with pytest.raises(module.SupervisorExecutionError, match="REMOTE_TRAINING_NONFINITE_LOSS"):
         module._operation(
             Client(),

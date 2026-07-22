@@ -93,8 +93,9 @@ elseif ($LiveReadiness) {
 
 $supervisorExitCode = 1
 $cleanupExitCode = 0
+$supervisorOutput = @()
 try {
-    & $resolvedPython @arguments
+    & $resolvedPython @arguments | Tee-Object -Variable supervisorOutput
     $supervisorExitCode = $LASTEXITCODE
 }
 finally {
@@ -126,5 +127,13 @@ if ($cleanupExitCode -ne 0) {
     throw "PHASE3F_FINALLY_CLEANUP_FAILED"
 }
 if ($supervisorExitCode -ne 0) {
+    $typedFailure = @(
+        $supervisorOutput |
+            ForEach-Object { [string]$_ } |
+            Where-Object { $_ -cmatch '^[A-Z][A-Z0-9_]{2,127}$' }
+    ) | Select-Object -Last 1
+    if (-not [string]::IsNullOrWhiteSpace([string]$typedFailure)) {
+        throw [string]$typedFailure
+    }
     throw "PHASE3F_SUPERVISOR_FAILED"
 }

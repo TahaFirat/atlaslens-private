@@ -1,5 +1,5 @@
 {
-  "schema": "atlaslens-phase3f-remote-environment-contract-v2",
+  "schema": "atlaslens-phase3f-remote-environment-contract-v3",
   "image": "runpod/pytorch@sha256:60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f",
   "image_identity_policy": "exact_digest",
   "platform": "linux_x86_64",
@@ -13,9 +13,23 @@
   ],
   "compatibility_source": "https://github.com/pytorch/vision#installation",
   "historical_observations": [
-    {"image_digest": "sha256:60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f", "python": "3.12", "torch": "2.9.1+cu128", "torchvision": null, "cuda": null}
+    {"image_digest": "sha256:60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f", "python": "3.12", "torch": "2.9.1+cu128", "torchvision": null, "cuda": "12.8"}
   ],
   "cuda_requirement": "12.8",
+  "framework_wheelhouse": {
+    "local_path": ".local/phase3f/wheelhouse/linux-cp312-cu128",
+    "lock": "config/phase3f-framework-wheelhouse.lock.json",
+    "lock_sha256": "ad830821871642321c5ceb3704a51d339dfec6782e30d95236ae8d7a1fc32011",
+    "package_index_resolution_on_pod": false,
+    "torchvision_companion": {
+      "version": "0.24.1+cu128",
+      "filename": "torchvision-0.24.1+cu128-cp312-cp312-manylinux_2_28_x86_64.whl",
+      "size_bytes": 8049914,
+      "sha256": "cf84eae1d2d12a7d261a7496eca00dd927b71792011b1e84d4162c950eb3201d",
+      "source_url": "https://download-r2.pytorch.org/whl/cu128/torchvision-0.24.1%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl",
+      "source_index": "https://download.pytorch.org/whl/cu128/torchvision/"
+    }
+  },
   "system_site_packages_required": true,
   "torch_download_prohibited": true,
   "official_index_url": "https://pypi.org/simple",

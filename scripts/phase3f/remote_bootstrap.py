@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 
 class AtomicWriter(Protocol):
@@ -30,6 +30,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--requirements-lock", type=Path, required=True)
     parser.add_argument("--expected-contract-sha256", required=True)
     parser.add_argument("--expected-lock-sha256", required=True)
+    parser.add_argument("--wheelhouse", type=Path, required=True)
+    parser.add_argument("--wheelhouse-inventory", type=Path, required=True)
     parser.add_argument("--vendor-root", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--venv-root", type=Path, required=True)
@@ -58,6 +60,7 @@ def _safe_environment() -> dict[str, str]:
             "TRANSFORMERS_OFFLINE": "1",
             "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             "PIP_NO_INPUT": "1",
+            "PIP_NO_INDEX": "1",
             "PYTHONNOUSERSITE": "1",
         }
     )
@@ -253,9 +256,11 @@ def main(argv: list[str] | None = None) -> int:
         REMOTE_ENVIRONMENT_RECEIPT_SCHEMA,
         DependencyPreflightResult,
         RemoteEnvironmentError,
+        capture_torch_identity,
         evaluate_base_runtime_checks,
         evaluate_remote_environment,
         load_remote_environment_contract,
+        verify_framework_wheelhouse,
     )
     from atlaslens_api.phase3f.training_recovery import (  # noqa: PLC0415
         atomic_json,
@@ -283,13 +288,26 @@ def main(argv: list[str] | None = None) -> int:
             expected_contract_sha256=args.expected_contract_sha256,
             expected_lock_sha256=args.expected_lock_sha256,
         )
+        wheelhouse = verify_framework_wheelhouse(
+            contract,
+            args.wheelhouse,
+            expected_inventory_path=args.wheelhouse_inventory,
+        )
+        torch_identity_before = capture_torch_identity()
     except RemoteEnvironmentError as exc:
+        failed_module = (
+            "torchvision"
+            if exc.code.startswith("REMOTE_TORCHVISION_")
+            else "torch"
+            if exc.code == "REMOTE_TORCH_IDENTITY_CHANGED"
+            else "dependency-lock"
+        )
         _failure_documents(
             args.recovery_root,
             atomic_json=atomic_json,
             sanitized_tail=sanitized_tail,
             failure_code=exc.code,
-            failed_module="dependency-lock",
+            failed_module=failed_module,
             exception_class=type(exc).__name__,
             report=empty_report,
             receipt=empty_receipt,
@@ -299,11 +317,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(exc.code)
         return 90
+    atomic_json(
+        args.recovery_root / "torch-identity-before.json",
+        torch_identity_before,
+    )
     base = evaluate_remote_environment(
         contract,
         expected_interpreter_class="system_python",
         vendor_root=None,
         stage="base",
+        allow_missing_torchvision_companion=True,
     )
     try:
         base = evaluate_base_runtime_checks(contract, base)
@@ -334,12 +357,38 @@ def main(argv: list[str] | None = None) -> int:
             report=base.report,
             environment_receipt=base.environment_receipt,
         )
+    base_failure_codes = {
+        code
+        for code in cast(list[object], base.report.get("failure_codes", []))
+        if isinstance(code, str)
+    }
+    companion_required = (
+        base.failure_code == "REMOTE_TORCHVISION_COMPANION_MISSING"
+        and base_failure_codes == {"REMOTE_TORCHVISION_COMPANION_MISSING"}
+    )
+    base.report.update(
+        {
+            "bootstrap_eligible": base.passed or companion_required,
+            "torchvision_companion_required": companion_required,
+            "framework_wheelhouse_inventory_sha256": wheelhouse.inventory_sha256,
+            "torchvision_wheel_sha256": wheelhouse.companion.sha256,
+        }
+    )
+    base.environment_receipt.update(
+        {
+            "bootstrap_eligible": base.passed or companion_required,
+            "torchvision_companion_required": companion_required,
+            "framework_wheelhouse_inventory_sha256": wheelhouse.inventory_sha256,
+            "torchvision_wheel_sha256": wheelhouse.companion.sha256,
+            "torch_identity_before": torch_identity_before,
+        }
+    )
     atomic_json(args.recovery_root / "base-environment-report.json", base.report)
     atomic_json(
         args.recovery_root / "base-environment-receipt.json",
         base.environment_receipt,
     )
-    if not base.passed:
+    if not base.passed and not companion_required:
         _failure_documents(
             args.recovery_root,
             atomic_json=atomic_json,
@@ -356,13 +405,52 @@ def main(argv: list[str] | None = None) -> int:
         print(base.failure_code)
         return 91
     environment = _safe_environment()
-    commands = (
+    framework_receipt: dict[str, object] = {
+        "schema": "atlaslens-phase3f-framework-install-receipt-v1",
+        "outcome": "pending",
+        "torchvision_companion_required": companion_required,
+        "torchvision_companion_installed": False,
+        "torchvision_version": contract.torchvision_companion_version,
+        "torchvision_wheel_sha256": wheelhouse.companion.sha256,
+        "framework_wheelhouse_inventory_sha256": wheelhouse.inventory_sha256,
+        "framework_wheelhouse_lock_sha256": (
+            contract.framework_wheelhouse_lock_sha256
+        ),
+        "package_index_resolution_count": 0,
+        "torch_download_count": 0,
+        "torch_identity_unchanged": False,
+        "dependency_failure_code": None,
+        "secrets_included": False,
+    }
+    framework_receipt_path = args.recovery_root / "framework-install-receipt.json"
+    atomic_json(framework_receipt_path, framework_receipt)
+    commands: list[tuple[list[str], str, str]] = [
         (
             [sys.executable, "-m", "venv", "--system-site-packages", str(args.venv_root)],
             "creating_venv",
             "venv",
-        ),
+        )
+    ]
+    if companion_required:
+        commands.append(
+            (
+                [
+                    str(_venv_python(args.venv_root)),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--isolated",
+                    "--no-deps",
+                    "--no-index",
+                    str(wheelhouse.companion.path),
+                ],
+                "installing_torchvision_companion",
+                "torchvision",
+            )
+        )
+    commands.extend(
         (
+            (
             [
                 str(_venv_python(args.venv_root)),
                 "-m",
@@ -372,12 +460,9 @@ def main(argv: list[str] | None = None) -> int:
                 "--no-deps",
                 "--require-hashes",
                 "--only-binary=:all:",
-                "--index-url",
-                contract.official_index_url,
-                "--timeout",
-                "60",
-                "--retries",
-                "2",
+                "--no-index",
+                "--find-links",
+                str(wheelhouse.root),
                 "-r",
                 str(args.requirements_lock),
             ],
@@ -403,6 +488,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.expected_contract_sha256,
                 "--expected-lock-sha256",
                 args.expected_lock_sha256,
+                "--expected-torch-identity",
+                str(args.recovery_root / "torch-identity-before.json"),
+                "--framework-install-receipt",
+                str(framework_receipt_path),
             ],
             "validating_project_imports",
             "project-import-graph",
@@ -434,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
             "validating_training_smoke",
             "megaloc-training-smoke",
         ),
+        )
     )
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -455,14 +545,35 @@ def main(argv: list[str] | None = None) -> int:
         )
         stdout_parts.append(stdout_text)
         stderr_parts.append(stderr_text)
+        if return_code == 0 and stage == "installing_torchvision_companion":
+            framework_receipt.update(
+                {
+                    "outcome": "companion_installed",
+                    "torchvision_companion_installed": True,
+                }
+            )
+            atomic_json(framework_receipt_path, framework_receipt)
         if return_code != 0:
             report = base.report
             receipt = base.environment_receipt
             dependency_report = args.recovery_root / "dependency-report.json"
             environment_receipt = args.recovery_root / "environment-receipt.json"
+            failure_code = (
+                "REMOTE_TORCHVISION_INSTALL_FAILED"
+                if stage == "installing_torchvision_companion"
+                else "REMOTE_DEPENDENCY_IMPORT_FAILED"
+            )
             if stage == "validating_training_smoke" and return_code == 124:
                 failure_code = "REMOTE_TRAINING_SMOKE_TIMEOUT"
                 exception_class = "TimeoutExpired"
+            if stage == "installing_torchvision_companion":
+                framework_receipt.update(
+                    {
+                        "outcome": "failed",
+                        "dependency_failure_code": failure_code,
+                    }
+                )
+                atomic_json(framework_receipt_path, framework_receipt)
             try:
                 candidate_report = json.loads(dependency_report.read_text(encoding="utf-8"))
                 candidate_receipt = json.loads(environment_receipt.read_text(encoding="utf-8"))
@@ -487,9 +598,9 @@ def main(argv: list[str] | None = None) -> int:
                         else exception_class
                     )
                 else:
-                    failure_code = "REMOTE_DEPENDENCY_IMPORT_FAILED"
+                    pass
             except (OSError, UnicodeError, json.JSONDecodeError):
-                failure_code = "REMOTE_DEPENDENCY_IMPORT_FAILED"
+                pass
             _failure_documents(
                 args.recovery_root,
                 atomic_json=atomic_json,

@@ -39,6 +39,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--requirements-lock", type=Path)
     parser.add_argument("--expected-contract-sha256")
     parser.add_argument("--expected-lock-sha256")
+    parser.add_argument("--expected-torch-identity", type=Path)
+    parser.add_argument("--framework-install-receipt", type=Path)
     parser.add_argument("--environment-receipt", type=Path)
     return parser
 
@@ -63,26 +65,34 @@ def _dependency_preflight(args: argparse.Namespace) -> int:
         REMOTE_DEPENDENCY_REPORT_SCHEMA,
         REMOTE_ENVIRONMENT_RECEIPT_SCHEMA,
         RemoteEnvironmentError,
+        capture_torch_identity,
+        evaluate_base_runtime_checks,
         evaluate_remote_environment,
         load_remote_environment_contract,
+        require_torch_identity_unchanged,
     )
     from atlaslens_api.phase3f.training_recovery import atomic_json  # noqa: PLC0415
 
-    if any(
-        value is None
-        for value in (
-            args.vendor_root,
-            args.recovery_root,
-            args.environment_contract,
-            args.requirements_lock,
-            args.expected_contract_sha256,
-            args.expected_lock_sha256,
+    required_values = [
+        args.vendor_root,
+        args.recovery_root,
+        args.environment_contract,
+        args.requirements_lock,
+        args.expected_contract_sha256,
+        args.expected_lock_sha256,
+    ]
+    if args.dependency_preflight_scope == "full":
+        required_values.extend(
+            (args.expected_torch_identity, args.framework_install_receipt)
         )
-    ):
+    if any(value is None for value in required_values):
         print("REMOTE_DEPENDENCY_LOCK_MISMATCH")
         return 92
     recovery_root = cast(Path, args.recovery_root)
     recovery_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    framework_receipt: dict[str, object] | None = None
+    torch_identity_before: dict[str, object] | None = None
+    torch_identity_after: dict[str, object] | None = None
     try:
         contract = load_remote_environment_contract(
             cast(Path, args.environment_contract),
@@ -93,22 +103,116 @@ def _dependency_preflight(args: argparse.Namespace) -> int:
         preflight_stage: Literal["project", "full"] = (
             "project" if args.dependency_preflight_scope == "project" else "full"
         )
+        if preflight_stage == "full":
+            torch_identity_before_raw = json.loads(
+                cast(Path, args.expected_torch_identity).read_text(encoding="utf-8")
+            )
+            framework_receipt_raw = json.loads(
+                cast(Path, args.framework_install_receipt).read_text(encoding="utf-8")
+            )
+            if not isinstance(torch_identity_before_raw, dict) or not isinstance(
+                framework_receipt_raw, dict
+            ):
+                raise RemoteEnvironmentError("REMOTE_TORCH_IDENTITY_CHANGED")
+            torch_identity_before = cast(
+                dict[str, object], torch_identity_before_raw
+            )
+            framework_receipt = cast(dict[str, object], framework_receipt_raw)
+            torch_identity_after = capture_torch_identity()
+            require_torch_identity_unchanged(
+                torch_identity_before, torch_identity_after
+            )
+            if not (
+                framework_receipt.get("schema")
+                == "atlaslens-phase3f-framework-install-receipt-v1"
+                and framework_receipt.get("torchvision_version")
+                == contract.torchvision_companion_version
+                and framework_receipt.get("torchvision_wheel_sha256")
+                == contract.torchvision_companion_sha256
+                and framework_receipt.get("framework_wheelhouse_lock_sha256")
+                == contract.framework_wheelhouse_lock_sha256
+                and framework_receipt.get("package_index_resolution_count") == 0
+                and framework_receipt.get("torch_download_count") == 0
+                and (
+                    framework_receipt.get("torchvision_companion_required") is False
+                    or framework_receipt.get("torchvision_companion_installed") is True
+                )
+            ):
+                raise RemoteEnvironmentError("REMOTE_TORCHVISION_INSTALL_FAILED")
+            framework_receipt.update(
+                {
+                    "outcome": "torch_identity_verified",
+                    "torch_identity_unchanged": True,
+                    "torch_identity_before": torch_identity_before,
+                    "torch_identity_after": torch_identity_after,
+                    "dependency_failure_code": None,
+                }
+            )
+            atomic_json(cast(Path, args.framework_install_receipt), framework_receipt)
+            atomic_json(
+                recovery_root / "torch-identity-after.json", torch_identity_after
+            )
         result = evaluate_remote_environment(
             contract,
             expected_interpreter_class="project_venv",
             vendor_root=cast(Path, args.vendor_root),
             stage=preflight_stage,
         )
+        if preflight_stage == "full":
+            result = evaluate_base_runtime_checks(contract, result)
         report = result.report
         receipt = result.environment_receipt
+        if framework_receipt is not None:
+            framework_receipt.update(
+                {
+                    "outcome": "passed" if result.passed else "failed",
+                    "dependency_failure_code": result.failure_code,
+                }
+            )
+            atomic_json(cast(Path, args.framework_install_receipt), framework_receipt)
+            framework_fields = {
+                "framework_wheelhouse_inventory_sha256": framework_receipt.get(
+                    "framework_wheelhouse_inventory_sha256"
+                ),
+                "framework_wheelhouse_lock_sha256": (
+                    contract.framework_wheelhouse_lock_sha256
+                ),
+                "torchvision_companion_installed": framework_receipt.get(
+                    "torchvision_companion_installed"
+                ),
+                "torchvision_wheel_sha256": contract.torchvision_companion_sha256,
+                "package_index_resolution_count": 0,
+                "torch_download_count": 0,
+                "torch_identity_unchanged": True,
+                "torch_identity_before": torch_identity_before,
+                "torch_identity_after": torch_identity_after,
+            }
+            report.update(framework_fields)
+            receipt.update(framework_fields)
         failure_code = result.failure_code
     except RemoteEnvironmentError as exc:
         failure_code = exc.code
+        failed_module = (
+            "torch"
+            if failure_code == "REMOTE_TORCH_IDENTITY_CHANGED"
+            else "torchvision"
+            if failure_code.startswith("REMOTE_TORCHVISION_")
+            else "dependency-lock"
+        )
+        if framework_receipt is not None and args.framework_install_receipt is not None:
+            framework_receipt.update(
+                {
+                    "outcome": "failed",
+                    "torch_identity_unchanged": False,
+                    "dependency_failure_code": failure_code,
+                }
+            )
+            atomic_json(cast(Path, args.framework_install_receipt), framework_receipt)
         report = {
             "schema": REMOTE_DEPENDENCY_REPORT_SCHEMA,
             "outcome": "failed",
             "dependency_failure_code": failure_code,
-            "failed_module": "dependency-lock",
+            "failed_module": failed_module,
             "failure_exception_class": type(exc).__name__,
             "checks": [],
             "check_count": 0,
@@ -119,7 +223,7 @@ def _dependency_preflight(args: argparse.Namespace) -> int:
             "outcome": "failed",
             "interpreter_class": "project_venv",
             "dependency_failure_code": failure_code,
-            "failed_module": "dependency-lock",
+            "failed_module": failed_module,
             "failure_exception_class": type(exc).__name__,
             "all_imports_passed": False,
             "secrets_included": False,
@@ -176,17 +280,31 @@ def _compatibility_smoke(args: argparse.Namespace) -> int:
         base_receipt = json.loads(
             (recovery_root / "base-environment-receipt.json").read_text(encoding="utf-8")
         )
+        framework_receipt = json.loads(
+            (recovery_root / "framework-install-receipt.json").read_text(
+                encoding="utf-8"
+            )
+        )
         if not isinstance(receipt, dict) or not isinstance(report, dict):
             raise RemoteEnvironmentError("REMOTE_DEPENDENCY_LOCK_MISMATCH")
-        if not isinstance(base_receipt, dict) or any(
-            receipt.get(field) != base_receipt.get(field)
-            for field in (
-                "python_major",
-                "python_minor",
-                "torch_version",
-                "torchvision_version",
-                "torch_cuda_version",
+        if (
+            not isinstance(base_receipt, dict)
+            or not isinstance(framework_receipt, dict)
+            or any(
+                receipt.get(field) != base_receipt.get(field)
+                for field in (
+                    "python_major",
+                    "python_minor",
+                    "torch_version",
+                    "torch_cuda_version",
+                )
             )
+            or framework_receipt.get("outcome") != "passed"
+            or framework_receipt.get("torch_identity_unchanged") is not True
+            or framework_receipt.get("torchvision_wheel_sha256")
+            != contract.torchvision_companion_sha256
+            or framework_receipt.get("package_index_resolution_count") != 0
+            or framework_receipt.get("torch_download_count") != 0
         ):
             raise RemoteEnvironmentError("REMOTE_BASE_PACKAGE_IDENTITY_CHANGED")
         smoke = run_remote_training_smoke(
@@ -216,6 +334,7 @@ def _compatibility_smoke(args: argparse.Namespace) -> int:
                 torchvision_version=cast(str, torchvision_version),
                 cuda_version=cast(str, cuda_version),
                 gpu_class=cast(str, gpu_class),
+                torchvision_wheel_sha256=contract.torchvision_companion_sha256,
                 vendor_source_sha256=vendor_sha256,
                 model_sha256=MODEL_SHA256,
             )
@@ -230,9 +349,9 @@ def _compatibility_smoke(args: argparse.Namespace) -> int:
                 }
             )
             report["training_smoke"] = smoke
-            report["full_report_check_count"] = cast(int, report["check_count"]) + cast(
-                int, smoke["check_count"]
-            )
+            report["full_report_check_count"] = cast(
+                int, report.get("full_report_check_count", report["check_count"])
+            ) + cast(int, smoke["check_count"])
             atomic_json(receipt_path, receipt)
             atomic_json(report_path, report)
             print("PHASE3F_REMOTE_TRAINING_SMOKE_PASSED")

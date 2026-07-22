@@ -19,6 +19,7 @@ restored. Execute requires an explicit cloud-consent switch:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Preflight
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action RemoteEnvironmentPlan
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action ReconcileLocalReceipts
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action CloudPlan
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Execute -CloudConsent
@@ -163,8 +164,23 @@ or authenticated GET returns that field, it must byte-match the request or the P
 is cleaned up with `REMOTE_IMAGE_IDENTITY_MISMATCH`. The official supported minor
 pairs are Torch/torchvision 2.7/0.22, 2.8/0.23 and 2.9/0.24, but a listed pair is
 not sufficient by itself. Bootstrap records the full Python, Torch, torchvision,
-CUDA, compiled-ops and small CUDA-operation report, installs only the lightweight
-hash lock with `--no-deps`, and verifies that Torch identity did not change.
+CUDA, compiled-ops and small CUDA-operation report. For the pinned CPython 3.12,
+CUDA 12.8 image, missing torchvision is repaired only from the pre-transferred
+`torchvision-0.24.1+cu128-cp312-cp312-manylinux_2_28_x86_64.whl` whose SHA-256 is
+`cf84eae1d2d12a7d261a7496eca00dd927b71792011b1e84d4162c950eb3201d`.
+The wheel comes from the official PyTorch CUDA 12.8 wheel index and is installed
+with `--no-index --no-deps`; Pod-side package-index resolution and Torch download
+are prohibited. The remaining lightweight lock is also transferred and installed
+offline with exact hashes. Pre-cloud validation fails before RunPod credentials or
+mutation with `REMOTE_TORCHVISION_COMPANION_MISSING` or
+`REMOTE_TORCHVISION_WHEEL_HASH_MISMATCH` when that inventory is incomplete.
+
+Bootstrap hashes the imported Torch module path and file and records its version,
+CUDA version, CPython ABI, device and inode before installing the companion. The
+project preflight must reproduce that identity exactly or fail with
+`REMOTE_TORCH_IDENTITY_CHANGED`. A companion install failure is preserved as
+`REMOTE_TORCHVISION_INSTALL_FAILED`; no generic dependency wrapper may replace
+these typed codes.
 
 Before `PHASE3F_CLOUD_JOB_STARTED`, a separate 180-second smoke verifies vendor
 and model hashes, imports and loads MegaLoc, and performs a synthetic CUDA AMP

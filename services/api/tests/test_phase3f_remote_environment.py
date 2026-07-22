@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
+import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -13,12 +16,18 @@ from atlaslens_api.phase3f import remote_environment as environment
 from atlaslens_api.phase3f.remote_environment import (
     DependencyCheck,
     DependencyPreflightResult,
+    FrameworkWheelArtifact,
+    FrameworkWheelhouse,
+    FrameworkWheelSpec,
     RemoteEnvironmentContract,
     RemoteEnvironmentError,
     canonical_environment_identity,
+    capture_torch_identity,
     evaluate_base_runtime_checks,
     evaluate_remote_environment,
     load_remote_environment_contract,
+    require_torch_identity_unchanged,
+    verify_framework_wheelhouse,
 )
 from atlaslens_api.phase3f.training import (
     aggregate_training_smoke_failure,
@@ -70,6 +79,7 @@ def _evaluate(
     expected_interpreter_class: str = "project_venv",
     actual_interpreter_class: str = "project_venv",
     stage: str = "full",
+    allow_missing_torchvision_companion: bool = False,
 ) -> DependencyPreflightResult:
     versions = _versions(contract)
     versions.update(version_overrides or {})
@@ -95,6 +105,7 @@ def _evaluate(
         version_reader=versions.__getitem__,
         actual_interpreter_class=actual_interpreter_class,
         python_version=(3, 12),
+        allow_missing_torchvision_companion=allow_missing_torchvision_companion,
     )
 
 
@@ -139,6 +150,18 @@ def test_observed_live_torch_pair_is_compatibility_approved() -> None:
     assert result.passed is True
     assert result.environment_receipt["torchvision_pair_compatible"] is True
     assert result.environment_receipt["torch_version"] == "2.9.1+cu128"
+
+
+def test_live_image_missing_torchvision_is_bootstrap_eligible() -> None:
+    result = _evaluate(
+        _contract(),
+        missing="torchvision",
+        stage="base",
+        allow_missing_torchvision_companion=True,
+    )
+    assert result.failure_code == "REMOTE_TORCHVISION_COMPANION_MISSING"
+    assert result.environment_receipt["bootstrap_eligible"] is True
+    assert result.environment_receipt["torchvision_companion_required"] is True
 
 
 @pytest.mark.parametrize(
@@ -262,6 +285,81 @@ def test_lock_hash_mismatch_fails_closed(tmp_path: Path) -> None:
         load_remote_environment_contract(CONTRACT_PATH, changed_lock)
 
 
+def _tiny_wheel_contract(tmp_path: Path) -> tuple[RemoteEnvironmentContract, Path]:
+    root = tmp_path / "wheelhouse"
+    root.mkdir()
+    filename = "torchvision-test-cp312-cp312-manylinux_2_28_x86_64.whl"
+    payload = b"official-wheel-fixture"
+    path = root / filename
+    path.write_bytes(payload)
+    digest = environment.hashlib.sha256(payload).hexdigest()
+    spec = FrameworkWheelSpec(
+        distribution="torchvision",
+        version="0.24.1+cu128",
+        filename=filename,
+        size_bytes=len(payload),
+        sha256=digest,
+        source="official_pytorch",
+    )
+    return (
+        replace(
+            _contract(),
+            framework_wheel_artifacts=(spec,),
+            torchvision_companion_filename=filename,
+            torchvision_companion_size_bytes=len(payload),
+            torchvision_companion_sha256=digest,
+        ),
+        root,
+    )
+
+
+def test_hash_pinned_framework_wheelhouse_is_verified(tmp_path: Path) -> None:
+    contract, root = _tiny_wheel_contract(tmp_path)
+    wheelhouse = verify_framework_wheelhouse(contract, root)
+    assert wheelhouse.companion.sha256 == contract.torchvision_companion_sha256
+    assert wheelhouse.inventory["package_index_resolution_on_pod"] is False
+
+
+def test_missing_or_changed_companion_wheel_is_typed(tmp_path: Path) -> None:
+    contract, root = _tiny_wheel_contract(tmp_path)
+    companion = root / contract.torchvision_companion_filename
+    companion.unlink()
+    with pytest.raises(
+        RemoteEnvironmentError, match="REMOTE_TORCHVISION_COMPANION_MISSING"
+    ):
+        verify_framework_wheelhouse(contract, root)
+    companion.write_bytes(b"changed")
+    with pytest.raises(
+        RemoteEnvironmentError, match="REMOTE_TORCHVISION_WHEEL_HASH_MISMATCH"
+    ):
+        verify_framework_wheelhouse(contract, root)
+
+
+def test_torch_identity_detects_post_install_change(tmp_path: Path) -> None:
+    module_path = tmp_path / "torch.py"
+    module_path.write_text("identity", encoding="ascii")
+    module = SimpleNamespace(
+        version=SimpleNamespace(cuda="12.8"),
+        __version__="2.9.1+cu128",
+        __file__=str(module_path),
+    )
+    before = capture_torch_identity(
+        torch_module=module,
+        version_reader=lambda _name: "2.9.1+cu128",
+        module_path=module_path,
+    )
+    after = capture_torch_identity(
+        torch_module=module,
+        version_reader=lambda _name: "2.9.1+cu128",
+        module_path=module_path,
+    )
+    require_torch_identity_unchanged(before, after)
+    changed = dict(after)
+    changed["version"] = "2.9.2+cu128"
+    with pytest.raises(RemoteEnvironmentError, match="REMOTE_TORCH_IDENTITY_CHANGED"):
+        require_torch_identity_unchanged(before, changed)
+
+
 def test_real_project_import_graph_passes_without_cuda_probe() -> None:
     contract = _contract()
     result = evaluate_remote_environment(
@@ -295,7 +393,9 @@ def _load_control() -> ModuleType:
 
 def test_remote_environment_plan_is_mutation_free(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    _mock_bootstrap_framework(monkeypatch, tmp_path)
     module = _load_control()
     monkeypatch.setattr(module.shutil, "which", lambda _name: None)
     plan = module.remote_environment_plan(ROOT)
@@ -310,6 +410,31 @@ def test_remote_environment_plan_is_mutation_free(
     assert plan["torch_download_prohibited"] is True
     assert plan["compatibility_smoke_required"] is True
     assert plan["historical_observed_torch"] == "2.9.1+cu128"
+    assert plan["framework_wheelhouse_artifact_count"] == 1
+    assert plan["torchvision_companion_present"] is True
+    assert plan["framework_transfer_ready"] is True
+    assert plan["package_index_resolution_on_pod"] is False
+    assert plan["create_attempts"] == 0
+    assert plan["dataset_writes"] == 0
+
+
+def test_remote_environment_plan_blocks_before_cloud_when_companion_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(*_args: object, **_kwargs: object) -> object:
+        raise RemoteEnvironmentError("REMOTE_TORCHVISION_COMPANION_MISSING")
+
+    monkeypatch.setattr(environment, "verify_framework_wheelhouse", missing)
+    module = _load_control()
+    monkeypatch.setattr(module.shutil, "which", lambda _name: None)
+    plan = module.remote_environment_plan(ROOT)
+    assert plan["local_blockers"] == ["REMOTE_TORCHVISION_COMPANION_MISSING"]
+    assert plan["ready_for_live_bootstrap"] is False
+    assert plan["runpod_api_calls"] == 0
+    assert plan["cloud_mutations"] == 0
+    assert plan["network_calls"] == 0
+    assert plan["create_attempts"] == 0
+    assert plan["dataset_writes"] == 0
 
 
 def test_environment_contract_hash_binds_checkpoint_configuration() -> None:
@@ -340,6 +465,10 @@ def test_bootstrap_environment_excludes_cloud_secrets(
 
 def _bootstrap_args(tmp_path: Path) -> list[str]:
     contract = _contract()
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir(exist_ok=True)
+    inventory = wheelhouse / "framework-checksum-inventory.json"
+    inventory.write_text("{}\n", encoding="ascii")
     return [
         "--repository-root",
         str(ROOT),
@@ -351,6 +480,10 @@ def _bootstrap_args(tmp_path: Path) -> list[str]:
         contract.contract_sha256,
         "--expected-lock-sha256",
         contract.requirements_lock_sha256,
+        "--wheelhouse",
+        str(wheelhouse),
+        "--wheelhouse-inventory",
+        str(inventory),
         "--vendor-root",
         str(ROOT / ".local" / "vendor" / "megaloc"),
         "--model",
@@ -364,16 +497,61 @@ def _bootstrap_args(tmp_path: Path) -> list[str]:
     ]
 
 
-def test_pinned_bootstrap_success_uses_one_interpreter(
+def _mock_bootstrap_framework(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> FrameworkWheelhouse:
+    contract = _contract()
+    wheelhouse_root = tmp_path / "wheelhouse"
+    wheelhouse_root.mkdir(exist_ok=True)
+    companion_path = wheelhouse_root / contract.torchvision_companion_filename
+    companion_path.write_bytes(b"companion-fixture")
+    companion = FrameworkWheelArtifact(
+        path=companion_path,
+        distribution="torchvision",
+        version=contract.torchvision_companion_version,
+        filename=contract.torchvision_companion_filename,
+        size_bytes=contract.torchvision_companion_size_bytes,
+        sha256=contract.torchvision_companion_sha256,
+        source="official_pytorch",
+    )
+    wheelhouse = FrameworkWheelhouse(
+        root=wheelhouse_root,
+        artifacts=(companion,),
+        inventory={"schema": "fixture"},
+        inventory_sha256="9" * 64,
+        companion=companion,
+    )
+    identity = {
+        "schema": "atlaslens-phase3f-torch-identity-v1",
+        "version": "2.9.1+cu128",
+        "cuda": "12.8",
+        "python_abi": "cp312",
+        "module_path_sha256": "1" * 64,
+        "module_file_sha256": "2" * 64,
+        "module_device": 1,
+        "module_inode": 2,
+        "secrets_included": False,
+    }
+    monkeypatch.setattr(
+        environment, "verify_framework_wheelhouse", lambda *_a, **_k: wheelhouse
+    )
+    monkeypatch.setattr(environment, "capture_torch_identity", lambda: identity)
+    return wheelhouse
+
+
+def test_live_image_shape_installs_companion_then_reaches_cuda_megaloc_gate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     module = _load_bootstrap()
     contract = _contract()
+    wheelhouse = _mock_bootstrap_framework(monkeypatch, tmp_path)
     base = _evaluate(
         contract,
+        missing="torchvision",
         expected_interpreter_class="system_python",
         actual_interpreter_class="system_python",
         stage="base",
+        allow_missing_torchvision_companion=True,
     )
     full = _evaluate(contract)
     commands: list[tuple[list[str], str]] = []
@@ -393,18 +571,124 @@ def test_pinned_bootstrap_success_uses_one_interpreter(
 
     monkeypatch.setattr(module, "_run_logged", fake_run)
     assert module.main(_bootstrap_args(tmp_path)) == 0
-    assert len(commands) == 4
+    assert len(commands) == 5
     assert "--system-site-packages" in commands[0][0]
-    install = commands[1][0]
-    assert "--isolated" in install
-    assert "--no-deps" in install
-    assert "--require-hashes" in install
-    assert "--only-binary=:all:" in install
-    assert "https://pypi.org/simple" in install
+    companion_install = commands[1][0]
+    assert commands[1][1] == "installing_torchvision_companion"
+    assert "--no-deps" in companion_install
+    assert "--no-index" in companion_install
+    assert str(wheelhouse.companion.path) in companion_install
+    locked_install = commands[2][0]
+    assert "--isolated" in locked_install
+    assert "--no-deps" in locked_install
+    assert "--require-hashes" in locked_install
+    assert "--only-binary=:all:" in locked_install
+    assert "--no-index" in locked_install
+    assert "--find-links" in locked_install
+    assert "https://pypi.org/simple" not in locked_install
     assert commands[1][0][0] == commands[2][0][0]
     assert commands[2][0][0] == commands[3][0][0]
-    assert commands[3][1] == "validating_training_smoke"
+    assert commands[3][0][0] == commands[4][0][0]
+    assert "--expected-torch-identity" in commands[3][0]
+    assert "--framework-install-receipt" in commands[3][0]
+    assert commands[4][1] == "validating_training_smoke"
     assert full.environment_receipt["cuda_available"] is True
+
+
+def test_cached_pinned_image_runs_offline_companion_and_cuda_megaloc_smoke(
+    tmp_path: Path,
+) -> None:
+    docker = shutil.which("docker")
+    if docker is None:
+        pytest.skip("local Docker is unavailable")
+    contract = _contract()
+    inspect = subprocess.run(  # noqa: S603
+        [docker, "image", "inspect", contract.image],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    if inspect.returncode != 0:
+        pytest.skip("pinned RunPod image is not present in the local Docker cache")
+    wheelhouse = verify_framework_wheelhouse(
+        contract, ROOT / contract.framework_wheelhouse_local_path
+    )
+    inventory = tmp_path / "framework-checksum-inventory.json"
+    atomic_json(inventory, wheelhouse.inventory)
+    model = ROOT / ".local" / "models" / "phase6c" / "megaloc" / "model.safetensors"
+    vendor = ROOT / ".local" / "vendor" / "megaloc"
+    if not model.is_file() or not vendor.is_dir():
+        pytest.skip("local MegaLoc artifacts are unavailable")
+    command = [
+        docker,
+        "run",
+        "--rm",
+        "--network=none",
+        "--gpus=all",
+        "--mount",
+        f"type=bind,source={ROOT},target=/repo,readonly",
+        "--mount",
+        f"type=bind,source={wheelhouse.root},target=/wheelhouse,readonly",
+        "--mount",
+        f"type=bind,source={tmp_path},target=/state",
+        contract.image,
+        "python",
+        "/repo/scripts/phase3f/remote_bootstrap.py",
+        "--repository-root",
+        "/repo",
+        "--contract",
+        "/repo/config/phase3f-remote-environment.json",
+        "--requirements-lock",
+        "/repo/config/phase3f-training-requirements.lock",
+        "--expected-contract-sha256",
+        contract.contract_sha256,
+        "--expected-lock-sha256",
+        contract.requirements_lock_sha256,
+        "--wheelhouse",
+        "/wheelhouse",
+        "--wheelhouse-inventory",
+        "/state/framework-checksum-inventory.json",
+        "--vendor-root",
+        "/repo/.local/vendor/megaloc",
+        "--model",
+        "/repo/.local/models/phase6c/megaloc/model.safetensors",
+        "--venv-root",
+        "/state/venv",
+        "--recovery-root",
+        "/state/recovery",
+        "--timeout-seconds",
+        "600",
+    ]
+    completed = subprocess.run(  # noqa: S603
+        command,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=630,
+    )
+    typed_lines = [
+        line
+        for line in completed.stdout.splitlines()
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", line)
+    ]
+    assert completed.returncode == 0, (
+        f"offline container bootstrap failed: "
+        f"{typed_lines[-1] if typed_lines else 'TYPED_CODE_MISSING'}"
+    )
+    recovery = tmp_path / "recovery"
+    framework = json.loads(
+        (recovery / "framework-install-receipt.json").read_text(encoding="utf-8")
+    )
+    smoke = json.loads(
+        (recovery / "training-smoke-report.json").read_text(encoding="utf-8")
+    )
+    assert framework["outcome"] == "passed"
+    assert framework["torch_identity_unchanged"] is True
+    assert framework["package_index_resolution_count"] == 0
+    assert framework["torch_download_count"] == 0
+    assert smoke["outcome"] == "passed"
+    assert smoke["failure_code"] is None
 
 
 @pytest.mark.parametrize(
@@ -417,11 +701,14 @@ def test_install_failure_or_timeout_stops_before_preflight(
     exception_class: str | None,
 ) -> None:
     module = _load_bootstrap()
+    _mock_bootstrap_framework(monkeypatch, tmp_path)
     base = _evaluate(
         _contract(),
+        missing="torchvision",
         expected_interpreter_class="system_python",
         actual_interpreter_class="system_python",
         stage="base",
+        allow_missing_torchvision_companion=True,
     )
     stages: list[str] = []
     monkeypatch.setattr(environment, "evaluate_remote_environment", lambda *_a, **_k: base)
@@ -430,26 +717,49 @@ def test_install_failure_or_timeout_stops_before_preflight(
     def fake_run(_command: list[str], **kwargs: object) -> tuple[int, str, str, str | None]:
         stage = cast(str, kwargs["stage"])
         stages.append(stage)
-        if stage == "installing_locked_packages":
+        if stage == "installing_torchvision_companion":
             return return_code, "", "", exception_class
         return 0, "", "", None
 
     monkeypatch.setattr(module, "_run_logged", fake_run)
     assert module.main(_bootstrap_args(tmp_path)) == return_code
-    assert stages == ["creating_venv", "installing_locked_packages"]
+    assert stages == ["creating_venv", "installing_torchvision_companion"]
     failure = json.loads((tmp_path / "recovery" / "failure.json").read_text())
-    assert failure["dependency_failure_code"] == "REMOTE_DEPENDENCY_IMPORT_FAILED"
-    assert failure["failed_module"] == "phase3f-training-lock"
+    assert failure["dependency_failure_code"] == "REMOTE_TORCHVISION_INSTALL_FAILED"
+    assert failure["failed_module"] == "torchvision"
     assert failure["exception_class"] == (
         exception_class or "DependencyBootstrapError"
     )
     assert failure["training_started"] is False
 
 
+def test_bootstrap_wheel_hash_mismatch_stops_before_any_install(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_bootstrap()
+
+    def mismatch(*_args: object, **_kwargs: object) -> object:
+        raise RemoteEnvironmentError("REMOTE_TORCHVISION_WHEEL_HASH_MISMATCH")
+
+    monkeypatch.setattr(environment, "verify_framework_wheelhouse", mismatch)
+    monkeypatch.setattr(
+        module,
+        "_run_logged",
+        lambda *_args, **_kwargs: pytest.fail("install must not start"),
+    )
+    assert module.main(_bootstrap_args(tmp_path)) == 90
+    failure = json.loads((tmp_path / "recovery" / "failure.json").read_text())
+    assert failure["dependency_failure_code"] == (
+        "REMOTE_TORCHVISION_WHEEL_HASH_MISMATCH"
+    )
+    assert failure["failed_module"] == "torchvision"
+
+
 def test_bootstrap_preserves_exact_module_with_empty_stderr(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     module = _load_bootstrap()
+    _mock_bootstrap_framework(monkeypatch, tmp_path)
     contract = _contract()
     base = _evaluate(
         contract,

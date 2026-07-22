@@ -379,11 +379,17 @@ def test_ready_allocation_advances_to_transfer_and_training_start(
     monkeypatch.setattr(module, "_run_command", fake_run_command)
     monkeypatch.setattr(module, "_run_watched", fake_run_watched)
     started = time.monotonic()
+    bundle_root = tmp_path / "bundle"
+    wheelhouse = bundle_root / "wheelhouse"
+    wheelhouse.mkdir(parents=True)
+    (wheelhouse / "framework-checksum-inventory.json").write_text(
+        "{}\n", encoding="ascii"
+    )
 
     result = module._operation(
         _ReadyClient(),
         lease,
-        bundle_root=tmp_path / "bundle",
+        bundle_root=bundle_root,
         key=tmp_path / "key",
         known_hosts=tmp_path / "known-hosts",
         download_path=tmp_path / "output.tar",
@@ -1187,6 +1193,8 @@ def test_powershell_wrappers_are_explicit_receipt_bound_and_secret_safe() -> Non
     assert "$MaxWallMinutes = 345" in start
     assert "finally" in start
     assert "stop-phase3f-runpod.ps1" in start
+    assert "Tee-Object -Variable supervisorOutput" in start
+    assert "throw [string]$typedFailure" in start
     assert 'Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")' in combined
     assert "phase3f-current.json" in status
     assert "phase3f-current.json" in stop
