@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Preflight", "CloudPlan", "RemoteEnvironmentPlan", "TrainingDeadlinePlan", "TrainingPlan", "ReconcileLocalReceipts", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
+    [ValidateSet("Preflight", "CloudPlan", "RemoteEnvironmentPlan", "TrainingDeadlinePlan", "TrainingMemoryPlan", "TrainingPlan", "ReconcileLocalReceipts", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
     [string]$Action,
     [ValidateNotNullOrEmpty()]
     [string]$RuntimeRoot = "D:\AtlasLensRuntime\phase3f-local",
@@ -134,8 +134,14 @@ function Invoke-Control {
         "--repository-root", $repoRoot,
         "--runtime-root", $resolvedRuntime
     )
-    if ($ControlAction -in @("resume-plan", "cloud-plan", "training-plan", "reconcile-local-receipts", "status")) {
+    if ($ControlAction -in @("resume-plan", "cloud-plan", "training-memory-plan", "training-plan", "reconcile-local-receipts", "status")) {
         $arguments += @("--cloud-runtime-root", $resolvedCloudRuntime)
+    }
+    if ($ControlAction -eq "training-memory-plan") {
+        $arguments += @(
+            "--max-gpu-hourly-usd",
+            $MaxGpuHourlyUsd.ToString([Globalization.CultureInfo]::InvariantCulture)
+        )
     }
     if ($ControlAction -in @("training-deadline-plan", "training-plan")) {
         $arguments += @(
@@ -265,6 +271,9 @@ switch ($Action) {
     "TrainingDeadlinePlan" {
         Invoke-Control -ControlAction "training-deadline-plan"
     }
+    "TrainingMemoryPlan" {
+        Invoke-Control -ControlAction "training-memory-plan"
+    }
     "TrainingPlan" {
         Invoke-Control -ControlAction "training-plan"
     }
@@ -272,6 +281,20 @@ switch ($Action) {
         Invoke-Control -ControlAction "reconcile-local-receipts"
     }
     { $_ -in @("Execute", "Resume") } {
+        $memoryOutput = @(Invoke-Control -ControlAction "training-memory-plan")
+        $memoryPlan = Convert-ControlResult `
+            -ControlOutput $memoryOutput `
+            -ExpectedAction "training-memory-plan"
+        if (
+            $memoryPlan.ready_for_cloud -ne $true -or
+            @($memoryPlan.local_blockers).Count -ne 0 -or
+            [int]$memoryPlan.create_attempts -ne 0 -or
+            [int]$memoryPlan.runpod_api_calls -ne 0 -or
+            [int]$memoryPlan.cloud_mutations -ne 0 -or
+            [int]$memoryPlan.dataset_writes -ne 0
+        ) {
+            throw [string]@($memoryPlan.local_blockers)[0]
+        }
         $deadlineOutput = @(Invoke-Control -ControlAction "training-deadline-plan")
         $deadlinePlan = Convert-ControlResult `
             -ControlOutput $deadlineOutput `

@@ -437,13 +437,16 @@ def test_metric_batches_have_positive_pairs_and_negative_groups() -> None:
 
 def test_training_and_operator_contracts_are_real_and_secret_safe() -> None:
     train_source = inspect.getsource(training.TrainableMegaLocRuntime.train)
+    step_source = inspect.getsource(
+        training.TrainableMegaLocRuntime._effective_batch_step
+    )
     job_source = inspect.getsource(training.run_training_job)
     launcher = LAUNCHER.read_text(encoding="utf-8")
     supervisor = _load_supervisor()
     execute_source = inspect.getsource(supervisor._run_execute)
 
-    assert ".backward()" in train_source
-    assert "scaler.step(optimizer)" in train_source
+    assert ".backward()" in step_source
+    assert "scaler.step(optimizer)" in step_source
     assert "AdamW" in train_source
     assert "GradScaler" in train_source
     assert "optimizer.load_state_dict" in inspect.getsource(
@@ -496,6 +499,7 @@ def test_training_and_operator_contracts_are_real_and_secret_safe() -> None:
         "CloudPlan",
         "RemoteEnvironmentPlan",
         "TrainingDeadlinePlan",
+        "TrainingMemoryPlan",
         "ReconcileLocalReceipts",
         "Execute",
         "Status",

@@ -41,6 +41,14 @@ from atlaslens_api.phase3f.deadline import (
     epoch_deadline_to_monotonic,
 )
 from atlaslens_api.phase3f.local_first import VerifiedAcquisition, verify_sealed_acquisition
+from atlaslens_api.phase3f.memory import (
+    BASELINE_MICROBATCH,
+    EFFECTIVE_BATCH_SIZE,
+    GRADIENT_ACCUMULATION_STEPS,
+    TRAINING_INPUT_SHAPE,
+    TRAINING_MICROBATCH,
+    StageOOMError,
+)
 from atlaslens_api.phase3f.pipeline import (
     MODEL_SHA256,
     DescriptorPublication,
@@ -148,7 +156,7 @@ def training_config_sha256(
             "TRAINING_ENVIRONMENT_CONTRACT_INVALID",
         )
     document: dict[str, object] = {
-        "schema": "atlaslens-phase3f-training-config-v1",
+        "schema": "atlaslens-phase3f-training-config-v2",
         "seed": seed,
         "maximum_epochs": max_epochs,
         "objective": "batch_hard_metric_learning_softplus_cosine_v1",
@@ -157,6 +165,9 @@ def training_config_sha256(
         "weight_decay": "0.0001",
         "scheduler": "constant",
         "mixed_precision": True,
+        "effective_batch_size": EFFECTIVE_BATCH_SIZE,
+        "microbatch_strategy": "deterministic_gradient_cache_v1",
+        "checkpoint_accumulation_boundary_only": True,
         "checkpoint_interval_seconds": CHECKPOINT_INTERVAL_SECONDS,
         "checkpoint_interval_steps": CHECKPOINT_INTERVAL_STEPS,
     }
@@ -587,6 +598,7 @@ class TrainableMegaLocRuntime:
         self._selected_parameters = tuple(parameter for _name, parameter in selected)
         self._initial_selected = initial_selected
         self._seed = seed
+        self._last_describe_diagnostic: dict[str, object] | None = None
 
     def _tensor(self, path: Path, *, training: bool, salt: int) -> Any:
         _require(path.is_file() and not path.is_symlink(), "TRAINING_IMAGE_INVALID")
@@ -612,28 +624,82 @@ class TrainableMegaLocRuntime:
             raise TrainingError("TRAINING_IMAGE_INVALID") from exc
 
     def describe(
-        self, paths: Sequence[Path], *, batch_size: int
+        self,
+        paths: Sequence[Path],
+        *,
+        batch_size: int,
+        stage: str = "validation",
     ) -> np.ndarray[Any, np.dtype[np.float32]]:
         if not paths:
             return np.empty((0, 8448), dtype=np.float32)
+        _require(batch_size >= 1, "TRAINING_INFERENCE_BATCH_INVALID")
+        _require(stage in {"baseline", "validation", "holdout"}, "TRAINING_STAGE_INVALID")
         output = np.empty((len(paths), 8448), dtype=np.float32)
         self._model.eval()
+        active_batch_size = min(batch_size, len(paths))
+        minimum_batch = active_batch_size
+        oom_recoveries = 0
         try:
             with self._torch.inference_mode():
-                for offset in range(0, len(paths), batch_size):
-                    batch_paths = paths[offset : offset + batch_size]
-                    tensors = [
-                        self._tensor(path, training=False, salt=offset + index)
-                        for index, path in enumerate(batch_paths)
-                    ]
-                    batch = self._torch.stack(tensors).to("cuda", non_blocking=True)
-                    with self._torch.amp.autocast("cuda", dtype=self._torch.float16):
-                        matrix = self._model(batch)
-                    output[offset : offset + len(batch_paths)] = matrix.float().cpu().numpy()
+                offset = 0
+                while offset < len(paths):
+                    batch_paths = paths[offset : offset + active_batch_size]
+                    tensors: list[Any] = []
+                    batch: Any = None
+                    matrix: Any = None
+                    try:
+                        tensors = [
+                            self._tensor(path, training=False, salt=offset + index)
+                            for index, path in enumerate(batch_paths)
+                        ]
+                        batch = self._torch.stack(tensors).to("cuda", non_blocking=True)
+                        with self._torch.amp.autocast("cuda", dtype=self._torch.float16):
+                            matrix = self._model(batch)
+                        output[offset : offset + len(batch_paths)] = (
+                            matrix.float().cpu().numpy()
+                        )
+                        offset += len(batch_paths)
+                        minimum_batch = min(minimum_batch, len(batch_paths))
+                    except self._torch.cuda.OutOfMemoryError as exc:
+                        oom_recoveries += 1
+                        terminal = None
+                        if active_batch_size == 1:
+                            terminal = StageOOMError(
+                                stage=cast(Any, stage),
+                                batch_size=1,
+                                input_shape=(1, *TRAINING_INPUT_SHAPE),
+                                torch_module=self._torch,
+                                source=exc,
+                            )
+                        if matrix is not None:
+                            matrix = None
+                        if batch is not None:
+                            batch = None
+                        tensors.clear()
+                        self._torch.cuda.empty_cache()
+                        if terminal is not None:
+                            raise terminal from exc
+                        active_batch_size = max(1, active_batch_size // 2)
+                        minimum_batch = min(minimum_batch, active_batch_size)
+                        continue
+                    finally:
+                        matrix = None
+                        batch = None
+                        tensors.clear()
+        except StageOOMError:
+            raise
         except Exception as exc:
-            if isinstance(exc, self._torch.cuda.OutOfMemoryError):
-                raise
             raise TrainingError("MEGALOC_TRAINING_INFERENCE_FAILED") from exc
+        self._last_describe_diagnostic = {
+            "stage": stage,
+            "requested_microbatch": batch_size,
+            "minimum_microbatch": minimum_batch,
+            "oom_recoveries": oom_recoveries,
+            "row_count": len(paths),
+            "dtype": "float16_autocast",
+            "model_mode": "eval",
+            "inference_mode": True,
+        }
         _require(bool(np.isfinite(output).all()), "DESCRIPTOR_NONFINITE")
         norms = np.linalg.norm(output, axis=1)
         _require(bool(np.allclose(norms, 1.0, atol=1e-3, rtol=0.0)), "DESCRIPTOR_NORM_INVALID")
@@ -696,7 +762,19 @@ class TrainableMegaLocRuntime:
             state = json.loads(
                 (generation_root / "training-state.json").read_text(encoding="utf-8")
             )
-            _require(isinstance(state, dict), "TRAINING_CHECKPOINT_INVALID")
+            _require(
+                isinstance(state, dict)
+                and state.get("accumulation_boundary") is True
+                and state.get("effective_batch_size") == EFFECTIVE_BATCH_SIZE
+                and isinstance(state.get("training_microbatch_size"), int)
+                and not isinstance(state.get("training_microbatch_size"), bool)
+                and isinstance(state.get("gradient_accumulation_steps"), int)
+                and not isinstance(state.get("gradient_accumulation_steps"), bool)
+                and cast(int, state["training_microbatch_size"])
+                * cast(int, state["gradient_accumulation_steps"])
+                == EFFECTIVE_BATCH_SIZE,
+                "TRAINING_CHECKPOINT_INVALID",
+            )
             delta = self._load_file(
                 str(generation_root / "trainable.safetensors"), device="cpu"
             )
@@ -778,7 +856,16 @@ class TrainableMegaLocRuntime:
         sealed_assets_sha256: str,
         training_config_sha256_value: str,
         environment_identity_sha256: str,
+        training_microbatch_size: int = TRAINING_MICROBATCH,
+        gradient_accumulation_steps: int = GRADIENT_ACCUMULATION_STEPS,
     ) -> None:
+        _require(
+            training_microbatch_size >= 1
+            and gradient_accumulation_steps >= 1
+            and training_microbatch_size * gradient_accumulation_steps
+            == EFFECTIVE_BATCH_SIZE,
+            "TRAINING_ACCUMULATION_INVALID",
+        )
         checkpoint_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = checkpoint_root / f".generation-{uuid4().hex}.partial"
         temporary.mkdir(mode=0o700)
@@ -825,6 +912,10 @@ class TrainableMegaLocRuntime:
                     "history": list(history),
                     "train_losses": list(train_losses),
                     "holdout_open_count": 0,
+                    "accumulation_boundary": True,
+                    "effective_batch_size": EFFECTIVE_BATCH_SIZE,
+                    "training_microbatch_size": training_microbatch_size,
+                    "gradient_accumulation_steps": gradient_accumulation_steps,
                     "python_rng_state": random.getstate(),
                     "numpy_rng_state": {
                         "algorithm": numpy_algorithm,
@@ -869,6 +960,10 @@ class TrainableMegaLocRuntime:
                 "next_batch_index": next_batch_index,
                 "optimizer_steps": optimizer_steps,
                 "holdout_open_count": 0,
+                "accumulation_boundary": True,
+                "effective_batch_size": EFFECTIVE_BATCH_SIZE,
+                "training_microbatch_size": training_microbatch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
                 "artifacts": artifacts,
                 "secrets_included": False,
             }
@@ -893,6 +988,159 @@ class TrainableMegaLocRuntime:
             if isinstance(exc, TrainingError):
                 raise
             raise TrainingError("TRAINING_CHECKPOINT_WRITE_FAILED") from exc
+
+    def _effective_batch_step(
+        self,
+        batch_assets: Sequence[SplitAsset],
+        media_root: Path,
+        optimizer: Any,
+        scheduler: Any,
+        scaler: Any,
+        *,
+        epoch: int,
+        batch_index: int,
+        microbatch_size: int,
+    ) -> tuple[float, int, int]:
+        """Run one exact effective-batch loss with bounded activation replays."""
+        _require(
+            4 <= len(batch_assets) <= EFFECTIVE_BATCH_SIZE
+            and 1 <= microbatch_size <= len(batch_assets),
+            "TRAINING_ACCUMULATION_INVALID",
+        )
+        labels_by_asset = _batch_metric_labels(batch_assets)
+        labels = self._torch.tensor(
+            [labels_by_asset[item.opaque_id] for item in batch_assets],
+            dtype=self._torch.long,
+            device="cuda",
+        )
+        active_microbatch = microbatch_size
+        oom_recoveries = 0
+        while True:
+            initial_cpu_rng = self._torch.get_rng_state()
+            initial_cuda_rng = self._torch.cuda.get_rng_state_all()
+            cached: list[Any] = []
+            replay_rng: list[tuple[Any, list[Any]]] = []
+            cached_embeddings: Any = None
+            cached_gradient: Any = None
+            batch: Any = None
+            micro_embeddings: Any = None
+            replay_embeddings: Any = None
+            tensors: list[Any] = []
+            try:
+                optimizer.zero_grad(set_to_none=True)
+                self._model.train()
+                with self._torch.no_grad():
+                    for offset in range(0, len(batch_assets), active_microbatch):
+                        micro_assets = batch_assets[offset : offset + active_microbatch]
+                        replay_rng.append(
+                            (
+                                self._torch.get_rng_state(),
+                                self._torch.cuda.get_rng_state_all(),
+                            )
+                        )
+                        tensors = [
+                            self._tensor(
+                                media_root / item.relative_path,
+                                training=True,
+                                salt=(
+                                    epoch * 1_000_000
+                                    + batch_index * EFFECTIVE_BATCH_SIZE
+                                    + offset
+                                    + index
+                                ),
+                            )
+                            for index, item in enumerate(micro_assets)
+                        ]
+                        batch = self._torch.stack(tensors).to(
+                            "cuda", non_blocking=True
+                        )
+                        with self._torch.amp.autocast(
+                            "cuda", dtype=self._torch.float16
+                        ):
+                            micro_embeddings = self._model(batch)
+                        cached.append(micro_embeddings.detach())
+                        micro_embeddings = None
+                        batch = None
+                        tensors.clear()
+                final_cpu_rng = self._torch.get_rng_state()
+                final_cuda_rng = self._torch.cuda.get_rng_state_all()
+                cached_embeddings = (
+                    self._torch.cat(cached, dim=0).detach().requires_grad_(True)
+                )
+                loss = self._metric_loss(cached_embeddings, labels)
+                _require(
+                    bool(self._torch.isfinite(loss).item()),
+                    "TRAINING_NONFINITE_LOSS",
+                )
+                scaler.scale(loss).backward()
+                _require(
+                    cached_embeddings.grad is not None,
+                    "TRAINING_EMBEDDING_GRADIENT_MISSING",
+                )
+                cached_gradient = cached_embeddings.grad.detach()
+                for replay_index, offset in enumerate(
+                    range(0, len(batch_assets), active_microbatch)
+                ):
+                    self._torch.set_rng_state(replay_rng[replay_index][0])
+                    self._torch.cuda.set_rng_state_all(replay_rng[replay_index][1])
+                    micro_assets = batch_assets[offset : offset + active_microbatch]
+                    tensors = [
+                        self._tensor(
+                            media_root / item.relative_path,
+                            training=True,
+                            salt=(
+                                epoch * 1_000_000
+                                + batch_index * EFFECTIVE_BATCH_SIZE
+                                + offset
+                                + index
+                            ),
+                        )
+                        for index, item in enumerate(micro_assets)
+                    ]
+                    batch = self._torch.stack(tensors).to("cuda", non_blocking=True)
+                    with self._torch.amp.autocast("cuda", dtype=self._torch.float16):
+                        replay_embeddings = self._model(batch)
+                    self._torch.autograd.backward(
+                        replay_embeddings,
+                        cached_gradient[offset : offset + len(micro_assets)],
+                    )
+                    replay_embeddings = None
+                    batch = None
+                    tensors.clear()
+                self._torch.set_rng_state(final_cpu_rng)
+                self._torch.cuda.set_rng_state_all(final_cuda_rng)
+                scaler.unscale_(optimizer)
+                self._torch.nn.utils.clip_grad_norm_(self._selected_parameters, 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                return float(loss.detach().cpu()), active_microbatch, oom_recoveries
+            except self._torch.cuda.OutOfMemoryError as exc:
+                terminal = StageOOMError(
+                    stage="train",
+                    batch_size=active_microbatch,
+                    input_shape=(active_microbatch, *TRAINING_INPUT_SHAPE),
+                    torch_module=self._torch,
+                    source=exc,
+                )
+                self._torch.set_rng_state(initial_cpu_rng)
+                self._torch.cuda.set_rng_state_all(initial_cuda_rng)
+                optimizer.zero_grad(set_to_none=True)
+                cached.clear()
+                replay_rng.clear()
+                tensors.clear()
+                replay_embeddings = None
+                micro_embeddings = None
+                batch = None
+                cached_gradient = None
+                cached_embeddings = None
+                self._torch.cuda.empty_cache()
+                oom_recoveries += 1
+                if active_microbatch == 1:
+                    raise terminal from exc
+                active_microbatch = max(1, active_microbatch // 2)
+                continue
 
     def train(
         self,
@@ -945,6 +1193,12 @@ class TrainableMegaLocRuntime:
         history = cast(list[dict[str, object]], resumed["history"])
         resumed_train_losses = cast(list[float], resumed["train_losses"])
         last_checkpoint_at = time.monotonic()
+        _require(
+            batch_size * gradient_accumulation == EFFECTIVE_BATCH_SIZE,
+            "TRAINING_ACCUMULATION_INVALID",
+        )
+        minimum_training_microbatch = batch_size
+        training_oom_recoveries = 0
         for epoch in range(start_epoch, max_epochs):
             _require(
                 time.monotonic() < deadline_monotonic,
@@ -952,12 +1206,10 @@ class TrainableMegaLocRuntime:
             )
             batches = _epoch_batches(
                 train_assets,
-                batch_size=batch_size,
+                batch_size=EFFECTIVE_BATCH_SIZE,
                 seed=self._seed,
                 epoch=epoch,
             )
-            self._model.train()
-            optimizer.zero_grad(set_to_none=True)
             train_losses = list(resumed_train_losses) if epoch == start_epoch else []
             for batch_index, batch_assets in enumerate(batches):
                 if epoch == start_epoch and batch_index < resume_batch:
@@ -966,107 +1218,93 @@ class TrainableMegaLocRuntime:
                     time.monotonic() < deadline_monotonic,
                     "TRAINING_WALL_LIMIT_REACHED",
                 )
-                labels_by_asset = _batch_metric_labels(batch_assets)
-                tensors = [
-                    self._tensor(
-                        media_root / item.relative_path,
-                        training=True,
-                        salt=epoch * 1_000_000 + batch_index * 100 + index,
+                loss_value, used_microbatch, oom_recoveries = (
+                    self._effective_batch_step(
+                        batch_assets,
+                        media_root,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        epoch=epoch,
+                        batch_index=batch_index,
+                        microbatch_size=batch_size,
                     )
-                    for index, item in enumerate(batch_assets)
-                ]
-                batch = self._torch.stack(tensors).to("cuda", non_blocking=True)
-                labels = self._torch.tensor(
-                    [labels_by_asset[item.opaque_id] for item in batch_assets],
-                    dtype=self._torch.long,
-                    device="cuda",
                 )
-                with self._torch.amp.autocast("cuda", dtype=self._torch.float16):
-                    embeddings = self._model(batch)
-                    loss = self._metric_loss(embeddings, labels)
-                    scaled_loss = loss / gradient_accumulation
-                _require(bool(self._torch.isfinite(loss).item()), "TRAINING_NONFINITE_LOSS")
-                scaler.scale(scaled_loss).backward()
-                train_losses.append(float(loss.detach().cpu()))
-                should_step = (batch_index + 1) % gradient_accumulation == 0 or (
-                    batch_index + 1 == len(batches)
+                train_losses.append(loss_value)
+                minimum_training_microbatch = min(
+                    minimum_training_microbatch, used_microbatch
                 )
-                if should_step:
-                    scaler.unscale_(optimizer)
-                    self._torch.nn.utils.clip_grad_norm_(self._selected_parameters, 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    optimizer_steps += 1
-                    if progress_root is not None:
-                        _atomic_json(
-                            progress_root / "progress.json",
-                            {
-                                "schema": "atlaslens-phase3f-remote-training-progress-v1",
-                                "stage": "training",
-                                "completed_epoch": completed_epoch,
-                                "epoch": epoch,
-                                "next_batch_index": batch_index + 1,
-                                "optimizer_steps": optimizer_steps,
-                                "holdout_open_count": 0,
-                                "secrets_included": False,
-                            },
-                        )
-                    now = time.monotonic()
-                    if (
-                        optimizer_steps % CHECKPOINT_INTERVAL_STEPS == 0
-                        or now - last_checkpoint_at >= CHECKPOINT_INTERVAL_SECONDS
-                    ):
-                        self._write_checkpoint(
-                            checkpoint_root,
-                            optimizer,
-                            scheduler,
-                            scaler,
-                            run_id=run_id,
-                            completed_epoch=completed_epoch,
-                            next_epoch=epoch,
-                            next_batch_index=batch_index + 1,
-                            optimizer_steps=optimizer_steps,
-                            best_validation_loss=best_loss,
-                            patience=patience,
-                            history=history,
-                            train_losses=train_losses,
-                            dataset_readiness_sha256=dataset_readiness_sha256,
-                            sealed_assets_sha256=sealed_assets_sha256,
-                            training_config_sha256_value=training_config_sha256_value,
-                            environment_identity_sha256=environment_identity_sha256,
-                        )
-                        last_checkpoint_at = now
+                training_oom_recoveries += oom_recoveries
+                optimizer_steps += 1
+                if progress_root is not None:
+                    _atomic_json(
+                        progress_root / "progress.json",
+                        {
+                            "schema": "atlaslens-phase3f-remote-training-progress-v1",
+                            "stage": "training",
+                            "completed_epoch": completed_epoch,
+                            "epoch": epoch,
+                            "next_batch_index": batch_index + 1,
+                            "optimizer_steps": optimizer_steps,
+                            "accumulation_boundary": True,
+                            "holdout_open_count": 0,
+                            "secrets_included": False,
+                        },
+                    )
+                now = time.monotonic()
+                if (
+                    optimizer_steps % CHECKPOINT_INTERVAL_STEPS == 0
+                    or now - last_checkpoint_at >= CHECKPOINT_INTERVAL_SECONDS
+                ):
+                    self._write_checkpoint(
+                        checkpoint_root,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        run_id=run_id,
+                        completed_epoch=completed_epoch,
+                        next_epoch=epoch,
+                        next_batch_index=batch_index + 1,
+                        optimizer_steps=optimizer_steps,
+                        best_validation_loss=best_loss,
+                        patience=patience,
+                        history=history,
+                        train_losses=train_losses,
+                        dataset_readiness_sha256=dataset_readiness_sha256,
+                        sealed_assets_sha256=sealed_assets_sha256,
+                        training_config_sha256_value=training_config_sha256_value,
+                        environment_identity_sha256=environment_identity_sha256,
+                        training_microbatch_size=minimum_training_microbatch,
+                        gradient_accumulation_steps=math.ceil(
+                            EFFECTIVE_BATCH_SIZE / minimum_training_microbatch
+                        ),
+                    )
+                    last_checkpoint_at = now
             validation_batches = _epoch_batches(
                 validation_assets,
-                batch_size=batch_size,
+                batch_size=EFFECTIVE_BATCH_SIZE,
                 seed=self._seed,
                 epoch=0,
             )
             validation_losses: list[float] = []
-            self._model.eval()
-            with self._torch.inference_mode():
-                for batch_index, batch_assets in enumerate(validation_batches):
-                    labels_by_asset = _batch_metric_labels(batch_assets)
-                    tensors = [
-                        self._tensor(
-                            media_root / item.relative_path,
-                            training=False,
-                            salt=batch_index * 100 + index,
-                        )
-                        for index, item in enumerate(batch_assets)
-                    ]
-                    batch = self._torch.stack(tensors).to("cuda", non_blocking=True)
-                    labels = self._torch.tensor(
-                        [labels_by_asset[item.opaque_id] for item in batch_assets],
-                        dtype=self._torch.long,
-                        device="cuda",
-                    )
-                    with self._torch.amp.autocast("cuda", dtype=self._torch.float16):
-                        loss = self._metric_loss(self._model(batch), labels)
-                    _require(bool(self._torch.isfinite(loss).item()), "VALIDATION_NONFINITE_LOSS")
-                    validation_losses.append(float(loss.cpu()))
+            for batch_assets in validation_batches:
+                labels_by_asset = _batch_metric_labels(batch_assets)
+                matrix = self.describe(
+                    [media_root / item.relative_path for item in batch_assets],
+                    batch_size=batch_size,
+                    stage="validation",
+                )
+                embeddings = self._torch.from_numpy(matrix)
+                labels = self._torch.tensor(
+                    [labels_by_asset[item.opaque_id] for item in batch_assets],
+                    dtype=self._torch.long,
+                )
+                loss = self._metric_loss(embeddings, labels)
+                _require(
+                    bool(self._torch.isfinite(loss).item()),
+                    "VALIDATION_NONFINITE_LOSS",
+                )
+                validation_losses.append(float(loss))
             mean_train = float(np.mean(train_losses))
             mean_validation = float(np.mean(validation_losses))
             improved = mean_validation < best_loss - 1e-6
@@ -1118,6 +1356,10 @@ class TrainableMegaLocRuntime:
                 sealed_assets_sha256=sealed_assets_sha256,
                 training_config_sha256_value=training_config_sha256_value,
                 environment_identity_sha256=environment_identity_sha256,
+                training_microbatch_size=minimum_training_microbatch,
+                gradient_accumulation_steps=math.ceil(
+                    EFFECTIVE_BATCH_SIZE / minimum_training_microbatch
+                ),
             )
             if improved:
                 pointer = json.loads(
@@ -1165,6 +1407,12 @@ class TrainableMegaLocRuntime:
             "trainable_parameter_names_sha256": hashlib.sha256(
                 _canonical_bytes(self._selected_names)
             ).hexdigest(),
+            "effective_batch_size": EFFECTIVE_BATCH_SIZE,
+            "minimum_training_microbatch": minimum_training_microbatch,
+            "gradient_accumulation_steps": math.ceil(
+                EFFECTIVE_BATCH_SIZE / minimum_training_microbatch
+            ),
+            "training_oom_recoveries": training_oom_recoveries,
             "weights_changed": True,
         }
 
@@ -1363,10 +1611,12 @@ def _runtime_descriptors(
     media_root: Path,
     *,
     batch_size: int,
+    stage: str = "validation",
 ) -> np.ndarray[Any, np.dtype[np.float32]]:
     return runtime.describe(
         [media_root / item.relative_path for item in assets],
         batch_size=batch_size,
+        stage=stage,
     )
 
 
@@ -1374,11 +1624,7 @@ def _adaptive_batch(torch: Any) -> tuple[int, int, int]:
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     total_gib = int(properties.total_memory) / 1024**3
     _require(total_gib >= 16.0, "GPU_MEMORY_BELOW_TRAINING_MINIMUM")
-    batch_size = 8 if total_gib >= 23.0 else 6 if total_gib >= 20.0 else 4
-    if batch_size % 2:
-        batch_size -= 1
-    accumulation = max(1, math.ceil(16 / batch_size))
-    return batch_size, accumulation, int(total_gib)
+    return TRAINING_MICROBATCH, GRADIENT_ACCUMULATION_STEPS, int(total_gib)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1527,10 +1773,14 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
     try:
         baseline_runtime = worker.MegaLocRuntime(config.model_path, config.vendor_root)
         baseline_reference = baseline_runtime.describe(
-            [media_root / item.relative_path for item in references]
+            [media_root / item.relative_path for item in references],
+            batch_size=BASELINE_MICROBATCH,
+            stage="baseline",
         )
         baseline_validation = baseline_runtime.describe(
-            [media_root / item.relative_path for item in validation]
+            [media_root / item.relative_path for item in validation],
+            batch_size=BASELINE_MICROBATCH,
+            stage="validation",
         )
         (
             baseline_index,
@@ -1565,46 +1815,41 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
         import torch
 
         batch_size, accumulation, gpu_memory_gib = _adaptive_batch(torch)
-        oom_recoveries = 0
-        while True:
-            try:
-                tuner = TrainableMegaLocRuntime(
-                    config.model_path,
-                    config.vendor_root,
-                    seed=config.seed,
-                )
-                training = tuner.train(
-                    references,
-                    validation,
-                    media_root,
-                    config.work_root / "training-checkpoint",
-                    batch_size=batch_size,
-                    gradient_accumulation=accumulation,
-                    max_epochs=config.max_epochs,
-                    deadline_monotonic=deadline_monotonic,
-                    run_id=config.run_id,
-                    dataset_readiness_sha256=dataset_readiness_sha256,
-                    sealed_assets_sha256=sealed_assets_sha256,
-                    training_config_sha256_value=config_sha256,
-                    environment_identity_sha256=environment_identity_sha256,
-                    progress_root=config.recovery_root,
-                )
-                break
-            except torch.cuda.OutOfMemoryError:
-                if tuner is not None:
-                    tuner.close()
-                    tuner = None
-                torch.cuda.empty_cache()
-                oom_recoveries += 1
-                if oom_recoveries > 2 or batch_size <= 4:
-                    raise TrainingError("TRAINING_CUDA_OOM_EXHAUSTED") from None
-                batch_size = max(4, batch_size - 2)
-                accumulation = max(1, math.ceil(16 / batch_size))
+        tuner = TrainableMegaLocRuntime(
+            config.model_path,
+            config.vendor_root,
+            seed=config.seed,
+        )
+        training = tuner.train(
+            references,
+            validation,
+            media_root,
+            config.work_root / "training-checkpoint",
+            batch_size=batch_size,
+            gradient_accumulation=accumulation,
+            max_epochs=config.max_epochs,
+            deadline_monotonic=deadline_monotonic,
+            run_id=config.run_id,
+            dataset_readiness_sha256=dataset_readiness_sha256,
+            sealed_assets_sha256=sealed_assets_sha256,
+            training_config_sha256_value=config_sha256,
+            environment_identity_sha256=environment_identity_sha256,
+            progress_root=config.recovery_root,
+        )
+        oom_recoveries = cast(int, training["training_oom_recoveries"])
         trained_reference = _runtime_descriptors(
-            tuner, references, media_root, batch_size=batch_size
+            tuner,
+            references,
+            media_root,
+            batch_size=batch_size,
+            stage="validation",
         )
         trained_validation = _runtime_descriptors(
-            tuner, validation, media_root, batch_size=batch_size
+            tuner,
+            validation,
+            media_root,
+            batch_size=batch_size,
+            stage="validation",
         )
         index, descriptor_sha, index_sha, publication_sha = worker._publish_reference_bundle(  # noqa: SLF001
             config.output_root,
@@ -1676,6 +1921,7 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
             holdout,
             media_root,
             batch_size=batch_size,
+            stage="holdout",
         )
         holdout_rows = worker._retrieval_rows(  # noqa: SLF001
             index,
@@ -1715,7 +1961,12 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
             "optimizer": "adamw",
             "mixed_precision": True,
             "adaptive_batch_size": batch_size,
-            "gradient_accumulation": accumulation,
+            "training_microbatch_size": training["minimum_training_microbatch"],
+            "effective_batch_size": EFFECTIVE_BATCH_SIZE,
+            "gradient_accumulation": training["gradient_accumulation_steps"],
+            "gradient_cache_replay": True,
+            "checkpoint_accumulation_boundary_only": True,
+            "baseline_microbatch_size": BASELINE_MICROBATCH,
             "gpu_memory_gib_floor": gpu_memory_gib,
             "oom_recoveries": oom_recoveries,
             "maximum_oom_recoveries": 2,

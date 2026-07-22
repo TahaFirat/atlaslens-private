@@ -1337,6 +1337,144 @@ def training_deadline_plan(
     return build_training_deadline_plan(requested_total_minutes).to_public_dict()
 
 
+def training_memory_plan(
+    repository: Path,
+    runtime_root: Path,
+    cloud_runtime: Path,
+    *,
+    max_gpu_hourly_usd: Decimal = Decimal("0.50"),
+) -> dict[str, object]:
+    """Build the hash-bound, zero-network production CUDA memory gate."""
+    local = resume_plan(repository, runtime_root, cloud_runtime)
+    run_id = cast(str, local["run_id"])
+    source = repository.resolve() / "services" / "api" / "src"
+    if str(source) not in sys.path:
+        sys.path.insert(0, str(source))
+    from atlaslens_api.phase3f.memory import (  # noqa: PLC0415
+        BASELINE_MAX_ATTENTION_TOKENS,
+        BASELINE_MAX_INPUT_SHAPE,
+        BASELINE_MICROBATCH,
+        EFFECTIVE_BATCH_SIZE,
+        FALLBACK_CLOUD_VRAM_GIB,
+        GRADIENT_ACCUMULATION_STEPS,
+        MAX_GPU_HOURLY_USD,
+        TRAINING_INPUT_SHAPE,
+        TRAINING_MICROBATCH,
+        MemoryPlanError,
+        require_production_memory_evidence,
+    )
+    from atlaslens_api.phase3f.pipeline import MODEL_SHA256  # noqa: PLC0415
+
+    sealed_root = runtime_root.resolve() / run_id / "sealed-acquisition"
+    inventory_sha256 = _sha256_path(
+        sealed_root / "checksum-inventory.json",
+        artifact="checksum-inventory.json",
+        max_bytes=64 * 1024 * 1024,
+    )
+    evidence_path = (
+        repository.resolve()
+        / ".local"
+        / "phase3f"
+        / "verification"
+        / run_id
+        / "production-memory-smoke.json"
+    )
+    blockers: list[str] = []
+    evidence: dict[str, object] | None = None
+    measured = None
+    if not evidence_path.is_file() or evidence_path.is_symlink():
+        blockers.append("LOCAL_CUDA_PRODUCTION_SHAPE_MISSING")
+    else:
+        try:
+            evidence = _integrity_json(
+                evidence_path,
+                artifact="production-memory-smoke.json",
+                missing_code="LOCAL_CUDA_PRODUCTION_SHAPE_MISSING",
+                invalid_code="LOCAL_CUDA_PRODUCTION_SHAPE_INVALID",
+                max_bytes=1024 * 1024,
+            )
+            measured = require_production_memory_evidence(
+                evidence,
+                run_id=run_id,
+                readiness_sha256=cast(str, local["readiness_sha256"]),
+                sealed_assets_sha256=cast(str, local["sealed_assets_sha256"]),
+                checksum_inventory_sha256=inventory_sha256,
+                model_sha256=MODEL_SHA256,
+            )
+        except (EndToEndError, MemoryPlanError, ValueError):
+            blockers.append("LOCAL_CUDA_PRODUCTION_SHAPE_INVALID")
+    if max_gpu_hourly_usd <= 0 or max_gpu_hourly_usd > MAX_GPU_HOURLY_USD:
+        blockers.append("GPU_MEMORY_PLAN_UNSATISFIED")
+    required_vram = measured.requirement.required_vram_gib if measured else None
+    if required_vram is not None and required_vram > FALLBACK_CLOUD_VRAM_GIB:
+        blockers.append("GPU_MEMORY_PLAN_UNSATISFIED")
+    if required_vram is None:
+        allowed: list[dict[str, object]] = []
+    elif required_vram <= 24:
+        allowed = [
+            {"provider_memory_gib": 24, "class": "L4_A5000_RTX3090"},
+            {"provider_memory_gib": 48, "class": "A40_A6000_FALLBACK"},
+        ]
+    else:
+        allowed = [
+            {"provider_memory_gib": 48, "class": "A40_A6000_FALLBACK"}
+        ]
+    return {
+        "schema": "atlaslens-phase3f-training-memory-plan-v1",
+        "action": "training-memory-plan",
+        "run_id": run_id,
+        "production_input_shape": list(BASELINE_MAX_INPUT_SHAPE),
+        "training_input_shape": list(TRAINING_INPUT_SHAPE),
+        "attention_token_count": BASELINE_MAX_ATTENTION_TOKENS,
+        "baseline_microbatch": BASELINE_MICROBATCH,
+        "training_microbatch": TRAINING_MICROBATCH,
+        "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+        "effective_batch_size": EFFECTIVE_BATCH_SIZE,
+        "measured_local_peak_allocated_bytes": (
+            measured.peak_allocated_bytes if measured else None
+        ),
+        "measured_local_peak_reserved_bytes": (
+            measured.peak_reserved_bytes if measured else None
+        ),
+        "required_gpu_vram_gib": required_vram,
+        "required_headroom_bytes": (
+            measured.requirement.required_headroom_bytes if measured else None
+        ),
+        "allowed_gpu_classes": allowed,
+        "max_hourly_price_usd": str(max_gpu_hourly_usd),
+        "local_cuda_production_shape_result": (
+            "passed" if measured is not None else "missing_or_invalid"
+        ),
+        "checkpoint_roundtrip_result": (
+            "passed"
+            if measured is not None and measured.checkpoint_roundtrip_passed
+            else "missing_or_invalid"
+        ),
+        "numerical_equivalence": (
+            {
+                "cosine_min": measured.numerical_cosine_min,
+                "linf_max": measured.numerical_linf_max,
+            }
+            if measured is not None
+            else None
+        ),
+        "evidence": evidence,
+        "asset_count": local["asset_count"],
+        "readiness_sha256": local["readiness_sha256"],
+        "sealed_assets_sha256": local["sealed_assets_sha256"],
+        "checksum_inventory_sha256": inventory_sha256,
+        "holdout_open_count": 0,
+        "local_blockers": list(dict.fromkeys(blockers)),
+        "ready_for_cloud": not blockers,
+        "create_attempts": 0,
+        "runpod_api_calls": 0,
+        "network_calls": 0,
+        "cloud_mutations": 0,
+        "dataset_writes": 0,
+        "secrets_included": False,
+    }
+
+
 def reconcile_local_receipts(cloud_runtime: Path) -> dict[str, object]:
     source = Path(__file__).resolve().parents[2] / "services" / "api" / "src"
     if str(source) not in sys.path:
@@ -1403,6 +1541,7 @@ def _parser() -> argparse.ArgumentParser:
             "cloud-plan",
             "remote-environment-plan",
             "training-deadline-plan",
+            "training-memory-plan",
             "training-plan",
             "reconcile-local-receipts",
             "status",
@@ -1412,6 +1551,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--cloud-runtime-root", type=Path)
     parser.add_argument("--training-max-wall-minutes", type=int, default=345)
+    parser.add_argument("--max-gpu-hourly-usd", type=Decimal, default=Decimal("0.50"))
     return parser
 
 
@@ -1442,6 +1582,14 @@ def main(argv: list[str] | None = None) -> int:
             result = training_deadline_plan(
                 args.repository_root,
                 args.training_max_wall_minutes,
+            )
+        elif args.action == "training-memory-plan":
+            _require(args.cloud_runtime_root is not None, "CLOUD_RUNTIME_ROOT_MISSING")
+            result = training_memory_plan(
+                args.repository_root,
+                args.runtime_root,
+                args.cloud_runtime_root,
+                max_gpu_hourly_usd=args.max_gpu_hourly_usd,
             )
         elif args.action == "training-plan":
             _require(args.cloud_runtime_root is not None, "CLOUD_RUNTIME_ROOT_MISSING")

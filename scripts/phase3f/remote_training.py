@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import re
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -38,6 +39,40 @@ def _bounded_text(path: Path) -> str:
     with path.open("rb") as stream:
         stream.seek(max(0, path.stat().st_size - 256 * 1024))
         return stream.read(256 * 1024).decode("utf-8", errors="replace")
+
+
+def _safe_oom_diagnostic(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    stage = value.get("stage")
+    stage_code = value.get("stage_error_code")
+    shape = value.get("input_shape")
+    if not (
+        stage in {"baseline", "train", "validation", "holdout"}
+        and isinstance(stage_code, str)
+        and re.fullmatch(r"REMOTE_TRAINING_CUDA_OOM_[A-Z_]+", stage_code)
+        and isinstance(shape, list)
+        and 1 <= len(shape) <= 4
+        and all(type(item) is int and item > 0 for item in shape)
+    ):
+        return None
+    result: dict[str, object] = {
+        "stage": stage,
+        "stage_error_code": stage_code,
+        "input_shape": shape,
+    }
+    for key in (
+        "batch_size",
+        "requested_bytes",
+        "allocated_bytes",
+        "reserved_bytes",
+        "total_bytes",
+    ):
+        item = value.get(key)
+        if item is None or (type(item) is int and item >= 0):
+            result[key] = item
+    result["batch_one"] = value.get("batch_one") is True
+    return result
 
 
 def _explicit_code(stdout: str, stderr: str) -> str | None:
@@ -143,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
         pass
     child_code = child_failure.get("message_code")
     exception_class = child_failure.get("exception_class")
+    oom_diagnostic = _safe_oom_diagnostic(child_failure.get("oom_diagnostic"))
     diagnostic = classify_remote_failure(
         124 if timed_out else return_code,
         stdout=stdout_text,
@@ -198,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                 "traceback_tail": child_failure.get("traceback_tail", []),
                 "holdout_open_count": progress.get("holdout_open_count", 0),
                 "peak_cuda_bytes": peak_cuda_bytes,
+                "oom_diagnostic": oom_diagnostic,
                 "disk_free_bytes": disk.free,
                 "secrets_included": False,
             },

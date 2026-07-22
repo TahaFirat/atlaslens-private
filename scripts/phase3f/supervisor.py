@@ -43,6 +43,11 @@ from atlaslens_api.phase3f.operator import (  # noqa: E402
     terminate_receipt_bound_pod,
     write_operator_receipt,
 )
+from atlaslens_api.phase3f.memory import (  # noqa: E402
+    FALLBACK_CLOUD_VRAM_GIB,
+    MemoryPlanError,
+    require_production_memory_evidence,
+)
 from atlaslens_api.phase3f.runpod import (  # noqa: E402
     GPUOffer,
     PodConnection,
@@ -114,6 +119,8 @@ GPU_PREFERENCES = (
     "NVIDIA RTX A5000",
     "NVIDIA L4",
     "NVIDIA GeForce RTX 3090",
+    "NVIDIA A40",
+    "NVIDIA RTX A6000",
 )
 E2E_RUN_BUDGET_USD = Decimal("3")
 E2E_HISTORICAL_BUDGET_USD = Decimal("10")
@@ -367,6 +374,45 @@ def _verify_local_readiness() -> None:
         newline_count=21,
     )
     _require_model_receipt(model_root / "receipt.json")
+
+
+def _require_production_memory_plan(sealed_root: Path, *, run_id: str) -> int:
+    readiness = sealed_root.parent / "training-readiness.json"
+    evidence = (
+        ROOT
+        / ".local"
+        / "phase3f"
+        / "verification"
+        / run_id
+        / "production-memory-smoke.json"
+    )
+    _require(
+        readiness.is_file()
+        and not readiness.is_symlink()
+        and evidence.is_file()
+        and not evidence.is_symlink(),
+        "GPU_MEMORY_PLAN_UNSATISFIED",
+    )
+    try:
+        document = json.loads(evidence.read_text(encoding="utf-8"))
+        _require(isinstance(document, dict), "GPU_MEMORY_PLAN_UNSATISFIED")
+        measured = require_production_memory_evidence(
+            cast(dict[str, object], document),
+            run_id=run_id,
+            readiness_sha256=_sha256_path(readiness),
+            sealed_assets_sha256=_sha256_path(sealed_root / "sealed-assets.json"),
+            checksum_inventory_sha256=_sha256_path(
+                sealed_root / "checksum-inventory.json"
+            ),
+            model_sha256=MODEL_SHA256,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, MemoryPlanError, ValueError) as exc:
+        raise SupervisorExecutionError("GPU_MEMORY_PLAN_UNSATISFIED") from exc
+    _require(
+        measured.requirement.required_vram_gib <= FALLBACK_CLOUD_VRAM_GIB,
+        "GPU_MEMORY_PLAN_UNSATISFIED",
+    )
+    return measured.requirement.required_vram_gib
 
 
 def _remote_environment_preflight() -> tuple[str, str, FrameworkWheelhouse]:
@@ -2170,10 +2216,16 @@ def _run_execute(
     environment_contract_sha256: str | None = None
     dependency_lock_sha256: str | None = None
     framework_wheelhouse: FrameworkWheelhouse | None = None
+    minimum_gpu_memory_gib = 16
     try:
         _disk_gate()
         head, tracked = _preflight_repository()
         _verify_local_readiness()
+        if args.sealed_acquisition is not None:
+            minimum_gpu_memory_gib = _require_production_memory_plan(
+                args.sealed_acquisition,
+                run_id=run_id,
+            )
         environment_contract_sha256, dependency_lock_sha256, framework_wheelhouse = (
             _remote_environment_preflight()
         )
@@ -2182,7 +2234,7 @@ def _run_execute(
                 image_name=IMAGE,
                 gpu_type_preferences=GPU_PREFERENCES,
                 container_disk_gb=40,
-                min_gpu_memory_gb=16,
+                min_gpu_memory_gb=minimum_gpu_memory_gib,
             )
             with RunPodV1Client(api_token=token, config=billing_config) as billing_client:
                 reconciliation_inventory = billing_client.inventory()
@@ -2284,7 +2336,7 @@ def _run_execute(
             image_name=IMAGE,
             gpu_type_preferences=GPU_PREFERENCES,
             container_disk_gb=40,
-            min_gpu_memory_gb=16,
+            min_gpu_memory_gb=minimum_gpu_memory_gib,
             ssh_public_key=public_key,
         )
         with RunPodV1Client(
@@ -2325,7 +2377,16 @@ def _run_execute(
             before = client.inventory()
             require_empty_inventory(before)
             _emit("PHASE3F_CLOUD_INVENTORY_EMPTY", resources=0)
-            offer = client.select_gpu_offer(max_hourly_price=policy.max_hourly_cost_usd)
+            try:
+                offer = client.select_gpu_offer(
+                    max_hourly_price=policy.max_hourly_cost_usd
+                )
+            except RunPodAPIError as exc:
+                if exc.code == "NO_ELIGIBLE_GPU_OFFER":
+                    raise SupervisorExecutionError(
+                        "GPU_MEMORY_PLAN_UNSATISFIED"
+                    ) from exc
+                raise
             _emit(
                 "PHASE3F_GPU_OFFER_SELECTED",
                 gpu=offer.display_name,

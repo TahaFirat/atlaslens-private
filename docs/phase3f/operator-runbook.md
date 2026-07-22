@@ -21,6 +21,7 @@ restored. Execute requires an explicit cloud-consent switch:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Preflight
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action RemoteEnvironmentPlan
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action TrainingDeadlinePlan -TrainingMaxWallMinutes 345
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action TrainingMemoryPlan -MaxGpuHourlyUsd 0.50
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action ReconcileLocalReceipts
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action CloudPlan
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Execute -CloudConsent
@@ -150,14 +151,19 @@ reproduces the same bounded report instead of another generic failure loop.
 
 Training freezes most of pinned MegaLoc and fine-tunes a bounded tail with a
 batch-hard cosine metric objective, AdamW, real backward/optimizer steps,
-mixed precision, deterministic seed and train-only augmentation. Batch size is
-selected from GPU memory with gradient accumulation. CUDA OOM can reduce the
-batch at most twice; epoch checkpoints support interruption resume; validation
-early stopping and the 345-minute Pod wall limit remain hard bounds. The locked
-holdout is described once, only after the fine-tuned validation threshold is
-locked. Outputs include pretrained/fine-tuned validation comparisons, final
-holdout benchmark, changed weight hashes and provenance. Regression never
-changes the production model automatically.
+mixed precision, deterministic seed and train-only augmentation. The effective
+batch remains 16: four-example CUDA microbatches use deterministic activation
+replay and one full-batch loss, then optimizer/scheduler step only at the complete
+accumulation boundary. Checkpoints are forbidden between those boundaries. CUDA
+OOM halves the current microbatch atomically; batch-one failure is terminal and
+stage typed. Baseline, validation and holdout inference use eval/inference mode,
+four-example bounded batches and the same backoff without changing asset order.
+Epoch checkpoints support interruption resume; validation early stopping and the
+345-minute Pod wall limit remain hard bounds. The locked holdout is described
+once, only after the fine-tuned validation threshold is locked. Outputs include
+pretrained/fine-tuned validation comparisons, final holdout benchmark, changed
+weight hashes and provenance. Regression never changes the production model
+automatically.
 
 The 345-minute parameter is the total receipt-bound attempt ceiling, not a child
 training deadline. One authoritative plan reserves 3,600 seconds for allocation,
@@ -177,6 +183,18 @@ action. It reports every reserve, the resulting child budget, supported bounds,
 typed blockers and zero RunPod/API/cloud-mutation counters. A child-side invalid
 epoch is preserved as `REMOTE_TRAINING_DEADLINE_INVALID`, including the sanitized
 `TrainingError`, message code, process exit code and traceback tail.
+
+`TrainingMemoryPlan` is the second required read-only gate. It accepts only the
+real local CUDA production-shape receipt bound to the current readiness,
+sealed-assets, checksum-inventory and model hashes. The receipt covers all 450
+reference descriptors, all 150 calibration descriptors, one effective training
+batch, checkpoint/new-process resume and a calibration-backed holdout-path probe
+with locked-holdout access zero. It reports measured allocated/reserved peaks,
+headroom and provider-memory minimum with zero network/API/create/cloud/dataset
+write counters. The direct supervisor repeats this check before its first RunPod
+inventory call. Offers are filtered by provider-reported VRAM and the $0.50/hour
+cap; a measured requirement above 24 GiB admits only the 48 GiB A40/A6000 class.
+No eligible offer fails as `GPU_MEMORY_PLAN_UNSATISFIED` before create.
 
 Remote bootstrap treats image allocation and training compatibility as separate
 gates. The create payload retains the exact digest-pinned `imageName`; when create

@@ -507,6 +507,8 @@ def main(argv: list[str] | None = None) -> int:
             except RuntimeError:
                 pass
             disk_free_bytes = shutil.disk_usage(args.work_root.parent).free
+            diagnostic_method = getattr(exc, "diagnostics", None)
+            oom_diagnostic = diagnostic_method() if callable(diagnostic_method) else None
             atomic_json(
                 args.recovery_root / "child-failure.json",
                 {
@@ -518,6 +520,7 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     "peak_cuda_bytes": peak_cuda_bytes,
                     "disk_free_bytes": disk_free_bytes,
+                    "oom_diagnostic": oom_diagnostic,
                     "secrets_included": False,
                 },
             )

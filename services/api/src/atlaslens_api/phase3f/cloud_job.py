@@ -64,6 +64,7 @@ from atlaslens_api.phase3f.coverage import (
     select_city_scope,
 )
 from atlaslens_api.phase3f.deadline import MAX_SUPPORTED_TOTAL_MINUTES
+from atlaslens_api.phase3f.memory import BASELINE_MICROBATCH, StageOOMError
 from atlaslens_api.phase3f.pipeline import (
     MODEL_REVISION,
     MODEL_SHA256,
@@ -3958,6 +3959,7 @@ class MegaLocRuntime:
         self._torch = torch
         self._transform = transform
         self._model = model
+        self._last_describe_diagnostic: dict[str, object] | None = None
 
     def _tensor(self, path: Path) -> Any:
         _require(path.is_file() and not path.is_symlink(), "IMAGE_INPUT_INVALID")
@@ -3983,23 +3985,82 @@ class MegaLocRuntime:
         except (OSError, ValueError) as exc:
             raise Phase3FCloudJobError("IMAGE_INPUT_INVALID") from exc
 
-    def describe(self, paths: Sequence[Path]) -> np.ndarray[Any, np.dtype[np.float32]]:
+    def describe(
+        self,
+        paths: Sequence[Path],
+        *,
+        batch_size: int = BASELINE_MICROBATCH,
+        stage: Literal["baseline", "validation", "holdout"] = "baseline",
+    ) -> np.ndarray[Any, np.dtype[np.float32]]:
         if not paths:
             return np.empty((0, 8448), dtype=np.float32)
+        _require(batch_size >= 1, "MEGALOC_INFERENCE_BATCH_INVALID")
         tensors = [self._tensor(path) for path in paths]
         grouped: dict[tuple[int, int], list[tuple[int, Any]]] = defaultdict(list)
         for position, tensor in enumerate(tensors):
             grouped[(int(tensor.shape[1]), int(tensor.shape[2]))].append((position, tensor))
         output = np.empty((len(paths), 8448), dtype=np.float32)
+        oom_recoveries = 0
+        minimum_batch = batch_size
+        self._model.eval()
         try:
             with self._torch.inference_mode():
                 for group in grouped.values():
-                    batch = self._torch.stack([tensor for _, tensor in group]).to("cuda")
-                    matrix = self._model(batch).float().cpu().numpy()
-                    for row, (position, _) in enumerate(group):
-                        output[position] = matrix[row]
+                    offset = 0
+                    active_batch_size = min(batch_size, len(group))
+                    while offset < len(group):
+                        active = group[offset : offset + active_batch_size]
+                        batch: Any = None
+                        matrix: Any = None
+                        try:
+                            batch = self._torch.stack(
+                                [tensor for _, tensor in active]
+                            ).to("cuda")
+                            matrix = self._model(batch).float().cpu().numpy()
+                            for row, (position, _) in enumerate(active):
+                                output[position] = matrix[row]
+                            offset += len(active)
+                            minimum_batch = min(minimum_batch, len(active))
+                        except self._torch.cuda.OutOfMemoryError as exc:
+                            oom_recoveries += 1
+                            terminal = None
+                            if active_batch_size == 1:
+                                height = int(active[0][1].shape[1])
+                                width = int(active[0][1].shape[2])
+                                terminal = StageOOMError(
+                                    stage=stage,
+                                    batch_size=1,
+                                    input_shape=(1, 3, height, width),
+                                    torch_module=self._torch,
+                                    source=exc,
+                                )
+                            if matrix is not None:
+                                matrix = None
+                            if batch is not None:
+                                batch = None
+                            self._torch.cuda.empty_cache()
+                            if terminal is not None:
+                                raise terminal from exc
+                            active_batch_size = max(1, active_batch_size // 2)
+                            minimum_batch = min(minimum_batch, active_batch_size)
+                            continue
+                        finally:
+                            matrix = None
+                            batch = None
+        except StageOOMError:
+            raise
         except Exception as exc:
             raise Phase3FCloudJobError("MEGALOC_INFERENCE_FAILED") from exc
+        self._last_describe_diagnostic = {
+            "stage": stage,
+            "requested_microbatch": batch_size,
+            "minimum_microbatch": minimum_batch,
+            "oom_recoveries": oom_recoveries,
+            "row_count": len(paths),
+            "dtype": "float32",
+            "model_mode": "eval",
+            "inference_mode": True,
+        }
         _require(output.shape == (len(paths), 8448), "DESCRIPTOR_SHAPE_INVALID")
         _require(bool(np.isfinite(output).all()), "DESCRIPTOR_NONFINITE")
         norms = np.linalg.norm(output, axis=1)
