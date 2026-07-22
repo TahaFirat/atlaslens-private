@@ -63,6 +63,7 @@ from atlaslens_api.phase3f.coverage import (
     CoverageSelectionLock,
     select_city_scope,
 )
+from atlaslens_api.phase3f.deadline import MAX_SUPPORTED_TOTAL_MINUTES
 from atlaslens_api.phase3f.pipeline import (
     MODEL_REVISION,
     MODEL_SHA256,
@@ -98,7 +99,7 @@ MEGALOC_WINDOWS_LICENSE_SHA256: Final = (
 SOURCE_POLICY_SHA256: Final = "72d51363f2b63de368d34d4d7bb2fc1145f93dc0469e7026100976732dfde209"
 MAX_METADATA_ITEMS_PER_CITY: Final = 600
 MAX_METADATA_ITEMS_TOTAL: Final = 9_600
-MAX_WALL_SECONDS: Final = 5 * 60 * 60 + 45 * 60
+MAX_WALL_SECONDS: Final = MAX_SUPPORTED_TOTAL_MINUTES * 60
 ACQUISITION_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-acquisition-checkpoint-v1"
 CLIENT_COUNTER_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-client-counters-v1"
 LEGACY_METADATA_PAGE_CHECKPOINT_SCHEMA: Final = "atlaslens-phase3f-metadata-pages-v1"

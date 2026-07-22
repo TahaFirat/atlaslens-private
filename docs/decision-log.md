@@ -1991,3 +1991,28 @@
   install failures retain exact typed codes, and live CUDA compatibility remains a
   required paid-runtime observation rather than an offline claim.
 - Target phase: Product Phase 3F cloud training pilot.
+
+## 2026-07-22 - Phase 3F uses one monotonic attempt/training deadline model
+
+- Context: Live attempt `19e989cc68e1d12e65badc61e8272ce7` accepted a
+  345-minute total wall parameter, subtracted a fixed 15 minutes, and created a
+  330-minute wall-clock epoch after transfer but before a 210.976-second remote
+  bootstrap. The training child therefore received about 19,589 remaining seconds,
+  exceeding its 16,200-second hard maximum plus 60-second boundary tolerance, and
+  failed before dataset open with `TRAINING_DEADLINE_INVALID`. Classification
+  masked that typed message as `REMOTE_TRAINING_UNKNOWN_FAILURE`.
+- Decision: Centralize total and training bounds in one module. Treat 345 minutes
+  as the total attempt ceiling: reserve 3,600 seconds for provisioning/SSH/transfer,
+  600 for bootstrap, 300 for salvage, and cap training at 16,200 seconds. Validate
+  the total locally, recompute the child duration from actual monotonic elapsed
+  immediately after bootstrap, then create one epoch value only at the process
+  boundary. Convert it once inside training and use monotonic checks thereafter.
+  Preserve invalid child epochs as `REMOTE_TRAINING_DEADLINE_INVALID`.
+- Alternatives: Change the operator value to 270 without identifying its semantics;
+  retain separate 345/330/270 constants; extend the training hard maximum; keep
+  wall-clock comparisons inside the training loop.
+- Consequences: Values 105 through 345 minutes share identical CLI and production
+  validation, the full safe recommendation remains 345 total minutes, a late
+  bootstrap reduces training rather than extending the Pod, insufficient remaining
+  time fails before child launch, and invalid plans prove zero create/API/mutation.
+- Target phase: Product Phase 3F cloud training pilot.

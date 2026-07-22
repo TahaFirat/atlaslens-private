@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-22T15:07:47+03:00
+last_verified_at: 2026-07-22T16:12:14+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: phase3f_offline_torchvision_companion_gate_ready_for_review
+product_phase_status: phase3f_offline_training_deadline_gate_ready_for_review
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -574,7 +574,18 @@ phase_3f_companion_tests: pass_403_phase3f_skip1_offline_container_docker_unavai
 phase_3f_companion_static: pass_ruff_strict_mypy261_and_control5_powershell5
 phase_3f_companion_dataset_hashes: readiness_2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9_sealed_b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1_inventory_f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93_assets830
 phase_3f_companion_live_actions: zero_resume_zero_execute_zero_runpod_zero_mapillary_zero_cloud_mutation_zero_dataset_runtime_write
-phase_3f_next_action: read_only_remote_environment_plan_review
+phase_3f_deadline_live_attempt: 19e989cc68e1d12e65badc61e8272ce7_training_deadline_invalid_exit1_training_false_checkpoint_false_holdout0_cleanup0_0_0_0
+phase_3f_deadline_root_cause: total345m_to_child330m_epoch_created_prebootstrap_vs_training_hard270m_plus60s
+phase_3f_deadline_live_math: child19800s_minus_bootstrap210_976515s_remaining19589_023485s_allowed16260s_excess3329_023485s
+phase_3f_deadline_model: total345m_provisioning3600s_bootstrap600s_salvage300s_training_max16200s_min_training1800s
+phase_3f_deadline_supported: total_min105m_total_max345m_recommended345m_child_future_epoch_boundary_internal_monotonic
+phase_3f_deadline_plan: pass_requested345_training16200_blockers0_create0_network0_runpod0_cloud_mutations0_dataset_writes0
+phase_3f_deadline_failure: training_deadline_invalid_to_remote_training_deadline_invalid_preserve_trainingerror_exit1_traceback
+phase_3f_deadline_tests: pass_418_phase3f_skip1_offline_container_docker_unavailable
+phase_3f_deadline_static: pass_ruff_strict_mypy262_and_control5_powershell5
+phase_3f_deadline_dataset_hashes: readiness_2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9_sealed_b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1_inventory_f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93_assets830
+phase_3f_deadline_live_actions: zero_resume_zero_execute_zero_network_zero_runpod_zero_mapillary_zero_cloud_mutation_zero_dataset_runtime_write
+phase_3f_next_action: read_only_training_deadline_plan_review
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
 phase_6c_dataset_qa_ui_gate: pass
@@ -629,6 +640,56 @@ next_phase: phase_6c_in_progress
 ```
 
 # AtlasLens project state
+
+## Product Phase 3F authoritative training deadline gate
+
+Status: **OFFLINE VERIFIED - LIVE RETRY NOT EXECUTED**.
+
+Live attempt `19e989cc68e1d12e65badc61e8272ce7` completed the exact pinned
+environment bootstrap and CUDA/MegaLoc smoke, then failed before dataset open or
+training. The child retained `TrainingError`, message
+`TRAINING_DEADLINE_INVALID`, exit 1, no checkpoint and holdout-open count zero;
+classification incorrectly emitted `REMOTE_TRAINING_UNKNOWN_FAILURE`. The current
+operator receipt remains terminated and cleanup-verified, with last recorded
+Pod/endpoint/network-volume/template inventory 0/0/0/0.
+
+The former supervisor accepted 345 total minutes (20,700 seconds), subtracted a
+fixed 15 minutes, and created a 19,800-second child epoch after transfer but before
+bootstrap. The observed bootstrap consumed 210.976515 seconds, leaving about
+19,589.023485 seconds when the child started. Training allowed at most 16,200
+seconds plus a 60-second boundary tolerance; the live value exceeded that
+predicate by about 3,329.023485 seconds. The numeric epoch was not persisted, so
+its exact value cannot be reconstructed; its creation point and duration are
+proved by source and the recovered bootstrap receipt.
+
+One deadline module now defines the complete model. A 345-minute total attempt
+reserves 3,600 seconds for provisioning/SSH/transfer, 600 for bootstrap and 300
+for salvage, producing a maximum 16,200-second training child. Supported totals
+are 105 through 345 minutes, with 345 recommended for the full training maximum.
+After bootstrap, actual elapsed time is deducted from the total using monotonic
+time; less than 1,800 seconds available for training fails before child launch.
+Only then is a future epoch generated for the process boundary. Training converts
+it once to a monotonic deadline, so later wall-clock shifts cannot extend or reduce
+the internal duration.
+
+The read-only `TrainingDeadlinePlan` for the live 345-minute parameter reports the
+four budgets above, `local_blockers=[]`, `ready_for_cloud=true`, and zero create,
+network, RunPod, cloud-mutation and dataset-write counters. A 346-minute plan
+returns `TRAINING_TOTAL_WALL_MINUTES_INVALID` with the same zero counters. Child
+`TRAINING_DEADLINE_INVALID` now maps to
+`REMOTE_TRAINING_DEADLINE_INVALID` while preserving exception class, message code,
+exit code and sanitized traceback.
+
+All 418 runnable Phase 3F tests pass; the offline-container test remains skipped
+because local Docker is unavailable. Ruff, strict mypy for 262 service source
+files and five control scripts, and all five PowerShell parsers pass. No
+Resume/Execute, RunPod/Mapillary/API/network call, Pod/resource or corpus/runtime
+mutation occurred. The sealed corpus remains 830 assets with readiness
+`2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9`,
+sealed-assets
+`b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1`
+and checksum inventory
+`f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93`.
 
 ## Product Phase 3F offline torchvision companion gate
 

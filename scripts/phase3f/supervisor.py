@@ -24,6 +24,14 @@ SOURCE = ROOT / "services" / "api" / "src"
 if str(SOURCE) not in sys.path:
     sys.path.insert(0, str(SOURCE))
 
+from atlaslens_api.phase3f.deadline import (  # noqa: E402
+    BOOTSTRAP_BUDGET_SECONDS,
+    SALVAGE_RESERVE_SECONDS,
+    TrainingDeadlineError,
+    build_training_deadline_plan,
+    compute_child_deadline,
+    require_training_deadline_plan,
+)
 from atlaslens_api.phase3f.operator import (  # noqa: E402
     OperatorReceipt,
     Phase3FOperatorError,
@@ -107,14 +115,11 @@ GPU_PREFERENCES = (
     "NVIDIA L4",
     "NVIDIA GeForce RTX 3090",
 )
-REMOTE_JOB_SECONDS = 5 * 60 * 60 + 30 * 60
 E2E_RUN_BUDGET_USD = Decimal("3")
 E2E_HISTORICAL_BUDGET_USD = Decimal("10")
 E2E_CLOSED_POD_DISK_ALLOWANCE_USD = Decimal("0.10")
 MAX_HISTORICAL_RECEIPTS = 1_000
 CHECKPOINT_SYNC_SECONDS = 5 * 60
-FAILURE_SALVAGE_SECONDS = 5 * 60
-DEPENDENCY_BOOTSTRAP_SECONDS = 10 * 60
 REMOTE_ENVIRONMENT_CONTRACT = ROOT / "config" / "phase3f-remote-environment.json"
 REMOTE_REQUIREMENTS_LOCK = ROOT / "config" / "phase3f-training-requirements.lock"
 REMOTE_FRAMEWORK_WHEELHOUSE = (
@@ -799,7 +804,7 @@ def _salvage_remote_failure(
     succeeded = False
 
     def remaining() -> float:
-        return min(timeout_seconds, FAILURE_SALVAGE_SECONDS) - (time.monotonic() - started)
+        return min(timeout_seconds, SALVAGE_RESERVE_SECONDS) - (time.monotonic() - started)
 
     try:
         _require(remaining() > 0, "REMOTE_TRAINING_SALVAGE_TIMEOUT")
@@ -937,7 +942,6 @@ def _operation(
     started: float,
     operator_receipt: OperatorReceipt,
     operator_receipt_path: Path,
-    remote_job_seconds: int,
     training_dataset: Path | None = None,
     checkpoint_store: Path | None = None,
     resume_archive: Path | None = None,
@@ -1017,45 +1021,10 @@ def _operation(
         )
         lease.assert_within_limits(elapsed_seconds=int(time.monotonic() - started))
     _emit("PHASE3F_TRANSFER_VERIFIED", run_id=run_id)
-    deadline = int(time.time() + remote_job_seconds)
     remote_contract = "/workspace/phase3f-repo/config/phase3f-remote-environment.json"
     remote_lock = "/workspace/phase3f-repo/config/phase3f-training-requirements.lock"
     remote_venv = "/workspace/phase3f-venv"
     remote_python = f"{remote_venv}/bin/python"
-    job_command = (
-        (
-            "ATLASLENS_PHASE3F_CHILD=training_job.py "
-            f"{remote_python} /workspace/phase3f-repo/scripts/phase3f/remote_training.py "
-            "--repository-root /workspace/phase3f-repo "
-            f"--run-id {run_id} "
-            "--sealed-root /workspace/phase3f-dataset/sealed-acquisition "
-            "--model /workspace/phase3f-transfer/model.safetensors "
-            "--vendor-root /workspace/phase3f-transfer/vendor "
-            "--work-root /workspace/phase3f-work "
-            "--output-root /workspace/phase3f-output "
-            "--recovery-root /workspace/phase3f-work/recovery "
-            f"--environment-contract {remote_contract} "
-            f"--requirements-lock {remote_lock} "
-            f"--expected-contract-sha256 {environment_contract_sha256} "
-            f"--expected-lock-sha256 {dependency_lock_sha256} "
-            "--environment-receipt /workspace/phase3f-work/recovery/environment-receipt.json "
-            f"--deadline-epoch {deadline} "
-            f"--timeout-seconds {remote_job_seconds}"
-        )
-        if training_dataset is not None
-        else (
-            "timeout --signal=TERM "
-            f"{remote_job_seconds} {remote_python} "
-            "/workspace/phase3f-repo/scripts/phase3f/cloud_job.py "
-            "--repository-root /workspace/phase3f-repo "
-            f"--run-id {run_id} "
-            "--model /workspace/phase3f-transfer/model.safetensors "
-            "--vendor-root /workspace/phase3f-transfer/vendor "
-            "--work-root /workspace/phase3f-work "
-            "--output-root /workspace/phase3f-output "
-            f"--deadline-epoch {deadline}"
-        )
-    )
     source_preparation = [
         "rm -rf /workspace/phase3f-repo /workspace/phase3f-output /workspace/phase3f-work "
         "/workspace/phase3f-dataset /workspace/phase3f-venv",
@@ -1064,7 +1033,7 @@ def _operation(
     ]
     bootstrap_command = (
         "unset MAPILLARY_ACCESS_TOKEN RUNPOD_API_KEY; "
-        f"timeout --kill-after=10s --signal=TERM {DEPENDENCY_BOOTSTRAP_SECONDS + 30} "
+        f"timeout --kill-after=10s --signal=TERM {BOOTSTRAP_BUDGET_SECONDS + 30} "
         "python /workspace/phase3f-repo/scripts/phase3f/remote_bootstrap.py "
         "--repository-root /workspace/phase3f-repo "
         f"--contract {remote_contract} "
@@ -1078,7 +1047,7 @@ def _operation(
         "--model /workspace/phase3f-transfer/model.safetensors "
         f"--venv-root {remote_venv} "
         "--recovery-root /workspace/phase3f-work/recovery "
-        f"--timeout-seconds {DEPENDENCY_BOOTSTRAP_SECONDS}"
+        f"--timeout-seconds {BOOTSTRAP_BUDGET_SECONDS}"
     )
     bootstrap_remote_command = " && ".join((*source_preparation, bootstrap_command))
     training_preparation: list[str] = []
@@ -1097,12 +1066,50 @@ def _operation(
                 "-C /workspace/phase3f-work/training-checkpoint"
             )
     prepared = " && ".join(training_preparation)
-    remote_command = (
-        f"{prepared + ' && ' if prepared else ''}{job_command}; phase3f_rc=$?; "
-        "if [ $phase3f_rc -eq 0 ]; then "
-        "tar -C /workspace -cf /workspace/phase3f-transfer/output.tar phase3f-output; "
-        "fi; exit $phase3f_rc"
-    )
+
+    def build_remote_command(deadline_epoch: int, training_seconds: int) -> str:
+        job_command = (
+            (
+                "ATLASLENS_PHASE3F_CHILD=training_job.py "
+                f"{remote_python} "
+                "/workspace/phase3f-repo/scripts/phase3f/remote_training.py "
+                "--repository-root /workspace/phase3f-repo "
+                f"--run-id {run_id} "
+                "--sealed-root /workspace/phase3f-dataset/sealed-acquisition "
+                "--model /workspace/phase3f-transfer/model.safetensors "
+                "--vendor-root /workspace/phase3f-transfer/vendor "
+                "--work-root /workspace/phase3f-work "
+                "--output-root /workspace/phase3f-output "
+                "--recovery-root /workspace/phase3f-work/recovery "
+                f"--environment-contract {remote_contract} "
+                f"--requirements-lock {remote_lock} "
+                f"--expected-contract-sha256 {environment_contract_sha256} "
+                f"--expected-lock-sha256 {dependency_lock_sha256} "
+                "--environment-receipt "
+                "/workspace/phase3f-work/recovery/environment-receipt.json "
+                f"--deadline-epoch {deadline_epoch} "
+                f"--timeout-seconds {training_seconds}"
+            )
+            if training_dataset is not None
+            else (
+                "timeout --signal=TERM "
+                f"{training_seconds} {remote_python} "
+                "/workspace/phase3f-repo/scripts/phase3f/cloud_job.py "
+                "--repository-root /workspace/phase3f-repo "
+                f"--run-id {run_id} "
+                "--model /workspace/phase3f-transfer/model.safetensors "
+                "--vendor-root /workspace/phase3f-transfer/vendor "
+                "--work-root /workspace/phase3f-work "
+                "--output-root /workspace/phase3f-output "
+                f"--deadline-epoch {deadline_epoch}"
+            )
+        )
+        return (
+            f"{prepared + ' && ' if prepared else ''}{job_command}; phase3f_rc=$?; "
+            "if [ $phase3f_rc -eq 0 ]; then "
+            "tar -C /workspace -cf /workspace/phase3f-transfer/output.tar "
+            "phase3f-output; fi; exit $phase3f_rc"
+        )
     checkpoint_enabled = all(
         value is not None
         for value in (
@@ -1128,7 +1135,7 @@ def _operation(
                 sealed_assets_sha256=cast(str, sealed_assets_sha256),
                 config_sha256=cast(str, config_sha256),
                 process_result=process_result,
-                timeout_seconds=min(FAILURE_SALVAGE_SECONDS, max(1.0, remaining())),
+                timeout_seconds=min(SALVAGE_RESERVE_SECONDS, max(1.0, remaining())),
             )
             if checkpoint_enabled
             else SalvageResult(
@@ -1140,7 +1147,7 @@ def _operation(
         _emit(
             "PHASE3F_REMOTE_BOOTSTRAP_STARTED",
             run_id=run_id,
-            timeout_seconds=DEPENDENCY_BOOTSTRAP_SECONDS,
+            timeout_seconds=BOOTSTRAP_BUDGET_SECONDS,
             cloud_mutations=0,
         )
         bootstrap_result = _run_watched(
@@ -1174,6 +1181,26 @@ def _operation(
             run_id=run_id,
             holdout_open_count=0,
             checkpoint_write_count=0,
+        )
+        try:
+            child_deadline = compute_child_deadline(
+                total_runtime_seconds=lease.policy.max_runtime_seconds,
+                started_monotonic=started,
+                now_monotonic=time.monotonic(),
+                now_epoch=time.time(),
+            )
+        except TrainingDeadlineError as exc:
+            raise SupervisorExecutionError(exc.code) from exc
+        remote_command = build_remote_command(
+            child_deadline.deadline_epoch,
+            child_deadline.training_budget_seconds,
+        )
+        _emit(
+            "PHASE3F_TRAINING_DEADLINE_ATTESTED",
+            elapsed_monotonic_seconds=child_deadline.elapsed_monotonic_seconds,
+            remaining_total_seconds=child_deadline.remaining_total_seconds,
+            training_budget_seconds=child_deadline.training_budget_seconds,
+            deadline_class="future_epoch_seconds",
         )
         _emit(
             "PHASE3F_REMOTE_DEPENDENCIES_READY",
@@ -1236,6 +1263,8 @@ def _operation(
         "pod_id_sha256": hashlib.sha256(lease.pod.pod_id.encode()).hexdigest(),
         "gpu": connection.gpu_display_name,
         "hourly_price_usd": str(connection.hourly_price),
+        "training_budget_seconds": child_deadline.training_budget_seconds,
+        "deadline_class": "future_epoch_seconds",
     }
 
 
@@ -1698,6 +1727,7 @@ def _parser() -> argparse.ArgumentParser:
     actions.add_argument("--live-readiness", action="store_true")
     actions.add_argument("--status", action="store_true")
     actions.add_argument("--terminate", action="store_true")
+    actions.add_argument("--deadline-plan", action="store_true")
     parser.add_argument("--runtime-root", type=Path, default=Path(r"C:\AtlasLensRuntime\phase3f"))
     parser.add_argument("--operator-receipt", type=Path)
     parser.add_argument("--max-spend-usd", type=Decimal, default=Decimal("10"))
@@ -1711,14 +1741,17 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _policy(args: argparse.Namespace) -> BudgetPolicy:
-    _require(30 <= args.max_wall_minutes <= 345, "MAX_WALL_MINUTES_INVALID")
+    try:
+        deadline = require_training_deadline_plan(args.max_wall_minutes)
+    except TrainingDeadlineError as exc:
+        raise SupervisorExecutionError(exc.code) from exc
     return BudgetPolicy(
         target_usd=min(TARGET_BUDGET_USD, args.soft_stop_usd - Decimal("0.01")),
         soft_stop_usd=args.soft_stop_usd,
         terminate_usd=args.hard_stop_usd,
         absolute_usd=args.max_spend_usd,
         max_hourly_cost_usd=args.max_gpu_hourly_usd,
-        max_runtime_seconds=args.max_wall_minutes * 60,
+        max_runtime_seconds=deadline.requested_total_seconds,
     )
 
 
@@ -2327,10 +2360,6 @@ def _run_execute(
                         started=started,
                         operator_receipt=operator_receipt,
                         operator_receipt_path=receipt_path,
-                        remote_job_seconds=max(
-                            60,
-                            min(REMOTE_JOB_SECONDS, policy.max_runtime_seconds - 15 * 60),
-                        ),
                         training_dataset=(
                             bundle.dataset_archive.path
                             if bundle.dataset_archive is not None
@@ -2530,6 +2559,10 @@ def _run_execute(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.deadline_plan:
+        plan = build_training_deadline_plan(args.max_wall_minutes)
+        print(json.dumps(plan.to_public_dict(), separators=(",", ":"), sort_keys=True))
+        return 0 if plan.ready_for_cloud else 1
     if (args.sealed_acquisition is None) != (args.dataset_run_id is None):
         print("PHASE3F_TRAINING_DATASET_ARGUMENTS_INCOMPLETE")
         return 1

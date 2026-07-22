@@ -51,6 +51,11 @@ def _load_supervisor() -> ModuleType:
     ("return_code", "message", "expected"),
     (
         (1, "TRAINING_CUDA_OOM_EXHAUSTED", "REMOTE_TRAINING_CUDA_OOM"),
+        (
+            1,
+            "TRAINING_DEADLINE_INVALID",
+            "REMOTE_TRAINING_DEADLINE_INVALID",
+        ),
         (124, "", "REMOTE_TRAINING_DEADLINE"),
         (1, "OSError: ENOSPC", "REMOTE_TRAINING_DISK_FULL"),
         (1, "TRAINING_IMAGE_INVALID", "REMOTE_TRAINING_DATALOADER_FAILED"),
@@ -67,6 +72,23 @@ def test_remote_failure_is_typed(
     result = classify_remote_failure(return_code, stderr=message)
     assert result.failure_code == expected
     assert result.process_signal == (15 if return_code == -15 else None)
+
+
+def test_deadline_failure_preserves_child_diagnostic_without_generic_mask() -> None:
+    result = classify_remote_failure(
+        1,
+        stderr="Traceback: TrainingError: TRAINING_DEADLINE_INVALID",
+        explicit_code="TRAINING_DEADLINE_INVALID",
+        exception_class="TrainingError",
+    )
+
+    assert result.failure_code == "REMOTE_TRAINING_DEADLINE_INVALID"
+    assert result.message_code == "TRAINING_DEADLINE_INVALID"
+    assert result.exception_class == "TrainingError"
+    assert result.process_exit_code == 1
+    assert result.stderr_tail == (
+        "Traceback: TrainingError: TRAINING_DEADLINE_INVALID",
+    )
 
 
 def test_remote_failure_redacts_secret_ip_url_and_private_path() -> None:
@@ -396,7 +418,6 @@ def test_nonzero_remote_code_is_not_masked_and_cleanup_still_runs(
             started=time.monotonic(),
             operator_receipt=receipt,
             operator_receipt_path=receipt_path,
-            remote_job_seconds=60,
             training_dataset=tmp_path / "dataset.tar",
             checkpoint_store=tmp_path / "store",
             recovery_attempt_root=tmp_path / "attempt",

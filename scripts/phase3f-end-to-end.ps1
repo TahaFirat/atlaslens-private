@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Preflight", "CloudPlan", "RemoteEnvironmentPlan", "TrainingPlan", "ReconcileLocalReceipts", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
+    [ValidateSet("Preflight", "CloudPlan", "RemoteEnvironmentPlan", "TrainingDeadlinePlan", "TrainingPlan", "ReconcileLocalReceipts", "Execute", "Status", "Resume", "EmergencyStop", "Cleanup")]
     [string]$Action,
     [ValidateNotNullOrEmpty()]
     [string]$RuntimeRoot = "D:\AtlasLensRuntime\phase3f-local",
@@ -9,7 +9,6 @@ param(
     [string]$CloudRuntimeRoot = "C:\AtlasLensRuntime\phase3f",
     [ValidateRange(30, 720)]
     [int]$AcquisitionMaxWallMinutes = 720,
-    [ValidateRange(30, 345)]
     [int]$TrainingMaxWallMinutes = 345,
     [ValidateRange(0.01, 3.0)]
     [decimal]$MaxSpendUsd = 3,
@@ -138,6 +137,12 @@ function Invoke-Control {
     if ($ControlAction -in @("resume-plan", "cloud-plan", "training-plan", "reconcile-local-receipts", "status")) {
         $arguments += @("--cloud-runtime-root", $resolvedCloudRuntime)
     }
+    if ($ControlAction -in @("training-deadline-plan", "training-plan")) {
+        $arguments += @(
+            "--training-max-wall-minutes",
+            $TrainingMaxWallMinutes.ToString([Globalization.CultureInfo]::InvariantCulture)
+        )
+    }
     $controlOutput = @(& $resolvedPython @arguments)
     if ($LASTEXITCODE -ne 0) {
         Throw-SanitizedChildFailure `
@@ -257,6 +262,9 @@ switch ($Action) {
     "RemoteEnvironmentPlan" {
         Invoke-Control -ControlAction "remote-environment-plan"
     }
+    "TrainingDeadlinePlan" {
+        Invoke-Control -ControlAction "training-deadline-plan"
+    }
     "TrainingPlan" {
         Invoke-Control -ControlAction "training-plan"
     }
@@ -264,6 +272,16 @@ switch ($Action) {
         Invoke-Control -ControlAction "reconcile-local-receipts"
     }
     { $_ -in @("Execute", "Resume") } {
+        $deadlineOutput = @(Invoke-Control -ControlAction "training-deadline-plan")
+        $deadlinePlan = Convert-ControlResult `
+            -ControlOutput $deadlineOutput `
+            -ExpectedAction "training-deadline-plan"
+        if (
+            $deadlinePlan.ready_for_cloud -ne $true -or
+            @($deadlinePlan.local_blockers).Count -ne 0
+        ) {
+            throw [string]@($deadlinePlan.local_blockers)[0]
+        }
         $null = Invoke-Control -ControlAction "preflight"
         $currentPath = Join-Path $resolvedRuntime "current.json"
         $resumeExisting = Test-Path -LiteralPath $currentPath -PathType Leaf

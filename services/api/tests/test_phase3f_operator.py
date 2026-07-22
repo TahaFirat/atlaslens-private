@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -386,6 +387,7 @@ def test_ready_allocation_advances_to_transfer_and_training_start(
         "{}\n", encoding="ascii"
     )
 
+    before_epoch = time.time()
     result = module._operation(
         _ReadyClient(),
         lease,
@@ -397,7 +399,6 @@ def test_ready_allocation_advances_to_transfer_and_training_start(
         started=started,
         operator_receipt=receipt,
         operator_receipt_path=receipt_path,
-        remote_job_seconds=60,
         training_dataset=tmp_path / "sealed-acquisition.tar",
         environment_contract_sha256="c" * 64,
         dependency_lock_sha256="d" * 64,
@@ -409,7 +410,13 @@ def test_ready_allocation_advances_to_transfer_and_training_start(
     assert "remote_bootstrap.py" in " ".join(watched[0])
     assert "training_job.py" in " ".join(watched[1])
     assert "phase3f-venv/bin/python" in " ".join(watched[1])
+    training_command = " ".join(watched[1])
+    deadline = re.search(r"--deadline-epoch ([0-9]+)", training_command)
+    assert deadline is not None
+    assert int(deadline.group(1)) > before_epoch
+    assert "--timeout-seconds 16200" in training_command
     assert result["gpu"] == "NVIDIA L4"
+    assert result["training_budget_seconds"] == 16_200
     events = [json.loads(line)["event"] for line in capsys.readouterr().out.splitlines()]
     assert events.index("PHASE3F_SSH_READY") < events.index("PHASE3F_TRANSFER_STARTED")
     assert events.index("PHASE3F_TRANSFER_VERIFIED") < events.index(
@@ -423,6 +430,7 @@ def test_ready_allocation_advances_to_transfer_and_training_start(
         "PHASE3F_REMOTE_BASE_ENVIRONMENT_REPORTED",
         "PHASE3F_REMOTE_LIGHTWEIGHT_DEPENDENCIES_READY",
         "PHASE3F_REMOTE_TRAINING_SMOKE_PASSED",
+        "PHASE3F_TRAINING_DEADLINE_ATTESTED",
         "PHASE3F_REMOTE_DEPENDENCIES_READY",
         "PHASE3F_CLOUD_JOB_STARTED",
     )
@@ -1191,6 +1199,10 @@ def test_powershell_wrappers_are_explicit_receipt_bound_and_secret_safe() -> Non
     assert "$HardStopUsd = 9" in start
     assert "$MaxGpuHourlyUsd = 0.50" in start
     assert "$MaxWallMinutes = 345" in start
+    assert "--deadline-plan" in start
+    assert start.index("--deadline-plan") < start.index(
+        "RUNPOD_API_KEY_NOT_VISIBLE_IN_PROCESS"
+    )
     assert "finally" in start
     assert "stop-phase3f-runpod.ps1" in start
     assert "Tee-Object -Variable supervisorOutput" in start

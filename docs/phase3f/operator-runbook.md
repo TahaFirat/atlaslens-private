@@ -20,6 +20,7 @@ restored. Execute requires an explicit cloud-consent switch:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Preflight
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action RemoteEnvironmentPlan
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action TrainingDeadlinePlan -TrainingMaxWallMinutes 345
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action ReconcileLocalReceipts
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action CloudPlan
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\geoSearch\scripts\phase3f-end-to-end.ps1" -Action Execute -CloudConsent
@@ -157,6 +158,25 @@ holdout is described once, only after the fine-tuned validation threshold is
 locked. Outputs include pretrained/fine-tuned validation comparisons, final
 holdout benchmark, changed weight hashes and provenance. Regression never
 changes the production model automatically.
+
+The 345-minute parameter is the total receipt-bound attempt ceiling, not a child
+training deadline. One authoritative plan reserves 3,600 seconds for allocation,
+SSH and transfer, 600 seconds for bootstrap, and 300 seconds for failure salvage;
+the training child is capped at 16,200 seconds (270 minutes). Immediately after
+bootstrap, the supervisor deducts actual elapsed time using the monotonic clock,
+retains the salvage reserve, and only then converts the remaining bounded duration
+to one future epoch value at the process boundary. Training converts that epoch
+once and uses monotonic time internally. Supported total values are 105 through
+345 minutes; the recommended full-training value is 345. Invalid values block
+before a RunPod key/client or create attempt. If less than 30 minutes remains for
+training, the existing Pod fails with
+`REMOTE_TRAINING_TIME_REMAINING_INSUFFICIENT` without launching the child.
+
+`TrainingDeadlinePlan` is the required read-only check before any later paid
+action. It reports every reserve, the resulting child budget, supported bounds,
+typed blockers and zero RunPod/API/cloud-mutation counters. A child-side invalid
+epoch is preserved as `REMOTE_TRAINING_DEADLINE_INVALID`, including the sanitized
+`TrainingError`, message code, process exit code and traceback tail.
 
 Remote bootstrap treats image allocation and training compatibility as separate
 gates. The create payload retains the exact digest-pinned `imageName`; when create

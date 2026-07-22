@@ -10,7 +10,6 @@ param(
     [decimal]$HardStopUsd = 9,
     [ValidateRange(0.01, 0.50)]
     [decimal]$MaxGpuHourlyUsd = 0.50,
-    [ValidateRange(30, 345)]
     [int]$MaxWallMinutes = 345,
     [ValidateNotNullOrEmpty()]
     [string]$RuntimeRoot = "C:\AtlasLensRuntime\phase3f",
@@ -23,9 +22,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-if ([string]::IsNullOrWhiteSpace($env:RUNPOD_API_KEY)) {
-    throw "RUNPOD_API_KEY_NOT_VISIBLE_IN_PROCESS"
-}
 if ($Execute -and $LiveReadiness) {
     throw "PHASE3F_OPERATOR_ACTION_INVALID"
 }
@@ -50,6 +46,38 @@ if ([string]::IsNullOrWhiteSpace($PythonPath)) {
     }
 }
 $resolvedPython = (Resolve-Path -LiteralPath $PythonPath).Path
+
+$deadlineOutput = @(& $resolvedPython $supervisor `
+    --deadline-plan `
+    --max-wall-minutes $MaxWallMinutes.ToString([Globalization.CultureInfo]::InvariantCulture))
+$deadlineExitCode = $LASTEXITCODE
+$deadlinePlan = $null
+if ($deadlineOutput.Count -eq 1) {
+    try {
+        $deadlinePlan = $deadlineOutput[0] | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        $deadlinePlan = $null
+    }
+}
+if (
+    $deadlineExitCode -ne 0 -or
+    $null -eq $deadlinePlan -or
+    $deadlinePlan.ready_for_cloud -ne $true -or
+    @($deadlinePlan.local_blockers).Count -ne 0
+) {
+    $blocker = if ($null -ne $deadlinePlan -and @($deadlinePlan.local_blockers).Count -gt 0) {
+        [string]@($deadlinePlan.local_blockers)[0]
+    }
+    else {
+        "TRAINING_DEADLINE_PLAN_INVALID"
+    }
+    throw $blocker
+}
+
+if ([string]::IsNullOrWhiteSpace($env:RUNPOD_API_KEY)) {
+    throw "RUNPOD_API_KEY_NOT_VISIBLE_IN_PROCESS"
+}
 
 $initialRunId = $null
 if (Test-Path -LiteralPath $operatorReceipt -PathType Leaf) {

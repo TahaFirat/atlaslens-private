@@ -35,6 +35,11 @@ from atlaslens_api.phase3f.benchmark import (
     evaluate_holdout_once,
     fit_abstention_threshold,
 )
+from atlaslens_api.phase3f.deadline import (
+    MAX_TRAINING_SECONDS,
+    TrainingDeadlineError,
+    epoch_deadline_to_monotonic,
+)
 from atlaslens_api.phase3f.local_first import VerifiedAcquisition, verify_sealed_acquisition
 from atlaslens_api.phase3f.pipeline import (
     MODEL_SHA256,
@@ -57,7 +62,7 @@ MAX_DATASET_ARCHIVE_BYTES: Final = 8 * 1024 * 1024 * 1024
 MIN_USABLE_ASSETS: Final = 830
 MAX_CONCENTRATION: Final = 0.35
 DEFAULT_MAX_EPOCHS: Final = 8
-DEFAULT_TRAINING_WALL_SECONDS: Final = 4 * 60 * 60 + 30 * 60
+DEFAULT_TRAINING_WALL_SECONDS: Final = MAX_TRAINING_SECONDS
 CHECKPOINT_INTERVAL_SECONDS: Final = 5 * 60
 CHECKPOINT_INTERVAL_STEPS: Final = 10
 _SHA256 = set("0123456789abcdef")
@@ -899,7 +904,7 @@ class TrainableMegaLocRuntime:
         batch_size: int,
         gradient_accumulation: int,
         max_epochs: int,
-        deadline_epoch: float,
+        deadline_monotonic: float,
         run_id: str,
         dataset_readiness_sha256: str,
         sealed_assets_sha256: str,
@@ -941,7 +946,10 @@ class TrainableMegaLocRuntime:
         resumed_train_losses = cast(list[float], resumed["train_losses"])
         last_checkpoint_at = time.monotonic()
         for epoch in range(start_epoch, max_epochs):
-            _require(time.time() < deadline_epoch, "TRAINING_WALL_LIMIT_REACHED")
+            _require(
+                time.monotonic() < deadline_monotonic,
+                "TRAINING_WALL_LIMIT_REACHED",
+            )
             batches = _epoch_batches(
                 train_assets,
                 batch_size=batch_size,
@@ -954,7 +962,10 @@ class TrainableMegaLocRuntime:
             for batch_index, batch_assets in enumerate(batches):
                 if epoch == start_epoch and batch_index < resume_batch:
                     continue
-                _require(time.time() < deadline_epoch, "TRAINING_WALL_LIMIT_REACHED")
+                _require(
+                    time.monotonic() < deadline_monotonic,
+                    "TRAINING_WALL_LIMIT_REACHED",
+                )
                 labels_by_asset = _batch_metric_labels(batch_assets)
                 tensors = [
                     self._tensor(
@@ -1392,10 +1403,14 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
         "RUN_ID_INVALID",
     )
     _require(1 <= config.max_epochs <= DEFAULT_MAX_EPOCHS, "TRAINING_EPOCH_LIMIT_INVALID")
-    _require(
-        time.time() < config.deadline_epoch <= time.time() + DEFAULT_TRAINING_WALL_SECONDS + 60,
-        "TRAINING_DEADLINE_INVALID",
-    )
+    try:
+        deadline_monotonic = epoch_deadline_to_monotonic(
+            config.deadline_epoch,
+            now_epoch=time.time(),
+            now_monotonic=time.monotonic(),
+        )
+    except TrainingDeadlineError as exc:
+        raise TrainingError(exc.code) from exc
     os.environ.pop("MAPILLARY_ACCESS_TOKEN", None)
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -1566,7 +1581,7 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
                     batch_size=batch_size,
                     gradient_accumulation=accumulation,
                     max_epochs=config.max_epochs,
-                    deadline_epoch=config.deadline_epoch,
+                    deadline_monotonic=deadline_monotonic,
                     run_id=config.run_id,
                     dataset_readiness_sha256=dataset_readiness_sha256,
                     sealed_assets_sha256=sealed_assets_sha256,

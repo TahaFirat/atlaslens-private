@@ -1122,6 +1122,8 @@ def training_plan(
     repository: Path,
     runtime_root: Path,
     cloud_runtime: Path,
+    *,
+    requested_total_minutes: int = 345,
 ) -> dict[str, object]:
     """Build a zero-network retry plan from integrity-bound local evidence only."""
     cloud = cloud_plan(repository, runtime_root, cloud_runtime)
@@ -1135,6 +1137,7 @@ def training_plan(
         inspect_local_checkpoint,
     )
 
+    deadline = training_deadline_plan(repository, requested_total_minutes)
     remote_environment = remote_environment_plan(repository)
     environment_contract_sha256 = cast(
         str, remote_environment["environment_contract_sha256"]
@@ -1153,6 +1156,7 @@ def training_plan(
         expected_training_config_sha256=config_sha256,
     )
     blockers = list(cast(list[str], cloud["local_blockers"]))
+    blockers.extend(cast(list[str], deadline["local_blockers"]))
     blockers.extend(cast(list[str], remote_environment["local_blockers"]))
     if checkpoint.present and not checkpoint.valid:
         blockers.append(checkpoint.failure_code or "TRAINING_CHECKPOINT_INVALID")
@@ -1215,7 +1219,15 @@ def training_plan(
             )
     start_epoch = checkpoint.next_epoch if checkpoint.valid else 0
     start_step = checkpoint.optimizer_steps if checkpoint.valid else 0
-    estimated_wall_minutes = max(30, int(330 * (8 - min(start_epoch, 7)) / 8))
+    estimated_wall_minutes = max(
+        30,
+        int(
+            cast(int, deadline["training_budget_seconds"])
+            / 60
+            * (8 - min(start_epoch, 7))
+            / 8
+        ),
+    )
     budget = cast(dict[str, object] | None, cloud["budget_snapshot"])
     proposed = Decimal("3") if budget is None else Decimal(cast(str, budget["proposed_run_max_usd"]))
     remaining = None if budget is None else Decimal(cast(str, budget["remaining_authorized_usd"]))
@@ -1236,6 +1248,7 @@ def training_plan(
         "local_smoke_training_config_sha256": smoke_config_sha256,
         "environment_contract_sha256": environment_contract_sha256,
         "dependency_lock_sha256": remote_environment["dependency_lock_sha256"],
+        "training_deadline_plan": deadline,
         "remote_environment_plan": remote_environment,
         "failure_forensic": {
             "failure_code": failure_code,
@@ -1309,6 +1322,21 @@ def training_plan(
     }
 
 
+def training_deadline_plan(
+    repository: Path,
+    requested_total_minutes: int,
+) -> dict[str, object]:
+    """Build the authoritative mutation-free attempt/training deadline plan."""
+    source = repository.resolve() / "services" / "api" / "src"
+    if str(source) not in sys.path:
+        sys.path.insert(0, str(source))
+    from atlaslens_api.phase3f.deadline import (  # noqa: PLC0415
+        build_training_deadline_plan,
+    )
+
+    return build_training_deadline_plan(requested_total_minutes).to_public_dict()
+
+
 def reconcile_local_receipts(cloud_runtime: Path) -> dict[str, object]:
     source = Path(__file__).resolve().parents[2] / "services" / "api" / "src"
     if str(source) not in sys.path:
@@ -1374,6 +1402,7 @@ def _parser() -> argparse.ArgumentParser:
             "resume-plan",
             "cloud-plan",
             "remote-environment-plan",
+            "training-deadline-plan",
             "training-plan",
             "reconcile-local-receipts",
             "status",
@@ -1382,6 +1411,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository-root", type=Path, required=True)
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--cloud-runtime-root", type=Path)
+    parser.add_argument("--training-max-wall-minutes", type=int, default=345)
     return parser
 
 
@@ -1408,12 +1438,18 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.action == "remote-environment-plan":
             result = remote_environment_plan(args.repository_root)
+        elif args.action == "training-deadline-plan":
+            result = training_deadline_plan(
+                args.repository_root,
+                args.training_max_wall_minutes,
+            )
         elif args.action == "training-plan":
             _require(args.cloud_runtime_root is not None, "CLOUD_RUNTIME_ROOT_MISSING")
             result = training_plan(
                 args.repository_root,
                 args.runtime_root,
                 args.cloud_runtime_root,
+                requested_total_minutes=args.training_max_wall_minutes,
             )
         elif args.action == "reconcile-local-receipts":
             _require(args.cloud_runtime_root is not None, "CLOUD_RUNTIME_ROOT_MISSING")

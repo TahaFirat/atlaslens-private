@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Protocol, cast
 from uuid import uuid4
 
+from atlaslens_api.phase3f.deadline import (
+    MAX_SUPPORTED_TOTAL_MINUTES,
+    MIN_SUPPORTED_TOTAL_MINUTES,
+)
 from atlaslens_api.phase3f.runpod import (
     ON_DEMAND_PRICE_TOLERANCE_USD,
     PodConnectivityProgressDiagnostic,
@@ -264,7 +268,9 @@ class OperatorReceipt:
         _require(
             isinstance(self.max_wall_minutes, int)
             and not isinstance(self.max_wall_minutes, bool)
-            and 1 <= self.max_wall_minutes <= 345,
+            and MIN_SUPPORTED_TOTAL_MINUTES
+            <= self.max_wall_minutes
+            <= MAX_SUPPORTED_TOTAL_MINUTES,
             "OPERATOR_RECEIPT_WALL_TIME_INVALID",
         )
         _require(

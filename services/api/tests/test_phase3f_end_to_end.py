@@ -495,6 +495,7 @@ def test_training_and_operator_contracts_are_real_and_secret_safe() -> None:
         "Preflight",
         "CloudPlan",
         "RemoteEnvironmentPlan",
+        "TrainingDeadlinePlan",
         "ReconcileLocalReceipts",
         "Execute",
         "Status",
@@ -511,6 +512,29 @@ def test_training_and_operator_contracts_are_real_and_secret_safe() -> None:
     assert "asda.html" not in launcher
     assert "Invoke-WebRequest" not in launcher
     assert "Invoke-RestMethod" not in launcher
+
+
+def test_training_deadline_plan_is_read_only_and_blocks_upper_bound_plus_one() -> None:
+    control = _load_control()
+
+    plan = control.training_deadline_plan(ROOT, 345)
+    blocked = control.training_deadline_plan(ROOT, 346)
+
+    assert plan["requested_total_minutes"] == 345
+    assert plan["provisioning_budget_seconds"] == 3_600
+    assert plan["bootstrap_budget_seconds"] == 600
+    assert plan["salvage_reserve_seconds"] == 300
+    assert plan["training_budget_seconds"] == 16_200
+    assert plan["min_supported_minutes"] == 105
+    assert plan["max_supported_minutes"] == 345
+    assert plan["computed_child_deadline_class"] == "future_epoch_seconds"
+    assert plan["local_blockers"] == []
+    assert plan["ready_for_cloud"] is True
+    assert plan["runpod_api_calls"] == 0
+    assert plan["create_attempts"] == 0
+    assert plan["cloud_mutations"] == 0
+    assert blocked["local_blockers"] == ["TRAINING_TOTAL_WALL_MINUTES_INVALID"]
+    assert blocked["ready_for_cloud"] is False
 
 
 def test_training_module_never_requires_mapillary_token() -> None:
@@ -752,6 +776,8 @@ def test_training_plan_requires_integrity_bound_local_cuda_smoke(
     assert plan["locked_holdout_access_count"] == 0
     assert plan["nonfinite_loss_count"] == 0
     assert plan["model_parameters_changed"] is True
+    assert plan["training_deadline_plan"]["training_budget_seconds"] == 16_200
+    assert plan["estimated_remaining_wall_minutes"] == 270
     assert plan["local_blockers"] == []
     assert plan["ready_for_training_retry"] is True
     assert plan["runpod_api_calls"] == 0

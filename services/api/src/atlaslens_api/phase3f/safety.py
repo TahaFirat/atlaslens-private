@@ -12,12 +12,14 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Protocol, TypeVar, cast
 
+from atlaslens_api.phase3f.deadline import MAX_SUPPORTED_TOTAL_MINUTES
+
 TARGET_BUDGET_USD = Decimal("6")
 SOFT_STOP_BUDGET_USD = Decimal("7.50")
 TERMINATE_BUDGET_USD = Decimal("9")
 ABSOLUTE_BUDGET_USD = Decimal("10")
 MAX_HOURLY_COST_USD = Decimal("0.50")
-MAX_RUNTIME_SECONDS = 5 * 60 * 60 + 45 * 60
+MAX_RUNTIME_SECONDS = MAX_SUPPORTED_TOTAL_MINUTES * 60
 
 _SAFE_RESOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,190}$")
 _SAFE_MARKER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
