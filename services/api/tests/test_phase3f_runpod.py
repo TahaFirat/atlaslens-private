@@ -24,6 +24,7 @@ from atlaslens_api.phase3f.runpod import (
     RunPodConfig,
     RunPodCreateError,
     RunPodV1Client,
+    attest_image_identity,
     build_create_payload,
     simulate_pod_allocation_state_machine,
     validate_create_payload_contract,
@@ -167,6 +168,30 @@ def _created_payload(
     if interruptible is not _MISSING_FIELD:
         payload["interruptible"] = interruptible
     return payload
+
+
+def test_image_identity_requires_the_exact_digest_without_normalization() -> None:
+    assert attest_image_identity(IMAGE, {"imageName": IMAGE}) == IMAGE
+    assert attest_image_identity(IMAGE, {}) is None
+    with pytest.raises(RunPodAPIError, match="REMOTE_IMAGE_IDENTITY_MISMATCH"):
+        attest_image_identity(IMAGE, {"imageName": "registry.example/atlaslens:latest"})
+    with pytest.raises(RunPodAPIError, match="REMOTE_IMAGE_IDENTITY_MISMATCH"):
+        attest_image_identity(
+            IMAGE,
+            {"imageName": "registry.example/atlaslens@sha256:" + "b" * 64},
+        )
+
+
+def test_create_response_diagnostic_records_secret_free_image_identity() -> None:
+    client = RunPodV1Client(api_token=TOKEN, config=_config())
+    body = bytearray(json.dumps({"id": "pod", "imageName": IMAGE}).encode())
+    client._observe_create_response(201, body, "application/json")  # noqa: SLF001
+    diagnostic = client.last_create_response_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.image_name_present is True
+    assert diagnostic.observed_image_name == IMAGE
+    assert diagnostic.image_digest_match is True
+    assert TOKEN not in repr(diagnostic.to_public_dict())
 
 
 def _attested_pod_payload(

@@ -16,7 +16,7 @@ from types import ModuleType
 from typing import Final, Literal, cast
 
 REMOTE_ENVIRONMENT_CONTRACT_SCHEMA: Final = (
-    "atlaslens-phase3f-remote-environment-contract-v1"
+    "atlaslens-phase3f-remote-environment-contract-v2"
 )
 REMOTE_DEPENDENCY_REPORT_SCHEMA: Final = "atlaslens-phase3f-dependency-report-v1"
 REMOTE_ENVIRONMENT_RECEIPT_SCHEMA: Final = "atlaslens-phase3f-environment-receipt-v1"
@@ -29,6 +29,17 @@ DEPENDENCY_FAILURE_CODES: Final = frozenset(
         "REMOTE_PYTHON_INTERPRETER_MISMATCH",
         "REMOTE_TORCH_CUDA_UNAVAILABLE",
         "REMOTE_TORCH_CUDA_ABI_MISMATCH",
+        "REMOTE_TORCHVISION_PAIR_UNSUPPORTED",
+        "REMOTE_TORCHVISION_OPS_FAILED",
+        "REMOTE_CUDA_TENSOR_ALLOCATION_FAILED",
+        "REMOTE_CUDA_AUTOCAST_FAILED",
+        "REMOTE_CUDA_FORWARD_FAILED",
+        "REMOTE_CUDA_BACKWARD_FAILED",
+        "REMOTE_CUDA_OPTIMIZER_FAILED",
+        "REMOTE_MODEL_HASH_MISMATCH",
+        "REMOTE_TRAINING_SMOKE_FAILED",
+        "REMOTE_TRAINING_SMOKE_TIMEOUT",
+        "REMOTE_BASE_PACKAGE_IDENTITY_CHANGED",
         "REMOTE_VENDOR_IMPORT_FAILED",
         "REMOTE_DEPENDENCY_LOCK_MISMATCH",
     }
@@ -43,6 +54,14 @@ _LOCK_LINE = re.compile(
 _REMOTE_IMAGE = (
     "runpod/pytorch@sha256:"
     "60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f"
+)
+SUPPORTED_TORCHVISION_PAIRS: Final = (
+    ("2.7", "0.22"),
+    ("2.8", "0.23"),
+    ("2.9", "0.24"),
+)
+TORCHVISION_COMPATIBILITY_SOURCE: Final = (
+    "https://github.com/pytorch/vision#installation"
 )
 
 
@@ -89,8 +108,10 @@ class RemoteEnvironmentContract:
     cuda_requirement: str
     official_index_url: str
     bootstrap_timeout_seconds: int
+    compatibility_smoke_timeout_seconds: int
     requirements_lock_sha256: str
     system_site_packages_required: bool
+    supported_torchvision_pairs: tuple[tuple[str, str], ...]
     checks: tuple[DependencyCheck, ...]
     contract_sha256: str
 
@@ -166,13 +187,38 @@ def load_remote_environment_contract(
     _require(value.get("schema") == REMOTE_ENVIRONMENT_CONTRACT_SCHEMA)
     _require(value.get("requirements_lock_sha256") == lock_sha256)
     _require(value.get("python_requirement") == "==3.12.*")
-    _require(value.get("torch_requirement") == "==2.7.1")
-    _require(value.get("torchvision_requirement") == "==0.22.1")
+    _require(value.get("torch_requirement") == ">=2.7,<2.10")
+    _require(value.get("torchvision_requirement") == ">=0.22,<0.25")
     _require(value.get("cuda_requirement") == "12.8")
     _require(value.get("platform") == "linux_x86_64")
     _require(value.get("system_site_packages_required") is True)
+    _require(value.get("image_identity_policy") == "exact_digest")
+    _require(value.get("torch_download_prohibited") is True)
     _require(value.get("official_index_url") == "https://pypi.org/simple")
     _require(value.get("bootstrap_timeout_seconds") == 600)
+    _require(value.get("compatibility_smoke_timeout_seconds") == 180)
+    _require(value.get("compatibility_source") == TORCHVISION_COMPATIBILITY_SOURCE)
+    raw_pairs = value.get("supported_torchvision_pairs")
+    _require(
+        isinstance(raw_pairs, list)
+        and tuple(
+            (row.get("torch_minor"), row.get("torchvision_minor"))
+            for row in raw_pairs
+            if isinstance(row, dict)
+        )
+        == SUPPORTED_TORCHVISION_PAIRS
+    )
+    history = value.get("historical_observations")
+    _require(
+        isinstance(history, list)
+        and len(history) == 1
+        and isinstance(history[0], dict)
+        and history[0].get("image_digest") == _REMOTE_IMAGE.split("@", 1)[1]
+        and history[0].get("python") == "3.12"
+        and history[0].get("torch") == "2.9.1+cu128"
+        and history[0].get("torchvision") is None
+        and history[0].get("cuda") is None
+    )
     _require(value.get("forbidden_locked_distributions") == ["torch", "torchvision"])
     _require(value.get("requirements_lock") == "config/phase3f-training-requirements.lock")
     image = value.get("image")
@@ -227,13 +273,15 @@ def load_remote_environment_contract(
         platform="linux_x86_64",
         python_major=3,
         python_minor=12,
-        torch_requirement="2.7.1",
-        torchvision_requirement="0.22.1",
+        torch_requirement=">=2.7,<2.10",
+        torchvision_requirement=">=0.22,<0.25",
         cuda_requirement="12.8",
         official_index_url="https://pypi.org/simple",
         bootstrap_timeout_seconds=600,
+        compatibility_smoke_timeout_seconds=180,
         requirements_lock_sha256=lock_sha256,
         system_site_packages_required=True,
+        supported_torchvision_pairs=SUPPORTED_TORCHVISION_PAIRS,
         checks=tuple(checks),
         contract_sha256=contract_sha256,
     )
@@ -261,6 +309,52 @@ def _safe_gpu_name(value: object) -> str | None:
     return value if isinstance(value, str) and bool(_SAFE_GPU.fullmatch(value)) else None
 
 
+def _version_minor(value: str) -> str | None:
+    matched = re.fullmatch(r"(?P<major>0|[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)"
+                             r"\.(?:0|[1-9][0-9]*)(?:\+[A-Za-z0-9.]+)?", value)
+    if matched is None:
+        return None
+    return f"{matched.group('major')}.{matched.group('minor')}"
+
+
+def canonical_environment_identity(
+    contract: RemoteEnvironmentContract,
+    *,
+    python_version: str,
+    torch_version: str,
+    torchvision_version: str,
+    cuda_version: str,
+    gpu_class: str,
+    vendor_source_sha256: str | None = None,
+    model_sha256: str | None = None,
+) -> tuple[dict[str, object], str]:
+    """Return the canonical, secret-free runtime identity and its SHA-256."""
+    _require(bool(re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", python_version)))
+    _require(_version_minor(torch_version) is not None)
+    _require(_version_minor(torchvision_version) is not None)
+    _require(bool(re.fullmatch(r"[0-9]+\.[0-9]+", cuda_version)))
+    _require(bool(_SAFE_GPU.fullmatch(gpu_class)))
+    for digest in (vendor_source_sha256, model_sha256):
+        _require(digest is None or bool(_SHA256.fullmatch(digest)))
+    document: dict[str, object] = {
+        "schema": "atlaslens-phase3f-runtime-environment-identity-v1",
+        "image": contract.image,
+        "python": python_version,
+        "torch": torch_version,
+        "torchvision": torchvision_version,
+        "cuda": cuda_version,
+        "gpu_class": gpu_class,
+        "dependency_lock_sha256": contract.requirements_lock_sha256,
+        "torch_download_prohibited": True,
+        "vendor_source_sha256": vendor_source_sha256,
+        "model_sha256": model_sha256,
+    }
+    encoded = json.dumps(
+        document, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("ascii")
+    return document, hashlib.sha256(encoded).hexdigest()
+
+
 def _document(
     contract: RemoteEnvironmentContract,
     *,
@@ -275,6 +369,8 @@ def _document(
     torch_cuda_version: str | None,
     gpu_name: str | None,
     preflight_scope: Literal["base", "project", "full"],
+    observed_torch_version: str | None = None,
+    observed_torchvision_version: str | None = None,
 ) -> DependencyPreflightResult:
     passed = failure_code is None
     abi_compatible = (
@@ -282,6 +378,37 @@ def _document(
         if cuda_available is None
         else cuda_available and torch_cuda_version == contract.cuda_requirement
     )
+    failure_codes = [
+        cast(str, row["dependency_failure_code"])
+        for row in rows
+        if isinstance(row.get("dependency_failure_code"), str)
+    ]
+    pair = (
+        (_version_minor(observed_torch_version), _version_minor(observed_torchvision_version))
+        if observed_torch_version is not None and observed_torchvision_version is not None
+        else (None, None)
+    )
+    pair_compatible = (
+        pair in contract.supported_torchvision_pairs
+        if pair[0] is not None and pair[1] is not None
+        else None
+    )
+    identity: dict[str, object] | None = None
+    identity_sha256: str | None = None
+    if (
+        observed_torch_version is not None
+        and observed_torchvision_version is not None
+        and torch_cuda_version is not None
+        and gpu_name is not None
+    ):
+        identity, identity_sha256 = canonical_environment_identity(
+            contract,
+            python_version=f"{python_version[0]}.{python_version[1]}",
+            torch_version=observed_torch_version,
+            torchvision_version=observed_torchvision_version,
+            cuda_version=torch_cuda_version,
+            gpu_class=gpu_name,
+        )
     report: dict[str, object] = {
         "schema": REMOTE_DEPENDENCY_REPORT_SCHEMA,
         "outcome": "passed" if passed else "failed",
@@ -290,10 +417,13 @@ def _document(
         "failure_exception_class": exception_class,
         "checks": rows,
         "check_count": len(rows),
+        "all_checks_collected": len(rows) > 0,
+        "failure_codes": failure_codes,
         "preflight_scope": preflight_scope,
         "contract_sha256": contract.contract_sha256,
         "dependency_lock_sha256": contract.requirements_lock_sha256,
         "secrets_included": False,
+        "torch_download_prohibited": True,
     }
     receipt: dict[str, object] = {
         "schema": REMOTE_ENVIRONMENT_RECEIPT_SCHEMA,
@@ -305,6 +435,13 @@ def _document(
         "python_minor": python_version[1],
         "cuda_available": cuda_available,
         "torch_cuda_version": torch_cuda_version,
+        "torch_version": observed_torch_version,
+        "torchvision_version": observed_torchvision_version,
+        "torchvision_pair_compatible": pair_compatible,
+        "supported_torchvision_pairs": [
+            list(item) for item in contract.supported_torchvision_pairs
+        ],
+        "compatibility_source": TORCHVISION_COMPATIBILITY_SOURCE,
         "gpu_name": gpu_name,
         "gpu_name_present": gpu_name is not None,
         "abi_compatible": abi_compatible,
@@ -315,6 +452,9 @@ def _document(
         "failure_exception_class": exception_class,
         "all_imports_passed": passed,
         "system_site_packages": contract.system_site_packages_required,
+        "torch_download_prohibited": True,
+        "runtime_environment_identity": identity,
+        "runtime_environment_sha256": identity_sha256,
         "secrets_included": False,
     }
     return DependencyPreflightResult(
@@ -344,6 +484,8 @@ def evaluate_remote_environment(
     cuda_available: bool | None = None
     torch_cuda_version: str | None = None
     gpu_name: str | None = None
+    observed_torch_version: str | None = None
+    observed_torchvision_version: str | None = None
     if actual_class != expected_interpreter_class or actual_python != (
         contract.python_major,
         contract.python_minor,
@@ -369,6 +511,7 @@ def evaluate_remote_environment(
         or (stage == "base" and check.source == "base_image")
         or (stage == "project" and check.source != "base_image")
     )
+    failures: list[tuple[str, str, str | None]] = []
     for check in selected:
         observed_version: str | None = None
         failure_code: str | None = None
@@ -377,11 +520,18 @@ def evaluate_remote_environment(
             module = importer(check, vendor_root)
             if check.distribution is not None:
                 observed_version = version_reader(check.distribution)
-                required = cast(str, check.required_version)
-                if observed_version.split("+", 1)[0] != required:
+                if check.module == "torch":
+                    observed_torch_version = observed_version
+                elif check.module == "torchvision":
+                    observed_torchvision_version = observed_version
+                required = check.required_version
+                if (
+                    required is not None
+                    and observed_version.split("+", 1)[0] != required
+                ):
                     failure_code = "REMOTE_DEPENDENCY_VERSION_MISMATCH"
                     exception_class = "VersionContractError"
-            if failure_code is None and check.module == "torch":
+            if check.module == "torch":
                 torch_module = cast(ModuleType, module)
                 cuda = torch_module.cuda
                 cuda_available = bool(cuda.is_available())
@@ -390,13 +540,13 @@ def evaluate_remote_environment(
                 torch_cuda_version = (
                     raw_cuda_version if isinstance(raw_cuda_version, str) else None
                 )
-                if not cuda_available:
+                if not cuda_available and failure_code is None:
                     failure_code = "REMOTE_TORCH_CUDA_UNAVAILABLE"
                     exception_class = "CudaContractError"
-                elif torch_cuda_version != contract.cuda_requirement:
+                elif torch_cuda_version != contract.cuda_requirement and failure_code is None:
                     failure_code = "REMOTE_TORCH_CUDA_ABI_MISMATCH"
                     exception_class = "CudaAbiContractError"
-                else:
+                elif cuda_available:
                     gpu_name = _safe_gpu_name(cuda.get_device_name(0))
         except (ModuleNotFoundError, importlib.metadata.PackageNotFoundError) as exc:
             failure_code = "REMOTE_DEPENDENCY_MODULE_MISSING"
@@ -448,33 +598,214 @@ def evaluate_remote_environment(
         rows.append(row)
         if failure_code is not None:
             _require(failure_code in DEPENDENCY_FAILURE_CODES, failure_code)
-            return _document(
-                contract,
-                expected_interpreter_class=expected_interpreter_class,
-                actual_interpreter_class=actual_class,
-                python_version=actual_python,
-                rows=rows,
-                failure_code=failure_code,
-                failed_module=check.module,
-                exception_class=exception_class,
-                cuda_available=cuda_available,
-                torch_cuda_version=torch_cuda_version,
-                gpu_name=gpu_name,
-                preflight_scope=stage,
-            )
+            failures.append((failure_code, check.module, exception_class))
+    if observed_torch_version is not None and observed_torchvision_version is not None:
+        pair = (
+            _version_minor(observed_torch_version),
+            _version_minor(observed_torchvision_version),
+        )
+        if pair not in contract.supported_torchvision_pairs:
+            pair_code = "REMOTE_TORCHVISION_PAIR_UNSUPPORTED"
+            for row in rows:
+                if (
+                    row.get("module") == "torchvision"
+                    and row.get("dependency_failure_code") is None
+                ):
+                    row["import_result"] = "failed"
+                    row["failure_exception_class"] = "TorchVisionPairContractError"
+                    row["dependency_failure_code"] = pair_code
+                    break
+            failures.append((pair_code, "torchvision", "TorchVisionPairContractError"))
+    failure_code, failed_module, exception_class = (
+        failures[0] if failures else (None, None, None)
+    )
     return _document(
         contract,
         expected_interpreter_class=expected_interpreter_class,
         actual_interpreter_class=actual_class,
         python_version=actual_python,
         rows=rows,
-        failure_code=None,
-        failed_module=None,
-        exception_class=None,
+        failure_code=failure_code,
+        failed_module=failed_module,
+        exception_class=exception_class,
         cuda_available=cuda_available,
         torch_cuda_version=torch_cuda_version,
         gpu_name=gpu_name,
         preflight_scope=stage,
+        observed_torch_version=observed_torch_version,
+        observed_torchvision_version=observed_torchvision_version,
+    )
+
+
+def evaluate_base_runtime_checks(
+    contract: RemoteEnvironmentContract,
+    base: DependencyPreflightResult,
+    *,
+    torch_module: object | None = None,
+    torchvision_module: object | None = None,
+) -> DependencyPreflightResult:
+    """Collect every small base-runtime check without stopping at the first failure."""
+    torch = torch_module
+    torchvision = torchvision_module
+    if torch is None:
+        try:
+            torch = importlib.import_module("torch")
+        except Exception:  # reported by every dependent probe below
+            torch = None
+    if torchvision is None:
+        try:
+            torchvision = importlib.import_module("torchvision")
+        except Exception:  # reported by the compiled-ops probe below
+            torchvision = None
+    checks: list[dict[str, object]] = []
+
+    def collect(name: str, code: str, operation: Callable[[], object]) -> None:
+        outcome = "passed"
+        exception_class: str | None = None
+        observed: object = "compatible"
+        try:
+            observed = operation()
+        except Exception as exc:  # sanitized probe boundary
+            outcome = "failed"
+            exception_class = type(exc).__name__
+            observed = "failed"
+        checks.append(
+            {
+                "check_name": name,
+                "outcome": outcome,
+                "observed": observed,
+                "dependency_failure_code": None if outcome == "passed" else code,
+                "failure_exception_class": exception_class,
+                "secrets_included": False,
+            }
+        )
+
+    collect("python-runtime", "REMOTE_PYTHON_INTERPRETER_MISMATCH", lambda: sys.version_info[:2])
+    collect(
+        "torch-version-cuda",
+        "REMOTE_TORCH_CUDA_ABI_MISMATCH",
+        lambda: (
+            contract.cuda_requirement
+            if getattr(cast(ModuleType, torch).version, "cuda", None)
+            == contract.cuda_requirement
+            else (_ for _ in ()).throw(RuntimeError("cuda abi"))
+        ),
+    )
+    collect(
+        "cuda-available",
+        "REMOTE_TORCH_CUDA_UNAVAILABLE",
+        lambda: True
+        if cast(ModuleType, torch).cuda.is_available()
+        else (_ for _ in ()).throw(RuntimeError("cuda unavailable")),
+    )
+    def initialize_cuda_runtime() -> str:
+        cast(ModuleType, torch).cuda.init()
+        return "initialized"
+
+    collect(
+        "cuda-runtime",
+        "REMOTE_TORCH_CUDA_UNAVAILABLE",
+        initialize_cuda_runtime,
+    )
+    collect(
+        "gpu-capability",
+        "REMOTE_TORCH_CUDA_UNAVAILABLE",
+        lambda: list(cast(ModuleType, torch).cuda.get_device_capability(0)),
+    )
+    collect(
+        "torchvision-compiled-ops",
+        "REMOTE_TORCHVISION_OPS_FAILED",
+        lambda: int(
+            cast(ModuleType, torchvision).ops.nms(
+                cast(ModuleType, torch).tensor([[0.0, 0.0, 1.0, 1.0]]),
+                cast(ModuleType, torch).tensor([1.0]),
+                0.5,
+            ).numel()
+        ),
+    )
+    collect(
+        "cuda-tensor-allocation",
+        "REMOTE_CUDA_TENSOR_ALLOCATION_FAILED",
+        lambda: list(cast(ModuleType, torch).zeros(2, device="cuda").shape),
+    )
+
+    def training_operation(stage: str) -> object:
+        module = cast(ModuleType, torch)
+        layer = module.nn.Linear(4, 2).to("cuda")
+        optimizer = module.optim.SGD(layer.parameters(), lr=0.01)
+        before = layer.weight.detach().clone()
+        optimizer.zero_grad(set_to_none=True)
+        with module.amp.autocast("cuda", dtype=module.float16):
+            output = layer(module.ones((2, 4), device="cuda"))
+            loss = output.float().square().mean()
+        if stage == "autocast":
+            return str(output.dtype)
+        loss.backward()
+        if stage == "backward":
+            return bool(layer.weight.grad is not None)
+        optimizer.step()
+        if stage == "optimizer":
+            return bool(not module.equal(before, layer.weight.detach()))
+        return list(output.shape)
+
+    collect("cuda-autocast", "REMOTE_CUDA_AUTOCAST_FAILED", lambda: training_operation("autocast"))
+    collect("cuda-forward", "REMOTE_CUDA_FORWARD_FAILED", lambda: training_operation("forward"))
+    collect("cuda-backward", "REMOTE_CUDA_BACKWARD_FAILED", lambda: training_operation("backward"))
+    collect(
+        "cuda-optimizer-step",
+        "REMOTE_CUDA_OPTIMIZER_FAILED",
+        lambda: training_operation("optimizer"),
+    )
+    failed = next(
+        (row for row in checks if row["dependency_failure_code"] is not None),
+        None,
+    )
+    failure_code = base.failure_code or (
+        cast(str, failed["dependency_failure_code"]) if failed is not None else None
+    )
+    failed_module = base.failed_module or (
+        cast(str, failed["check_name"]) if failed is not None else None
+    )
+    exception_class = base.exception_class or (
+        cast(str | None, failed["failure_exception_class"])
+        if failed is not None
+        else None
+    )
+    report = dict(base.report)
+    report["base_runtime_checks"] = checks
+    report["base_runtime_check_count"] = len(checks)
+    report["full_report_check_count"] = cast(int, report["check_count"]) + len(checks)
+    report["all_checks_collected"] = True
+    report["outcome"] = "passed" if failure_code is None else "failed"
+    report["dependency_failure_code"] = failure_code
+    report["failed_module"] = failed_module
+    report["failure_exception_class"] = exception_class
+    report["failure_codes"] = [
+        code
+        for code in (
+            *cast(list[str], report.get("failure_codes", [])),
+            *(
+                cast(str, row["dependency_failure_code"])
+                for row in checks
+                if row["dependency_failure_code"] is not None
+            ),
+        )
+    ]
+    receipt = dict(base.environment_receipt)
+    receipt["base_runtime_checks_passed"] = failed is None
+    receipt["base_runtime_check_count"] = len(checks)
+    receipt["outcome"] = "passed" if failure_code is None else "failed"
+    receipt["dependency_failure_code"] = failure_code
+    receipt["failed_module"] = failed_module
+    receipt["failure_exception_class"] = exception_class
+    receipt["all_imports_passed"] = failure_code is None
+    return DependencyPreflightResult(
+        passed=failure_code is None,
+        failure_code=failure_code,
+        failed_module=failed_module,
+        exception_class=exception_class,
+        report=report,
+        environment_receipt=receipt,
     )
 
 
@@ -496,6 +827,17 @@ def require_environment_receipt(
         and value.get("python_minor") == 12
         and value.get("cuda_available") is True
         and value.get("abi_compatible") is True
+        and value.get("torchvision_pair_compatible") is True
+        and value.get("compatibility_smoke_passed") is True
+        and value.get("compatibility_smoke_event")
+        == "PHASE3F_REMOTE_TRAINING_SMOKE_PASSED"
+        and isinstance(value.get("runtime_environment_identity"), dict)
+        and isinstance(value.get("runtime_environment_sha256"), str)
+        and bool(_SHA256.fullmatch(cast(str, value["runtime_environment_sha256"])))
+        and isinstance(value.get("vendor_source_sha256"), str)
+        and bool(_SHA256.fullmatch(cast(str, value["vendor_source_sha256"])))
+        and isinstance(value.get("model_sha256"), str)
+        and bool(_SHA256.fullmatch(cast(str, value["model_sha256"])))
         and value.get("all_imports_passed") is True
         and value.get("system_site_packages") is True
         and value.get("contract_sha256") == expected_contract_sha256
@@ -520,6 +862,7 @@ def require_dependency_report(
 ) -> dict[str, object]:
     value = _read_json(path)
     rows = value.get("checks")
+    smoke = value.get("training_smoke")
     _require(
         value.get("schema") == REMOTE_DEPENDENCY_REPORT_SCHEMA
         and value.get("outcome") == "passed"
@@ -532,6 +875,12 @@ def require_dependency_report(
         and value.get("contract_sha256") == expected_contract_sha256
         and value.get("dependency_lock_sha256") == expected_lock_sha256
         and value.get("secrets_included") is False
+        and isinstance(smoke, dict)
+        and smoke.get("outcome") == "passed"
+        and smoke.get("event") == "PHASE3F_REMOTE_TRAINING_SMOKE_PASSED"
+        and smoke.get("holdout_open_count") == 0
+        and smoke.get("checkpoint_write_count") == 0
+        and smoke.get("secrets_included") is False
     )
     for row in cast(list[object], rows):
         _require(
@@ -553,6 +902,10 @@ __all__ = [
     "REMOTE_ENVIRONMENT_RECEIPT_SCHEMA",
     "RemoteEnvironmentContract",
     "RemoteEnvironmentError",
+    "SUPPORTED_TORCHVISION_PAIRS",
+    "TORCHVISION_COMPATIBILITY_SOURCE",
+    "canonical_environment_identity",
+    "evaluate_base_runtime_checks",
     "evaluate_remote_environment",
     "interpreter_class",
     "load_remote_environment_contract",

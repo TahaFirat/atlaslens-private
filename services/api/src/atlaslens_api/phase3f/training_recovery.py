@@ -237,6 +237,7 @@ class CheckpointStatus:
     dataset_readiness_sha256: str | None
     sealed_assets_sha256: str | None
     training_config_sha256: str | None
+    environment_identity_sha256: str | None
     artifact_count: int
 
     def to_public_dict(self) -> dict[str, object]:
@@ -254,6 +255,7 @@ class CheckpointStatus:
             "dataset_readiness_sha256": self.dataset_readiness_sha256,
             "sealed_assets_sha256": self.sealed_assets_sha256,
             "training_config_sha256": self.training_config_sha256,
+            "environment_identity_sha256": self.environment_identity_sha256,
             "artifact_count": self.artifact_count,
         }
 
@@ -274,6 +276,7 @@ def _missing_checkpoint() -> CheckpointStatus:
         dataset_readiness_sha256=None,
         sealed_assets_sha256=None,
         training_config_sha256=None,
+        environment_identity_sha256=None,
         artifact_count=0,
     )
 
@@ -357,6 +360,7 @@ def validate_checkpoint_tree(
     expected_readiness_sha256: str,
     expected_sealed_assets_sha256: str,
     expected_training_config_sha256: str,
+    expected_environment_identity_sha256: str | None = None,
 ) -> CheckpointStatus:
     _require(bool(_HEX32.fullmatch(expected_run_id)), "RUN_ID_INVALID")
     pointer = _read_json(checkpoint_root / "latest.json")
@@ -376,6 +380,7 @@ def validate_checkpoint_tree(
     manifest_path = generation_root / "checkpoint-manifest.json"
     manifest = _read_json(manifest_path)
     artifacts = manifest.get("artifacts")
+    environment_identity_sha256 = manifest.get("environment_identity_sha256")
     _require(
         manifest.get("schema") == CHECKPOINT_MANIFEST_SCHEMA
         and manifest.get("run_id") == expected_run_id
@@ -383,6 +388,17 @@ def validate_checkpoint_tree(
         and manifest.get("sealed_assets_sha256") == expected_sealed_assets_sha256
         and manifest.get("training_config_sha256") == expected_training_config_sha256
         and manifest.get("holdout_open_count") == 0
+        and (
+            environment_identity_sha256 is None
+            or (
+                isinstance(environment_identity_sha256, str)
+                and bool(_SHA256.fullmatch(environment_identity_sha256))
+            )
+        )
+        and (
+            expected_environment_identity_sha256 is None
+            or environment_identity_sha256 == expected_environment_identity_sha256
+        )
         and isinstance(artifacts, list)
         and bool(artifacts),
         "TRAINING_CHECKPOINT_BINDING_MISMATCH",
@@ -474,6 +490,9 @@ def validate_checkpoint_tree(
         dataset_readiness_sha256=expected_readiness_sha256,
         sealed_assets_sha256=expected_sealed_assets_sha256,
         training_config_sha256=expected_training_config_sha256,
+        environment_identity_sha256=cast(
+            str | None, environment_identity_sha256
+        ),
         artifact_count=len(artifacts),
     )
 
@@ -621,6 +640,7 @@ def store_verified_checkpoint_archive(
             "dataset_readiness_sha256": expected_readiness_sha256,
             "sealed_assets_sha256": expected_sealed_assets_sha256,
             "training_config_sha256": expected_training_config_sha256,
+            "environment_identity_sha256": status.environment_identity_sha256,
             "secret_values_included": False,
         },
     )

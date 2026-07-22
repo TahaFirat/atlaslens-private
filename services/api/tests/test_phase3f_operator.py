@@ -412,6 +412,17 @@ def test_ready_allocation_advances_to_transfer_and_training_start(
     assert events.index("PHASE3F_REMOTE_DEPENDENCIES_READY") < events.index(
         "PHASE3F_CLOUD_JOB_STARTED"
     )
+    ordered = (
+        "PHASE3F_REMOTE_BOOTSTRAP_STARTED",
+        "PHASE3F_REMOTE_BASE_ENVIRONMENT_REPORTED",
+        "PHASE3F_REMOTE_LIGHTWEIGHT_DEPENDENCIES_READY",
+        "PHASE3F_REMOTE_TRAINING_SMOKE_PASSED",
+        "PHASE3F_REMOTE_DEPENDENCIES_READY",
+        "PHASE3F_CLOUD_JOB_STARTED",
+    )
+    assert [events.index(event) for event in ordered] == sorted(
+        events.index(event) for event in ordered
+    )
     assert events.count("PHASE3F_REMOTE_BOOTSTRAP_STARTED") == 1
     assert events.count("PHASE3F_REMOTE_DEPENDENCIES_READY") == 1
 
@@ -440,6 +451,10 @@ def test_legacy_operator_receipt_remains_readable(tmp_path: Path) -> None:
         "get_interruptible_json_type",
         "pod_inventory_count",
         "explicit_false_source",
+        "requested_image_name",
+        "observed_image_name",
+        "image_digest_match",
+        "image_identity_source",
         "gpu_attestation_outcome",
         "gpu_attestation_failure_code",
         "normalized_gpu_path",
@@ -483,6 +498,10 @@ def test_previous_v2_operator_receipt_remains_readable(tmp_path: Path) -> None:
     payload = _receipt().to_dict()
     for field in (
         "attempt_id",
+        "requested_image_name",
+        "observed_image_name",
+        "image_digest_match",
+        "image_identity_source",
         "gpu_attestation_outcome",
         "gpu_attestation_failure_code",
         "normalized_gpu_path",

@@ -1048,6 +1048,7 @@ def _operation(
         f"--expected-contract-sha256 {environment_contract_sha256} "
         f"--expected-lock-sha256 {dependency_lock_sha256} "
         "--vendor-root /workspace/phase3f-transfer/vendor "
+        "--model /workspace/phase3f-transfer/model.safetensors "
         f"--venv-root {remote_venv} "
         "--recovery-root /workspace/phase3f-work/recovery "
         f"--timeout-seconds {DEPENDENCY_BOOTSTRAP_SECONDS}"
@@ -1128,6 +1129,22 @@ def _operation(
             raise SupervisorExecutionError(
                 salvage_failure(bootstrap_result).failure_code
             )
+        _emit(
+            "PHASE3F_REMOTE_BASE_ENVIRONMENT_REPORTED",
+            run_id=run_id,
+            secrets_included=False,
+        )
+        _emit(
+            "PHASE3F_REMOTE_LIGHTWEIGHT_DEPENDENCIES_READY",
+            run_id=run_id,
+            torch_downloaded=False,
+        )
+        _emit(
+            "PHASE3F_REMOTE_TRAINING_SMOKE_PASSED",
+            run_id=run_id,
+            holdout_open_count=0,
+            checkpoint_write_count=0,
+        )
         _emit(
             "PHASE3F_REMOTE_DEPENDENCIES_READY",
             run_id=run_id,

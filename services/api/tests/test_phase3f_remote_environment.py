@@ -15,10 +15,15 @@ from atlaslens_api.phase3f.remote_environment import (
     DependencyPreflightResult,
     RemoteEnvironmentContract,
     RemoteEnvironmentError,
+    canonical_environment_identity,
+    evaluate_base_runtime_checks,
     evaluate_remote_environment,
     load_remote_environment_contract,
 )
-from atlaslens_api.phase3f.training import training_config_sha256
+from atlaslens_api.phase3f.training import (
+    aggregate_training_smoke_failure,
+    training_config_sha256,
+)
 from atlaslens_api.phase3f.training_recovery import atomic_json
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -45,11 +50,13 @@ def _contract() -> RemoteEnvironmentContract:
 
 
 def _versions(contract: RemoteEnvironmentContract) -> dict[str, str]:
-    return {
+    versions = {
         cast(str, check.distribution): cast(str, check.required_version)
         for check in contract.checks
-        if check.distribution is not None
+        if check.distribution is not None and check.required_version is not None
     }
+    versions.update({"torch": "2.9.1+cu128", "torchvision": "0.24.1+cu128"})
+    return versions
 
 
 def _evaluate(
@@ -120,8 +127,102 @@ def test_missing_dependency_is_exact_even_without_stderr(module: str) -> None:
 )
 def test_base_version_mismatch_is_typed(distribution: str, observed: str) -> None:
     result = _evaluate(_contract(), version_overrides={distribution: observed})
-    assert result.failure_code == "REMOTE_DEPENDENCY_VERSION_MISMATCH"
-    assert result.failed_module == distribution
+    assert result.failure_code == "REMOTE_TORCHVISION_PAIR_UNSUPPORTED"
+    assert result.report["check_count"] == 20
+
+
+def test_observed_live_torch_pair_is_compatibility_approved() -> None:
+    result = _evaluate(
+        _contract(),
+        version_overrides={"torch": "2.9.1+cu128", "torchvision": "0.24.1+cu128"},
+    )
+    assert result.passed is True
+    assert result.environment_receipt["torchvision_pair_compatible"] is True
+    assert result.environment_receipt["torch_version"] == "2.9.1+cu128"
+
+
+@pytest.mark.parametrize(
+    ("torch_version", "torchvision_version"),
+    (("2.7.1", "0.22.1"), ("2.8.0", "0.23.0"), ("2.9.1+cu128", "0.24.1+cu128")),
+)
+def test_every_official_production_pair_requires_and_passes_the_gate(
+    torch_version: str,
+    torchvision_version: str,
+) -> None:
+    result = _evaluate(
+        _contract(),
+        version_overrides={"torch": torch_version, "torchvision": torchvision_version},
+    )
+    assert result.passed is True
+    assert result.environment_receipt["torchvision_pair_compatible"] is True
+
+
+def test_full_report_continues_after_first_failure() -> None:
+    result = _evaluate(
+        _contract(),
+        missing="pydantic",
+        version_overrides={"torchvision": "0.23.1"},
+    )
+    assert result.passed is False
+    assert result.report["check_count"] == 20
+    assert len(cast(list[object], result.report["failure_codes"])) >= 2
+
+
+def test_base_runtime_probe_collects_ops_after_earlier_failures() -> None:
+    base = _evaluate(
+        _contract(),
+        expected_interpreter_class="system_python",
+        actual_interpreter_class="system_python",
+        stage="base",
+    )
+    result = evaluate_base_runtime_checks(
+        _contract(), base, torch_module=object(), torchvision_module=object()
+    )
+    rows = cast(list[dict[str, object]], result.report["base_runtime_checks"])
+    assert len(rows) == 11
+    assert rows[-1]["check_name"] == "cuda-optimizer-step"
+    assert any(
+        row["dependency_failure_code"] == "REMOTE_TORCHVISION_OPS_FAILED"
+        for row in rows
+    )
+
+
+def test_runtime_identity_binds_actual_versions_and_artifacts() -> None:
+    contract = _contract()
+    identity, digest = canonical_environment_identity(
+        contract,
+        python_version="3.12",
+        torch_version="2.9.1+cu128",
+        torchvision_version="0.24.1+cu128",
+        cuda_version="12.8",
+        gpu_class="NVIDIA RTX A5000",
+        vendor_source_sha256="1" * 64,
+        model_sha256="2" * 64,
+    )
+    assert identity["image"] == contract.image
+    assert identity["torch"] == "2.9.1+cu128"
+    assert len(digest) == 64
+
+
+@pytest.mark.parametrize(
+    ("check_name", "code"),
+    (
+        ("torchvision-compiled-ops", "REMOTE_TORCHVISION_OPS_FAILED"),
+        ("megaloc-vendor-import", "REMOTE_VENDOR_IMPORT_FAILED"),
+        ("model-safetensors-hash", "REMOTE_MODEL_HASH_MISMATCH"),
+        ("forward", "REMOTE_CUDA_FORWARD_FAILED"),
+        ("backward", "REMOTE_CUDA_BACKWARD_FAILED"),
+        ("finite-loss", "REMOTE_TRAINING_SMOKE_FAILED"),
+    ),
+)
+def test_smoke_aggregate_preserves_exact_failure(check_name: str, code: str) -> None:
+    rows = [
+        {"check_name": "earlier", "failure_code": None},
+        {"check_name": check_name, "failure_code": code},
+        {"check_name": "later", "failure_code": None},
+    ]
+    assert aggregate_training_smoke_failure(rows) == code
+    assert len(rows) == 3
 
 
 def test_cuda_unavailable_is_typed() -> None:
@@ -206,6 +307,9 @@ def test_remote_environment_plan_is_mutation_free(
     assert plan["runpod_api_calls"] == 0
     assert plan["cloud_mutations"] == 0
     assert plan["network_calls"] == 0
+    assert plan["torch_download_prohibited"] is True
+    assert plan["compatibility_smoke_required"] is True
+    assert plan["historical_observed_torch"] == "2.9.1+cu128"
 
 
 def test_environment_contract_hash_binds_checkpoint_configuration() -> None:
@@ -249,6 +353,8 @@ def _bootstrap_args(tmp_path: Path) -> list[str]:
         contract.requirements_lock_sha256,
         "--vendor-root",
         str(ROOT / ".local" / "vendor" / "megaloc"),
+        "--model",
+        str(ROOT / ".local" / "models" / "phase6c" / "megaloc" / "model.safetensors"),
         "--venv-root",
         str(tmp_path / "venv"),
         "--recovery-root",
@@ -272,6 +378,9 @@ def test_pinned_bootstrap_success_uses_one_interpreter(
     full = _evaluate(contract)
     commands: list[tuple[list[str], str]] = []
     monkeypatch.setattr(environment, "evaluate_remote_environment", lambda *_a, **_k: base)
+    monkeypatch.setattr(environment, "evaluate_base_runtime_checks", lambda *_a, **_k: base)
+    monkeypatch.setattr(environment, "require_dependency_report", lambda *_a, **_k: {})
+    monkeypatch.setattr(environment, "require_environment_receipt", lambda *_a, **_k: {})
 
     def fake_run(command: list[str], **kwargs: object) -> tuple[int, str, str, None]:
         stage = cast(str, kwargs["stage"])
@@ -284,7 +393,7 @@ def test_pinned_bootstrap_success_uses_one_interpreter(
 
     monkeypatch.setattr(module, "_run_logged", fake_run)
     assert module.main(_bootstrap_args(tmp_path)) == 0
-    assert len(commands) == 3
+    assert len(commands) == 4
     assert "--system-site-packages" in commands[0][0]
     install = commands[1][0]
     assert "--isolated" in install
@@ -293,6 +402,8 @@ def test_pinned_bootstrap_success_uses_one_interpreter(
     assert "--only-binary=:all:" in install
     assert "https://pypi.org/simple" in install
     assert commands[1][0][0] == commands[2][0][0]
+    assert commands[2][0][0] == commands[3][0][0]
+    assert commands[3][1] == "validating_training_smoke"
     assert full.environment_receipt["cuda_available"] is True
 
 
@@ -314,6 +425,7 @@ def test_install_failure_or_timeout_stops_before_preflight(
     )
     stages: list[str] = []
     monkeypatch.setattr(environment, "evaluate_remote_environment", lambda *_a, **_k: base)
+    monkeypatch.setattr(environment, "evaluate_base_runtime_checks", lambda *_a, **_k: base)
 
     def fake_run(_command: list[str], **kwargs: object) -> tuple[int, str, str, str | None]:
         stage = cast(str, kwargs["stage"])
@@ -347,6 +459,7 @@ def test_bootstrap_preserves_exact_module_with_empty_stderr(
     )
     missing = _evaluate(contract, missing="pydantic", stage="project")
     monkeypatch.setattr(environment, "evaluate_remote_environment", lambda *_a, **_k: base)
+    monkeypatch.setattr(environment, "evaluate_base_runtime_checks", lambda *_a, **_k: base)
 
     def fake_run(_command: list[str], **kwargs: object) -> tuple[int, str, str, None]:
         if kwargs["stage"] == "validating_project_imports":

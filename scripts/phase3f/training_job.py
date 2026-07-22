@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-epochs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20260720)
     parser.add_argument("--dependency-preflight-only", action="store_true")
+    parser.add_argument("--compatibility-smoke-only", action="store_true")
+    parser.add_argument("--compatibility-smoke-timeout-seconds", type=int, default=180)
     parser.add_argument(
         "--dependency-preflight-scope",
         choices=("project", "full"),
@@ -38,6 +41,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-lock-sha256")
     parser.add_argument("--environment-receipt", type=Path)
     return parser
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _safe_code(exc: BaseException) -> str:
@@ -126,6 +137,156 @@ def _dependency_preflight(args: argparse.Namespace) -> int:
     return 0
 
 
+def _compatibility_smoke(args: argparse.Namespace) -> int:
+    from atlaslens_api.phase3f.pipeline import MODEL_SHA256  # noqa: PLC0415
+    from atlaslens_api.phase3f.remote_environment import (  # noqa: PLC0415
+        RemoteEnvironmentError,
+        canonical_environment_identity,
+        load_remote_environment_contract,
+    )
+    from atlaslens_api.phase3f.training import run_remote_training_smoke  # noqa: PLC0415
+    from atlaslens_api.phase3f.training_recovery import atomic_json  # noqa: PLC0415
+
+    if any(
+        value is None
+        for value in (
+            args.model,
+            args.vendor_root,
+            args.recovery_root,
+            args.environment_contract,
+            args.requirements_lock,
+            args.expected_contract_sha256,
+            args.expected_lock_sha256,
+        )
+    ):
+        print("REMOTE_DEPENDENCY_LOCK_MISMATCH")
+        return 95
+    recovery_root = cast(Path, args.recovery_root)
+    receipt_path = recovery_root / "environment-receipt.json"
+    report_path = recovery_root / "dependency-report.json"
+    try:
+        contract = load_remote_environment_contract(
+            cast(Path, args.environment_contract),
+            cast(Path, args.requirements_lock),
+            expected_contract_sha256=cast(str, args.expected_contract_sha256),
+            expected_lock_sha256=cast(str, args.expected_lock_sha256),
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        base_receipt = json.loads(
+            (recovery_root / "base-environment-receipt.json").read_text(encoding="utf-8")
+        )
+        if not isinstance(receipt, dict) or not isinstance(report, dict):
+            raise RemoteEnvironmentError("REMOTE_DEPENDENCY_LOCK_MISMATCH")
+        if not isinstance(base_receipt, dict) or any(
+            receipt.get(field) != base_receipt.get(field)
+            for field in (
+                "python_major",
+                "python_minor",
+                "torch_version",
+                "torchvision_version",
+                "torch_cuda_version",
+            )
+        ):
+            raise RemoteEnvironmentError("REMOTE_BASE_PACKAGE_IDENTITY_CHANGED")
+        smoke = run_remote_training_smoke(
+            cast(Path, args.model),
+            cast(Path, args.vendor_root),
+            timeout_seconds=args.compatibility_smoke_timeout_seconds,
+        )
+        atomic_json(recovery_root / "training-smoke-report.json", smoke)
+        failure_code = smoke.get("failure_code")
+        if failure_code is None:
+            torch_version = receipt.get("torch_version")
+            torchvision_version = receipt.get("torchvision_version")
+            cuda_version = receipt.get("torch_cuda_version")
+            gpu_class = receipt.get("gpu_name")
+            if not all(
+                isinstance(value, str)
+                for value in (torch_version, torchvision_version, cuda_version, gpu_class)
+            ):
+                raise RemoteEnvironmentError("REMOTE_TRAINING_SMOKE_FAILED")
+            vendor_sha256 = _sha256_path(
+                cast(Path, args.vendor_root) / "megaloc_model.py"
+            )
+            identity, identity_sha256 = canonical_environment_identity(
+                contract,
+                python_version=f"{receipt['python_major']}.{receipt['python_minor']}",
+                torch_version=cast(str, torch_version),
+                torchvision_version=cast(str, torchvision_version),
+                cuda_version=cast(str, cuda_version),
+                gpu_class=cast(str, gpu_class),
+                vendor_source_sha256=vendor_sha256,
+                model_sha256=MODEL_SHA256,
+            )
+            receipt.update(
+                {
+                    "compatibility_smoke_passed": True,
+                    "compatibility_smoke_event": "PHASE3F_REMOTE_TRAINING_SMOKE_PASSED",
+                    "vendor_source_sha256": vendor_sha256,
+                    "model_sha256": MODEL_SHA256,
+                    "runtime_environment_identity": identity,
+                    "runtime_environment_sha256": identity_sha256,
+                }
+            )
+            report["training_smoke"] = smoke
+            report["full_report_check_count"] = cast(int, report["check_count"]) + cast(
+                int, smoke["check_count"]
+            )
+            atomic_json(receipt_path, receipt)
+            atomic_json(report_path, report)
+            print("PHASE3F_REMOTE_TRAINING_SMOKE_PASSED")
+            return 0
+        exact = cast(str, failure_code)
+        receipt.update(
+            {
+                "outcome": "failed",
+                "compatibility_smoke_passed": False,
+                "dependency_failure_code": exact,
+                "failed_module": "megaloc-training-smoke",
+            }
+        )
+        report.update(
+            {
+                "outcome": "failed",
+                "dependency_failure_code": exact,
+                "failed_module": "megaloc-training-smoke",
+                "training_smoke": smoke,
+            }
+        )
+        atomic_json(receipt_path, receipt)
+        atomic_json(report_path, report)
+        print(exact)
+        return 95
+    except (OSError, UnicodeError, json.JSONDecodeError, RemoteEnvironmentError) as exc:
+        code = getattr(exc, "code", "REMOTE_TRAINING_SMOKE_FAILED")
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if isinstance(receipt, dict) and isinstance(report, dict):
+                receipt.update(
+                    {
+                        "outcome": "failed",
+                        "compatibility_smoke_passed": False,
+                        "dependency_failure_code": code,
+                        "failed_module": "environment-identity",
+                    }
+                )
+                report.update(
+                    {
+                        "outcome": "failed",
+                        "dependency_failure_code": code,
+                        "failed_module": "environment-identity",
+                    }
+                )
+                atomic_json(receipt_path, receipt)
+                atomic_json(report_path, report)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+        print(code)
+        return 95
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     os.environ.pop("MAPILLARY_ACCESS_TOKEN", None)
@@ -136,6 +297,8 @@ def main(argv: list[str] | None = None) -> int:
     sys.path.insert(0, str(source))
     if args.dependency_preflight_only:
         return _dependency_preflight(args)
+    if args.compatibility_smoke_only:
+        return _compatibility_smoke(args)
     if any(
         value is None
         for value in (

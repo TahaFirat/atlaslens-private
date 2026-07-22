@@ -1945,3 +1945,27 @@
   class before training cost accrues, and Linux/CUDA compatibility still requires
   the first live bootstrap on the exact image digest.
 - Target phase: Product Phase 3F cloud training pilot.
+
+## 2026-07-22 - Phase 3F attests compatibility against the observed RunPod stack
+
+- Context: The digest-pinned image returned Torch `2.9.1+cu128`, while the local
+  contract had manually associated that digest with Torch `2.7.1`. The base
+  preflight stopped at that first string mismatch, so torchvision, CUDA ops and
+  MegaLoc training compatibility were not measured.
+- Decision: Keep the exact image digest as the reproducibility boundary, attest
+  any provider-reported `imageName` without normalization, and use the official
+  PyTorch/torchvision minor pairs 2.7/0.22, 2.8/0.23 and 2.9/0.24 as a necessary
+  but insufficient allowlist. Collect the complete base report, preserve the
+  image Torch stack in a `--system-site-packages` venv, and require a bounded
+  CUDA MegaLoc forward/backward/optimizer smoke before training starts. Hash the
+  observed Python, Torch, torchvision, CUDA, GPU class, image, lightweight lock,
+  vendor source and model into the environment receipt and every new checkpoint.
+- Alternatives: Pin the contract to the unobserved 2.7.1 assumption; download a
+  replacement multi-gigabyte Torch stack on each paid Pod; accept any 2.x version
+  without compiled-op and model smoke validation.
+- Consequences: Compatible preinstalled Torch is reused without a Torch download,
+  mismatched image identity or unsupported ABI fails before training, every base
+  mismatch is reported in one salvageable report, and checkpoint resume rejects a
+  different observed environment unless it passes the explicit compatibility
+  policy and exact environment binding.
+- Target phase: Product Phase 3F cloud training pilot.

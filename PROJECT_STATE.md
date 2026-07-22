@@ -2,10 +2,10 @@
 current_phase: 6
 phase_name: phase_6c_candidate_recall_turkiye_retrieval_evaluation
 phase_status: in_progress
-last_verified_at: 2026-07-22T00:21:34+03:00
+last_verified_at: 2026-07-22T10:50:56+03:00
 current_product_phase: 3
 product_phase_name: phase_3f_licensed_multi_region_corpus_and_independent_calibration
-product_phase_status: phase3f_deterministic_remote_dependencies_ready_for_live_bootstrap
+product_phase_status: phase3f_actual_runpod_torch_environment_gate_ready_for_live_bootstrap
 phase_1_safety_runtime_checkpoint: complete_local_git_closure
 phase_1_secret_template_sanitization: pass
 phase_1_source_backup: pass_manifest_483_of_483
@@ -544,14 +544,26 @@ phase_3f_retry_static: pass_ruff_strict_mypy268_powershell5_diff_secret_scan
 phase_3f_retry_live_actions: local_cuda_only_zero_resume_zero_execute_zero_network_zero_runpod_zero_mapillary_zero_cloud_mutation_zero_dataset_write
 phase_3f_dependency_live_predicate: bare_system_python_pip_install_nonzero_stdout_stderr_discarded_exit91
 phase_3f_dependency_historical_detail: exact_package_unrecoverable_pydantic_possible_not_proven
-phase_3f_dependency_environment: base_image_digest_python3_12_torch2_7_1_torchvision0_22_1_cuda12_8_then_system_site_venv
+phase_3f_dependency_environment: exact_image_digest_python3_12_official_pairs_torch2_7_2_8_2_9_torchvision0_22_0_23_0_24_cuda12_8_then_system_site_venv
 phase_3f_dependency_lock_sha256: f7737cc780e84aa97f096b552835aa486ebf47f33451ef3f69004d31d4a45a47
-phase_3f_dependency_contract_sha256: 8558b3d68af857c202a604920669bfe7774e1a46cb6c4b4db991f41053ad2728
+phase_3f_dependency_contract_sha256: a1f484f7808c69448fa22be3e77c93ad39b92255af124949f8ab1c7ce13bbce1
 phase_3f_dependency_plan: pass_project_imports18_linux_cache_absent_live_bootstrap_required_network0_mutations0
 phase_3f_dependency_bootstrap: max600s_exact_receipts_redacted_logs_checksum_inventory_before_training
 phase_3f_dependency_tests: pass_381_phase3f
 phase_3f_dependency_static: pass_ruff_strict_mypy261_and_control5_powershell5_diff_secret_scan
 phase_3f_dependency_live_actions: zero_resume_zero_execute_zero_network_zero_runpod_zero_mapillary_zero_cuda_smoke_zero_dataset_runtime_mutation
+phase_3f_torch_live_attempt: b0b81041496e386b3dfa7318a4527ff1_exit91_torch_required2_7_1_observed2_9_1_cu128_training_false_cleanup0_0_0_0
+phase_3f_torch_contract_root_cause: static_expected_version_was_not_derived_from_digest_and_fail_fast_stopped_after_first_torch_row
+phase_3f_torch_image_identity: request_preserves_exact_digest_create_and_get_imageName_exact_when_present_mismatch_typed_cleanup
+phase_3f_torch_full_report: modules20_base_runtime11_training_smoke11_total42_first_failure_does_not_stop_collection
+phase_3f_torch_smoke: max180s_vendor_model_hash_megaloc_import_load_cuda_amp_forward_finite_loss_backward_optimizer_tensor_change_holdout0_checkpoint0
+phase_3f_torch_download: prohibited_lock_denylist_no_deps_system_site_identity_postcheck
+phase_3f_torch_checkpoint_identity: actual_image_python_torch_torchvision_cuda_gpu_lock_vendor_model_canonical_sha256_exact_remote_resume
+phase_3f_torch_plan: pass_supported_pairs3_historical_torch2_9_1_cu128_blockers0_network0_runpod0_mutations0
+phase_3f_torch_tests: pass_396_phase3f
+phase_3f_torch_static: pass_ruff_strict_mypy261_and_control5_powershell5_diff_secret_scan
+phase_3f_torch_dataset_hashes: readiness_2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9_sealed_b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1_manifest_f30d8de3f1331a03553895d16c281e6691698700fa6ae8993afdd5d98f26d2d4_inventory_f2b146f28ea5449c6b62f6266cd7836f735e6fea76c3fe9e74c9712cbb0a0a93_assets830
+phase_3f_torch_live_actions: zero_resume_zero_execute_zero_network_zero_runpod_zero_mapillary_zero_cloud_mutation_zero_dataset_runtime_write
 phase_3f_next_action: run_exact_resume_ce23_with_explicit_cloud_consent_after_review
 phase_6c_started: true
 phase_6c_frontend_repair_gate: pass
@@ -608,26 +620,33 @@ next_phase: phase_6c_in_progress
 
 # AtlasLens project state
 
-## Product Phase 3F deterministic RunPod training dependencies
+## Product Phase 3F observed RunPod training environment compatibility
 
 Status: **OFFLINE VERIFIED - LIVE BOOTSTRAP/RETRY NOT EXECUTED**.
 
-The retained attempt `11f918aac0c4628c2c0452604ffeae18` proves only that the
-old bare system `python -m pip install` predicate returned nonzero and exited 91.
-That shell branch discarded both streams and wrote only the generic category, so
-the exact failed distribution is unrecoverable. `pydantic` is in the real training
-import graph and the same interpreter path could reproduce the earlier manual
-missing-pydantic observation, but it is not proven for this attempt. `timm` is not
-in the current vendored MegaLoc production graph.
+Attempt `b0b81041496e386b3dfa7318a4527ff1` reached the digest-pinned image with
+Python 3.12 and observed Torch `2.9.1+cu128`, then exited 91 because the contract
+manually expected 2.7.1. The one-row report proves the parser stopped at the first
+version string mismatch; torchvision, CUDA ops and MegaLoc compatibility were not
+observed. Salvage succeeded, training never started, no checkpoint exists, and
+cleanup restored Pod/endpoint/network-volume/template inventory to 0/0/0/0.
 
-Remote training now validates the digest-pinned Python 3.12, Torch 2.7.1,
-torchvision 0.22.1 and CUDA 12.8 base before creating a dedicated
-`--system-site-packages` venv. Sixteen lightweight project distributions install
-from a Linux-x86_64 binary-only, no-dependency, exact-version/hash lock through the
-official PyPI index. The lock excludes Torch and torchvision, so the image CUDA
-stack cannot be replaced. The same venv interpreter performs the full import,
-version, vendor and CUDA/ABI preflight and then launches training. The environment
-contract hash is part of the checkpoint configuration identity.
+Remote training now separates reproducibility identity from runtime compatibility.
+The create payload keeps the exact image digest, and provider `imageName` in create
+or authenticated GET must match byte-for-byte when present. The official
+Torch/torchvision minor pairs 2.7/0.22, 2.8/0.23 and 2.9/0.24 are necessary but
+not sufficient: CUDA 12.8, torchvision compiled ops, CUDA allocation/autocast,
+forward/backward/optimizer and the complete project import graph must pass. The
+preflight collects every row before its aggregate typed decision.
+
+Sixteen lightweight project distributions still install through the official
+PyPI index with exact hashes, `--no-deps` and binary-only policy in one
+`--system-site-packages` venv. Torch, torchvision and CUDA packages are forbidden
+from the lock, and post-install identity must equal the base report. A separate
+180-second smoke verifies vendor/model hashes, imports and loads MegaLoc, then runs
+synthetic CUDA AMP forward, finite loss, backward and one optimizer step without
+opening the dataset or holdout and without writing checkpoint or training state.
+Only `PHASE3F_REMOTE_TRAINING_SMOKE_PASSED` permits the cloud-job-start event.
 
 Bootstrap is bounded to 600 seconds inside a 630-second process watchdog. It runs
 before dataset extraction or model load, emits minute progress, and on failure
@@ -636,23 +655,28 @@ failure receipt and checksum inventory before salvage can succeed. Missing detai
 is no longer treated as successful dependency salvage. No second bootstrap or Pod
 create is attempted.
 
-The real local project venv passed all 18 project/import checks without a CUDA
-probe. The mutation-free `RemoteEnvironmentPlan` reports the pinned image,
-contract SHA-256
-`8558b3d68af857c202a604920669bfe7774e1a46cb6c4b4db991f41053ad2728`,
+The mutation-free `RemoteEnvironmentPlan` simulation reports all 18 local project
+imports passing, the pinned image, contract SHA-256
+`a1f484f7808c69448fa22be3e77c93ad39b92255af124949f8ab1c7ce13bbce1`,
 lock SHA-256
 `f7737cc780e84aa97f096b552835aa486ebf47f33451ef3f69004d31d4a45a47`,
-no local blockers and zero network/API/cloud mutations. The image was not present
-in the local Docker cache, so the Linux base/CUDA check remains a required live
-bootstrap gate rather than a local blocker.
+three supported pairs, the historical Torch observation, 42 total report checks,
+required smoke, prohibited Torch download, no local blockers and zero
+network/API/cloud mutations. The actual observed environment identity binds image,
+Python, full Torch/torchvision/CUDA versions, GPU class, lightweight lock and
+vendor/model hashes. New checkpoints retain this SHA and remote resume requires an
+exact match after the explicit compatibility gate.
 
-All 381 Phase 3F tests pass, including dependency classification, locked bootstrap
-success/failure/timeout, receipt salvage, single-interpreter transition, no-training
-on bootstrap failure, budget/archive/checkpoint and cleanup regressions. Ruff,
+All 396 Phase 3F tests pass, including official-pair acceptance/rejection,
+full-report continuation, image digest normalization/drop rejection, smoke failure
+aggregation, no-training before smoke, receipt salvage, event ordering,
+budget/archive/checkpoint and cleanup regressions. Ruff,
 strict mypy for 261 source files and five control scripts, all five PowerShell
 parsers, diff validation and the changed-file secret scan pass. No Resume/Execute,
-network, package/model/dataset
-download, RunPod/Mapillary, CUDA smoke, corpus/runtime or cloud mutation occurred.
+network, package/model/dataset download, RunPod/Mapillary, CUDA smoke,
+corpus/runtime or cloud mutation occurred. The sealed corpus remains 830 assets
+with readiness `2a1b3bc2150d1b5d389dbce07187bd3b51b27727d42a8215cf5ca34857b94bf9`
+and sealed-assets `b709e3e2cb1a75c75b1537eb17e9ba06296c50939c5d995bfaadd19e71be5ba1`.
 
 ## Product Phase 3F local CUDA retry validation and billing-lag reconciliation
 

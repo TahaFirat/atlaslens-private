@@ -31,6 +31,7 @@ _MAX_RECEIPT_BYTES = 64 * 1024
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 _RESOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,190}$")
 _GPU_TYPE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._():+-]{0,190}$")
+_IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,510}@sha256:[0-9a-f]{64}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _STAGES = frozenset({"preflight", "running", "failed", "terminated"})
 _RENTAL_EVIDENCE = frozenset(
@@ -166,6 +167,10 @@ class OperatorReceipt:
     get_interruptible_json_type: str | None = None
     pod_inventory_count: int | None = None
     explicit_false_source: str | None = None
+    requested_image_name: str | None = None
+    observed_image_name: str | None = None
+    image_digest_match: bool | None = None
+    image_identity_source: str | None = None
     gpu_attestation_outcome: str | None = None
     gpu_attestation_failure_code: str | None = None
     normalized_gpu_path: str | None = None
@@ -306,6 +311,33 @@ class OperatorReceipt:
                 "OPERATOR_RECEIPT_EVIDENCE_INVALID",
             )
             _require(self.create_http_status == 201, "OPERATOR_RECEIPT_EVIDENCE_INVALID")
+            if self.requested_image_name is None:
+                _require(
+                    self.observed_image_name is None
+                    and self.image_digest_match is None
+                    and self.image_identity_source is None,
+                    "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+                )
+            else:
+                _require(
+                    bool(_IMAGE.fullmatch(self.requested_image_name))
+                    and self.image_identity_source
+                    in {"create_response", "authenticated_get", "request_payload"},
+                    "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+                )
+                if self.observed_image_name is None:
+                    _require(
+                        self.image_digest_match is None
+                        and self.image_identity_source == "request_payload",
+                        "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+                    )
+                else:
+                    _require(
+                        bool(_IMAGE.fullmatch(self.observed_image_name))
+                        and self.observed_image_name == self.requested_image_name
+                        and self.image_digest_match is True,
+                        "OPERATOR_RECEIPT_EVIDENCE_INVALID",
+                    )
             _require(self.desired_status == "RUNNING", "OPERATOR_RECEIPT_EVIDENCE_INVALID")
             _require(
                 self.cloud_type in {"SECURE", "COMMUNITY"},
@@ -368,6 +400,10 @@ class OperatorReceipt:
                         self.get_interruptible_json_type,
                         self.pod_inventory_count,
                         self.explicit_false_source,
+                        self.requested_image_name,
+                        self.observed_image_name,
+                        self.image_digest_match,
+                        self.image_identity_source,
                     )
                 ),
                 "OPERATOR_RECEIPT_EVIDENCE_INVALID",
@@ -638,6 +674,10 @@ class OperatorReceipt:
             "get_interruptible_json_type": self.get_interruptible_json_type,
             "pod_inventory_count": self.pod_inventory_count,
             "explicit_false_source": self.explicit_false_source,
+            "requested_image_name": self.requested_image_name,
+            "observed_image_name": self.observed_image_name,
+            "image_digest_match": self.image_digest_match,
+            "image_identity_source": self.image_identity_source,
             "gpu_attestation_outcome": self.gpu_attestation_outcome,
             "gpu_attestation_failure_code": self.gpu_attestation_failure_code,
             "normalized_gpu_path": self.normalized_gpu_path,
@@ -708,6 +748,10 @@ class OperatorReceipt:
             "get_interruptible_json_type",
             "pod_inventory_count",
             "explicit_false_source",
+            "requested_image_name",
+            "observed_image_name",
+            "image_digest_match",
+            "image_identity_source",
         }
         gpu_attestation_fields = {
             "gpu_attestation_outcome",
@@ -745,6 +789,12 @@ class OperatorReceipt:
         legacy_gpu_attestation_fields = gpu_attestation_fields - {
             "normalized_gpu_count_path"
         }
+        legacy_evidence_fields = evidence_fields - {
+            "requested_image_name",
+            "observed_image_name",
+            "image_digest_match",
+            "image_identity_source",
+        }
         schema = row.get("schema")
         is_legacy = schema == _LEGACY_OPERATOR_RECEIPT_SCHEMA
         normalized_fields = set(row)
@@ -756,8 +806,13 @@ class OperatorReceipt:
                 and frozenset(normalized_fields)
                 in {
                     frozenset(legacy_expected | evidence_fields),
+                    frozenset(legacy_expected | legacy_evidence_fields),
                     *(
-                        frozenset(legacy_expected | evidence_fields | gpu_fields | suffix)
+                        frozenset(legacy_expected | selected_evidence | gpu_fields | suffix)
+                        for selected_evidence in (
+                            legacy_evidence_fields,
+                            evidence_fields,
+                        )
                         for gpu_fields in (
                             legacy_gpu_attestation_fields,
                             gpu_attestation_fields,
@@ -819,6 +874,10 @@ class OperatorReceipt:
         get_type = None if is_legacy else row.get("get_interruptible_json_type")
         inventory_count = None if is_legacy else row.get("pod_inventory_count")
         false_source = None if is_legacy else row.get("explicit_false_source")
+        requested_image_name = row.get("requested_image_name")
+        observed_image_name = row.get("observed_image_name")
+        image_digest_match = row.get("image_digest_match")
+        image_identity_source = row.get("image_identity_source")
         has_gpu_attestation = "gpu_attestation_outcome" in row
         gpu_attestation_outcome = (
             row.get("gpu_attestation_outcome") if has_gpu_attestation else None
@@ -886,6 +945,9 @@ class OperatorReceipt:
             create_type,
             get_type,
             false_source,
+            requested_image_name,
+            observed_image_name,
+            image_identity_source,
             gpu_attestation_outcome,
             gpu_attestation_failure_code,
             normalized_gpu_path,
@@ -912,6 +974,7 @@ class OperatorReceipt:
             tcp_port_present,
             ssh_ready,
             receipt_bound_match,
+            image_digest_match,
         ):
             _require(
                 optional_boolean is None or isinstance(optional_boolean, bool),
@@ -1013,6 +1076,10 @@ class OperatorReceipt:
             get_interruptible_json_type=cast(str | None, get_type),
             pod_inventory_count=cast(int | None, inventory_count),
             explicit_false_source=cast(str | None, false_source),
+            requested_image_name=cast(str | None, requested_image_name),
+            observed_image_name=cast(str | None, observed_image_name),
+            image_digest_match=cast(bool | None, image_digest_match),
+            image_identity_source=cast(str | None, image_identity_source),
             gpu_attestation_outcome=cast(str | None, gpu_attestation_outcome),
             gpu_attestation_failure_code=cast(
                 str | None, gpu_attestation_failure_code
@@ -1098,6 +1165,10 @@ class OperatorReceipt:
             get_interruptible_json_type=attestation.get_interruptible_json_type,
             pod_inventory_count=attestation.pod_inventory_count,
             explicit_false_source=attestation.explicit_false_source,
+            requested_image_name=attestation.requested_image_name,
+            observed_image_name=attestation.observed_image_name,
+            image_digest_match=attestation.image_digest_match,
+            image_identity_source=attestation.image_identity_source,
             allocation_attested_at=allocation_attested_at,
         )
 

@@ -31,6 +31,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-contract-sha256", required=True)
     parser.add_argument("--expected-lock-sha256", required=True)
     parser.add_argument("--vendor-root", type=Path, required=True)
+    parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--venv-root", type=Path, required=True)
     parser.add_argument("--recovery-root", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=600)
@@ -250,7 +251,9 @@ def main(argv: list[str] | None = None) -> int:
     from atlaslens_api.phase3f.remote_environment import (  # noqa: PLC0415
         REMOTE_DEPENDENCY_REPORT_SCHEMA,
         REMOTE_ENVIRONMENT_RECEIPT_SCHEMA,
+        DependencyPreflightResult,
         RemoteEnvironmentError,
+        evaluate_base_runtime_checks,
         evaluate_remote_environment,
         load_remote_environment_contract,
     )
@@ -301,6 +304,40 @@ def main(argv: list[str] | None = None) -> int:
         expected_interpreter_class="system_python",
         vendor_root=None,
         stage="base",
+    )
+    try:
+        base = evaluate_base_runtime_checks(contract, base)
+    except Exception as exc:  # sanitized base-probe boundary
+        base.report.update(
+            {
+                "outcome": "failed",
+                "dependency_failure_code": "REMOTE_DEPENDENCY_IMPORT_FAILED",
+                "failed_module": "base-runtime-probe",
+                "failure_exception_class": type(exc).__name__,
+                "all_checks_collected": False,
+            }
+        )
+        base.environment_receipt.update(
+            {
+                "outcome": "failed",
+                "dependency_failure_code": "REMOTE_DEPENDENCY_IMPORT_FAILED",
+                "failed_module": "base-runtime-probe",
+                "failure_exception_class": type(exc).__name__,
+                "all_imports_passed": False,
+            }
+        )
+        base = DependencyPreflightResult(
+            passed=False,
+            failure_code="REMOTE_DEPENDENCY_IMPORT_FAILED",
+            failed_module="base-runtime-probe",
+            exception_class=type(exc).__name__,
+            report=base.report,
+            environment_receipt=base.environment_receipt,
+        )
+    atomic_json(args.recovery_root / "base-environment-report.json", base.report)
+    atomic_json(
+        args.recovery_root / "base-environment-receipt.json",
+        base.environment_receipt,
     )
     if not base.passed:
         _failure_documents(
@@ -370,17 +407,49 @@ def main(argv: list[str] | None = None) -> int:
             "validating_project_imports",
             "project-import-graph",
         ),
+        (
+            [
+                str(_venv_python(args.venv_root)),
+                str(args.repository_root / "scripts" / "phase3f" / "training_job.py"),
+                "--compatibility-smoke-only",
+                "--repository-root",
+                str(args.repository_root),
+                "--model",
+                str(args.model),
+                "--vendor-root",
+                str(args.vendor_root),
+                "--recovery-root",
+                str(args.recovery_root),
+                "--environment-contract",
+                str(args.contract),
+                "--requirements-lock",
+                str(args.requirements_lock),
+                "--expected-contract-sha256",
+                args.expected_contract_sha256,
+                "--expected-lock-sha256",
+                args.expected_lock_sha256,
+                "--compatibility-smoke-timeout-seconds",
+                str(contract.compatibility_smoke_timeout_seconds),
+            ],
+            "validating_training_smoke",
+            "megaloc-training-smoke",
+        ),
     )
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     for command, stage, failed_module in commands:
         _progress(args.recovery_root, atomic_json, stage=stage, started=started)
+        command_deadline = (
+            min(deadline, time.monotonic() + contract.compatibility_smoke_timeout_seconds)
+            if stage == "validating_training_smoke"
+            else deadline
+        )
         return_code, stdout_text, stderr_text, exception_class = _run_logged(
             command,
             recovery_root=args.recovery_root,
             environment=environment,
             started=started,
-            deadline=deadline,
+            deadline=command_deadline,
             stage=stage,
             atomic_json=atomic_json,
         )
@@ -391,6 +460,9 @@ def main(argv: list[str] | None = None) -> int:
             receipt = base.environment_receipt
             dependency_report = args.recovery_root / "dependency-report.json"
             environment_receipt = args.recovery_root / "environment-receipt.json"
+            if stage == "validating_training_smoke" and return_code == 124:
+                failure_code = "REMOTE_TRAINING_SMOKE_TIMEOUT"
+                exception_class = "TimeoutExpired"
             try:
                 candidate_report = json.loads(dependency_report.read_text(encoding="utf-8"))
                 candidate_receipt = json.loads(environment_receipt.read_text(encoding="utf-8"))
@@ -400,9 +472,14 @@ def main(argv: list[str] | None = None) -> int:
                     exact = candidate_report.get("dependency_failure_code")
                     module = candidate_report.get("failed_module")
                     observed_exception = candidate_report.get("failure_exception_class")
-                    failure_code = (
-                        exact if isinstance(exact, str) else "REMOTE_DEPENDENCY_IMPORT_FAILED"
-                    )
+                    if not (
+                        stage == "validating_training_smoke" and return_code == 124
+                    ):
+                        failure_code = (
+                            exact
+                            if isinstance(exact, str)
+                            else "REMOTE_DEPENDENCY_IMPORT_FAILED"
+                        )
                     failed_module = module if isinstance(module, str) else failed_module
                     exception_class = (
                         observed_exception

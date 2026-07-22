@@ -157,6 +157,22 @@ locked. Outputs include pretrained/fine-tuned validation comparisons, final
 holdout benchmark, changed weight hashes and provenance. Regression never
 changes the production model automatically.
 
+Remote bootstrap treats image allocation and training compatibility as separate
+gates. The create payload retains the exact digest-pinned `imageName`; when create
+or authenticated GET returns that field, it must byte-match the request or the Pod
+is cleaned up with `REMOTE_IMAGE_IDENTITY_MISMATCH`. The official supported minor
+pairs are Torch/torchvision 2.7/0.22, 2.8/0.23 and 2.9/0.24, but a listed pair is
+not sufficient by itself. Bootstrap records the full Python, Torch, torchvision,
+CUDA, compiled-ops and small CUDA-operation report, installs only the lightweight
+hash lock with `--no-deps`, and verifies that Torch identity did not change.
+
+Before `PHASE3F_CLOUD_JOB_STARTED`, a separate 180-second smoke verifies vendor
+and model hashes, imports and loads MegaLoc, and performs a synthetic CUDA AMP
+forward, finite loss, backward and optimizer step. It does not open the locked
+holdout, write a checkpoint or advance production state. Only
+`PHASE3F_REMOTE_TRAINING_SMOKE_PASSED` permits training. Failures salvage the base
+report, dependency report, environment identity, smoke report and redacted logs.
+
 ## Preferred local-first execution
 
 Phase 3F acquisition and GPU compute are separate checkpoints. Acquisition runs

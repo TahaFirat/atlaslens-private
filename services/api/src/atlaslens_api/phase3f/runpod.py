@@ -560,6 +560,9 @@ class CreateResponseDiagnostic:
     content_type: str
     failure_code: str | None
     validation_errors: tuple[CreateValidationErrorDiagnostic, ...] = ()
+    image_name_present: bool | None = None
+    observed_image_name: str | None = None
+    image_digest_match: bool | None = None
     secret_free: bool = True
 
     def to_public_dict(self) -> dict[str, object]:
@@ -578,6 +581,9 @@ class CreateResponseDiagnostic:
             "validation_errors": [
                 item.to_public_dict() for item in self.validation_errors
             ],
+            "image_name_present": self.image_name_present,
+            "observed_image_name": self.observed_image_name,
+            "image_digest_match": self.image_digest_match,
             "secret_free": self.secret_free,
         }
 
@@ -629,6 +635,10 @@ class PodRentalAttestationDiagnostic:
     gpu_count: int
     cost_attestation: str
     normalized_gpu_count_path: str | None = None
+    requested_image_name: str | None = None
+    observed_image_name: str | None = None
+    image_digest_match: bool | None = None
+    image_identity_source: str | None = None
     secret_free: bool = True
 
     def to_public_dict(self) -> dict[str, object]:
@@ -659,6 +669,10 @@ class PodRentalAttestationDiagnostic:
             "gpu_count": self.gpu_count,
             "normalized_gpu_count_path": self.normalized_gpu_count_path,
             "cost_attestation": self.cost_attestation,
+            "requested_image_name": self.requested_image_name,
+            "observed_image_name": self.observed_image_name,
+            "image_digest_match": self.image_digest_match,
+            "image_identity_source": self.image_identity_source,
             "secret_free": self.secret_free,
         }
 
@@ -684,6 +698,9 @@ class PodGPUAttestationProgressDiagnostic:
     observed_gpu_id_sha256: str | None = None
     create_http_class: str = "success_201"
     normalized_gpu_count_path: str | None = None
+    requested_image_name: str | None = None
+    observed_image_name: str | None = None
+    image_digest_match: bool | None = None
     secret_free: bool = True
 
     def to_public_dict(self) -> dict[str, object]:
@@ -700,6 +717,9 @@ class PodGPUAttestationProgressDiagnostic:
             "gpu_count": self.gpu_count,
             "normalized_gpu_count_path": self.normalized_gpu_count_path,
             "cost_attestation": self.cost_attestation,
+            "requested_image_name": self.requested_image_name,
+            "observed_image_name": self.observed_image_name,
+            "image_digest_match": self.image_digest_match,
             "receipt_bound_pod_count": self.receipt_bound_pod_count,
             "unexpected_pod_count": self.unexpected_pod_count,
             "endpoint_count": self.endpoint_count,
@@ -769,6 +789,24 @@ class _NormalizedGPUObservation:
     gpu_path: str | None
     gpu_count: int | None
     gpu_count_path: str | None
+
+
+def attest_image_identity(
+    requested_image_name: str,
+    response: Mapping[str, object],
+) -> str | None:
+    """Attest an optional provider image field without normalizing away its digest."""
+    _require(bool(_IMAGE.fullmatch(requested_image_name)), "REMOTE_IMAGE_IDENTITY_MISMATCH")
+    observed = response.get("imageName", _MISSING)
+    if observed is _MISSING or observed is None:
+        return None
+    _require(
+        isinstance(observed, str)
+        and bool(_IMAGE.fullmatch(observed))
+        and hmac.compare_digest(observed, requested_image_name),
+        "REMOTE_IMAGE_IDENTITY_MISMATCH",
+    )
+    return cast(str, observed)
 
 
 def _normalized_gpu_observation(
@@ -1807,6 +1845,10 @@ class RunPodV1Client:
         create_gpu_path = create_gpu.gpu_path
         create_gpu_count = create_gpu.gpu_count
         create_gpu_count_path = create_gpu.gpu_count_path
+        create_image_name = attest_image_identity(
+            self._config.image_name,
+            create_row,
+        )
         self._record_gpu_progress(
             PodGPUAttestationProgressDiagnostic(
                 outcome="pending",
@@ -1832,6 +1874,11 @@ class RunPodV1Client:
                     if create_gpu_id is not None
                     and create_gpu_id != offer.gpu_type_id
                     else None
+                ),
+                requested_image_name=self._config.image_name,
+                observed_image_name=create_image_name,
+                image_digest_match=(
+                    True if create_image_name is not None else None
                 ),
             )
         )
@@ -1894,6 +1941,11 @@ class RunPodV1Client:
             get_present = "interruptible" in verified
             get_type = _json_type(get_value)
             desired = verified.get("desiredStatus", _MISSING)
+            get_image_name = attest_image_identity(
+                self._config.image_name,
+                verified,
+            )
+            effective_image_name = create_image_name or get_image_name
             try:
                 verified_gpu = self._normalized_gpu(verified)
             except RunPodAPIError as exc:
@@ -1949,6 +2001,11 @@ class RunPodV1Client:
                         hashlib.sha256(gpu_id.encode("utf-8")).hexdigest()
                         if gpu_id is not None and gpu_id != offer.gpu_type_id
                         else None
+                    ),
+                    requested_image_name=self._config.image_name,
+                    observed_image_name=effective_image_name,
+                    image_digest_match=(
+                        True if effective_image_name is not None else None
                     ),
                 )
             )
@@ -2121,6 +2178,18 @@ class RunPodV1Client:
                     normalized_gpu_count_path=cast(
                         str, effective_gpu_count_path
                     ),
+                    requested_image_name=self._config.image_name,
+                    observed_image_name=effective_image_name,
+                    image_digest_match=(
+                        True if effective_image_name is not None else None
+                    ),
+                    image_identity_source=(
+                        "create_response"
+                        if create_image_name is not None
+                        else "authenticated_get"
+                        if get_image_name is not None
+                        else "request_payload"
+                    ),
                 )
                 return attestation
             remaining = deadline - self._monotonic()
@@ -2249,6 +2318,10 @@ class RunPodV1Client:
         observed_gpu_id: str,
         gpu_count: int,
         normalized_gpu_count_path: str,
+        requested_image_name: str,
+        observed_image_name: str | None,
+        image_digest_match: bool | None,
+        image_identity_source: str,
     ) -> PodRentalAttestationDiagnostic:
         return PodRentalAttestationDiagnostic(
             evidence=evidence,
@@ -2275,6 +2348,10 @@ class RunPodV1Client:
             gpu_count=gpu_count,
             normalized_gpu_count_path=normalized_gpu_count_path,
             cost_attestation="graphql_uninterruptable_price_match",
+            requested_image_name=requested_image_name,
+            observed_image_name=observed_image_name,
+            image_digest_match=image_digest_match,
+            image_identity_source=image_identity_source,
         )
 
     def terminate_pod(self, pod_id: str) -> None:
@@ -2741,6 +2818,12 @@ class RunPodV1Client:
                 )
             )
             interruptible = row.get("interruptible", _MISSING)
+            image_value = row.get("imageName", _MISSING)
+            safe_image = (
+                image_value
+                if isinstance(image_value, str) and bool(_IMAGE.fullmatch(image_value))
+                else None
+            )
             self._last_create_response_diagnostic = CreateResponseDiagnostic(
                 http_status=status,
                 top_level_keys=keys,
@@ -2757,6 +2840,13 @@ class RunPodV1Client:
                 sha256=None,
                 content_type=content_type,
                 failure_code=self._bad_request_code(status, row),
+                image_name_present="imageName" in row,
+                observed_image_name=safe_image,
+                image_digest_match=(
+                    hmac.compare_digest(safe_image, self._config.image_name)
+                    if safe_image is not None
+                    else None
+                ),
             )
             return
         validation_errors = self._validation_errors(payload)

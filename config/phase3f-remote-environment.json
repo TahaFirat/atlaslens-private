@@ -1,14 +1,26 @@
 {
-  "schema": "atlaslens-phase3f-remote-environment-contract-v1",
+  "schema": "atlaslens-phase3f-remote-environment-contract-v2",
   "image": "runpod/pytorch@sha256:60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f",
+  "image_identity_policy": "exact_digest",
   "platform": "linux_x86_64",
   "python_requirement": "==3.12.*",
-  "torch_requirement": "==2.7.1",
-  "torchvision_requirement": "==0.22.1",
+  "torch_requirement": ">=2.7,<2.10",
+  "torchvision_requirement": ">=0.22,<0.25",
+  "supported_torchvision_pairs": [
+    {"torch_minor": "2.7", "torchvision_minor": "0.22"},
+    {"torch_minor": "2.8", "torchvision_minor": "0.23"},
+    {"torch_minor": "2.9", "torchvision_minor": "0.24"}
+  ],
+  "compatibility_source": "https://github.com/pytorch/vision#installation",
+  "historical_observations": [
+    {"image_digest": "sha256:60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f", "python": "3.12", "torch": "2.9.1+cu128", "torchvision": null, "cuda": null}
+  ],
   "cuda_requirement": "12.8",
   "system_site_packages_required": true,
+  "torch_download_prohibited": true,
   "official_index_url": "https://pypi.org/simple",
   "bootstrap_timeout_seconds": 600,
+  "compatibility_smoke_timeout_seconds": 180,
   "requirements_lock": "config/phase3f-training-requirements.lock",
   "requirements_lock_sha256": "f7737cc780e84aa97f096b552835aa486ebf47f33451ef3f69004d31d4a45a47",
   "forbidden_locked_distributions": [
@@ -16,8 +28,8 @@
     "torchvision"
   ],
   "checks": [
-    {"name": "base-torch", "module": "torch", "distribution": "torch", "required_version": "2.7.1", "source": "base_image"},
-    {"name": "base-torchvision", "module": "torchvision", "distribution": "torchvision", "required_version": "0.22.1", "source": "base_image"},
+    {"name": "base-torch", "module": "torch", "distribution": "torch", "required_version": null, "source": "base_image"},
+    {"name": "base-torchvision", "module": "torchvision", "distribution": "torchvision", "required_version": null, "source": "base_image"},
     {"name": "locked-annotated-types", "module": "annotated_types", "distribution": "annotated-types", "required_version": "0.7.0", "source": "locked_project"},
     {"name": "locked-anyio", "module": "anyio", "distribution": "anyio", "required_version": "4.14.1", "source": "locked_project"},
     {"name": "locked-certifi", "module": "certifi", "distribution": "certifi", "required_version": "2026.6.17", "source": "locked_project"},

@@ -17,7 +17,7 @@ import sys
 import tarfile
 import time
 from collections import Counter, defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -663,6 +663,7 @@ class TrainableMegaLocRuntime:
         dataset_readiness_sha256: str,
         sealed_assets_sha256: str,
         training_config_sha256_value: str,
+        environment_identity_sha256: str,
     ) -> dict[str, Any]:
         pointer_path = checkpoint_root / "latest.json"
         if not pointer_path.exists():
@@ -683,6 +684,7 @@ class TrainableMegaLocRuntime:
                 expected_readiness_sha256=dataset_readiness_sha256,
                 expected_sealed_assets_sha256=sealed_assets_sha256,
                 expected_training_config_sha256=training_config_sha256_value,
+                expected_environment_identity_sha256=environment_identity_sha256,
             )
             pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
             generation_root = checkpoint_root / cast(str, pointer["generation"])
@@ -770,6 +772,7 @@ class TrainableMegaLocRuntime:
         dataset_readiness_sha256: str,
         sealed_assets_sha256: str,
         training_config_sha256_value: str,
+        environment_identity_sha256: str,
     ) -> None:
         checkpoint_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = checkpoint_root / f".generation-{uuid4().hex}.partial"
@@ -828,6 +831,7 @@ class TrainableMegaLocRuntime:
                     "selected_parameter_names_sha256": hashlib.sha256(
                         _canonical_bytes(self._selected_names)
                     ).hexdigest(),
+                    "environment_identity_sha256": environment_identity_sha256,
                     "secrets_included": False,
                 },
             )
@@ -854,6 +858,7 @@ class TrainableMegaLocRuntime:
                 "dataset_readiness_sha256": dataset_readiness_sha256,
                 "sealed_assets_sha256": sealed_assets_sha256,
                 "training_config_sha256": training_config_sha256_value,
+                "environment_identity_sha256": environment_identity_sha256,
                 "completed_epoch": completed_epoch,
                 "next_epoch": next_epoch,
                 "next_batch_index": next_batch_index,
@@ -899,8 +904,13 @@ class TrainableMegaLocRuntime:
         dataset_readiness_sha256: str,
         sealed_assets_sha256: str,
         training_config_sha256_value: str,
+        environment_identity_sha256: str,
         progress_root: Path | None = None,
     ) -> dict[str, object]:
+        _require(
+            bool(re.fullmatch(r"[0-9a-f]{64}", environment_identity_sha256)),
+            "TRAINING_ENVIRONMENT_RECEIPT_INVALID",
+        )
         optimizer = self._torch.optim.AdamW(
             self._selected_parameters,
             lr=2e-6,
@@ -919,6 +929,7 @@ class TrainableMegaLocRuntime:
             dataset_readiness_sha256=dataset_readiness_sha256,
             sealed_assets_sha256=sealed_assets_sha256,
             training_config_sha256_value=training_config_sha256_value,
+            environment_identity_sha256=environment_identity_sha256,
         )
         start_epoch = cast(int, resumed["next_epoch"])
         resume_batch = cast(int, resumed["next_batch_index"])
@@ -1013,6 +1024,7 @@ class TrainableMegaLocRuntime:
                             dataset_readiness_sha256=dataset_readiness_sha256,
                             sealed_assets_sha256=sealed_assets_sha256,
                             training_config_sha256_value=training_config_sha256_value,
+                            environment_identity_sha256=environment_identity_sha256,
                         )
                         last_checkpoint_at = now
             validation_batches = _epoch_batches(
@@ -1094,6 +1106,7 @@ class TrainableMegaLocRuntime:
                 dataset_readiness_sha256=dataset_readiness_sha256,
                 sealed_assets_sha256=sealed_assets_sha256,
                 training_config_sha256_value=training_config_sha256_value,
+                environment_identity_sha256=environment_identity_sha256,
             )
             if improved:
                 pointer = json.loads(
@@ -1160,6 +1173,179 @@ class TrainableMegaLocRuntime:
         self._torch.cuda.empty_cache()
 
 
+def aggregate_training_smoke_failure(
+    checks: Sequence[Mapping[str, object]],
+) -> str | None:
+    """Return the first typed smoke failure after every check has been collected."""
+    for row in checks:
+        code = row.get("failure_code")
+        if isinstance(code, str):
+            return code
+    return None
+
+
+def run_remote_training_smoke(
+    model_path: Path,
+    vendor_root: Path,
+    *,
+    timeout_seconds: int = 180,
+    seed: int = 20260720,
+    runtime_factory: Callable[..., TrainableMegaLocRuntime] = TrainableMegaLocRuntime,
+) -> dict[str, object]:
+    """Run one isolated CUDA optimizer step without dataset or checkpoint mutation."""
+    _require(1 <= timeout_seconds <= 180, "REMOTE_TRAINING_SMOKE_TIMEOUT")
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    checks: list[dict[str, object]] = []
+    failure_code: str | None = None
+    runtime: TrainableMegaLocRuntime | None = None
+
+    def record(name: str, passed: bool, code: str, observed: object = "compatible") -> None:
+        nonlocal failure_code
+        if not passed and failure_code is None:
+            failure_code = code
+        checks.append(
+            {
+                "check_name": name,
+                "outcome": "passed" if passed else "failed",
+                "observed": observed if passed else "failed",
+                "failure_code": None if passed else code,
+                "secrets_included": False,
+            }
+        )
+
+    def within_deadline() -> None:
+        _require(time.monotonic() < deadline, "REMOTE_TRAINING_SMOKE_TIMEOUT")
+
+    try:
+        worker.verify_megaloc_artifacts(
+            model_path,
+            vendor_root / "megaloc_model.py",
+            vendor_root / "LICENSE",
+        )
+        record("vendor-source-hash", True, "REMOTE_MODEL_HASH_MISMATCH")
+        record("model-safetensors-hash", True, "REMOTE_MODEL_HASH_MISMATCH")
+    except Exception as exc:
+        code = (
+            "REMOTE_MODEL_HASH_MISMATCH"
+            if "SHA256" in str(getattr(exc, "code", ""))
+            else "REMOTE_VENDOR_IMPORT_FAILED"
+        )
+        record("vendor-source-hash", False, code)
+        record("model-safetensors-hash", False, code)
+    try:
+        within_deadline()
+        if failure_code is not None:
+            raise TrainingError(failure_code)
+        runtime = runtime_factory(model_path, vendor_root, seed=seed)
+        record("megaloc-vendor-import", True, "REMOTE_VENDOR_IMPORT_FAILED")
+        record("megaloc-model-load", True, "REMOTE_TRAINING_SMOKE_FAILED")
+    except Exception as exc:
+        code = str(getattr(exc, "code", "REMOTE_TRAINING_SMOKE_FAILED"))
+        code = (
+            "REMOTE_VENDOR_IMPORT_FAILED"
+            if "RUNTIME_MISSING" in code
+            else "REMOTE_TRAINING_SMOKE_TIMEOUT"
+            if code == "REMOTE_TRAINING_SMOKE_TIMEOUT"
+            else "REMOTE_TRAINING_SMOKE_FAILED"
+        )
+        record("megaloc-vendor-import", False, code)
+        record("megaloc-model-load", False, code)
+    peak_cuda_bytes: int | None = None
+    if runtime is not None:
+        torch = runtime._torch  # noqa: SLF001 - same-module isolated compatibility probe
+        model = runtime._model  # noqa: SLF001
+        parameters = runtime._selected_parameters  # noqa: SLF001
+        try:
+            within_deadline()
+            torch.cuda.reset_peak_memory_stats()
+            torch.manual_seed(seed)
+            batch = torch.zeros((2, 3, 392, 392), device="cuda")
+            record("cuda-tensor-allocation", True, "REMOTE_CUDA_TENSOR_ALLOCATION_FAILED")
+        except Exception:
+            batch = None
+            record("cuda-tensor-allocation", False, "REMOTE_CUDA_TENSOR_ALLOCATION_FAILED")
+        output: Any = None
+        loss: Any = None
+        optimizer: Any = None
+        before: Any = None
+        try:
+            within_deadline()
+            optimizer = torch.optim.AdamW(parameters, lr=2e-6, weight_decay=1e-4)
+            optimizer.zero_grad(set_to_none=True)
+            before = parameters[0].detach().clone()
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                output = model(batch)
+            record("amp-autocast", True, "REMOTE_CUDA_AUTOCAST_FAILED", str(output.dtype))
+            record("forward", True, "REMOTE_CUDA_FORWARD_FAILED", list(output.shape))
+        except Exception:
+            record("amp-autocast", False, "REMOTE_CUDA_AUTOCAST_FAILED")
+            record("forward", False, "REMOTE_CUDA_FORWARD_FAILED")
+        try:
+            within_deadline()
+            weights = torch.linspace(0.5, 1.5, output.shape[-1], device="cuda")
+            loss = (output.float() * weights).mean()
+            finite = bool(torch.isfinite(loss).item())
+            record("finite-loss", finite, "REMOTE_TRAINING_SMOKE_FAILED", finite)
+        except Exception:
+            record("finite-loss", False, "REMOTE_TRAINING_SMOKE_FAILED")
+        try:
+            within_deadline()
+            loss.backward()
+            record("backward", True, "REMOTE_CUDA_BACKWARD_FAILED")
+        except Exception:
+            record("backward", False, "REMOTE_CUDA_BACKWARD_FAILED")
+        try:
+            within_deadline()
+            optimizer.step()
+            record("optimizer-step", True, "REMOTE_CUDA_OPTIMIZER_FAILED")
+            changed = bool(not torch.equal(before, parameters[0].detach()))
+            record("model-tensor-changed", changed, "REMOTE_TRAINING_SMOKE_FAILED", changed)
+        except Exception:
+            record("optimizer-step", False, "REMOTE_CUDA_OPTIMIZER_FAILED")
+            record("model-tensor-changed", False, "REMOTE_TRAINING_SMOKE_FAILED")
+        try:
+            peak_cuda_bytes = int(torch.cuda.max_memory_allocated())
+        except RuntimeError:
+            peak_cuda_bytes = None
+    else:
+        for name, code in (
+            ("cuda-tensor-allocation", "REMOTE_CUDA_TENSOR_ALLOCATION_FAILED"),
+            ("amp-autocast", "REMOTE_CUDA_AUTOCAST_FAILED"),
+            ("forward", "REMOTE_CUDA_FORWARD_FAILED"),
+            ("finite-loss", "REMOTE_TRAINING_SMOKE_FAILED"),
+            ("backward", "REMOTE_CUDA_BACKWARD_FAILED"),
+            ("optimizer-step", "REMOTE_CUDA_OPTIMIZER_FAILED"),
+            ("model-tensor-changed", "REMOTE_TRAINING_SMOKE_FAILED"),
+        ):
+            record(name, False, code)
+    if runtime is not None:
+        runtime.close()
+    elapsed = time.monotonic() - started
+    failure_code = aggregate_training_smoke_failure(checks)
+    if elapsed > timeout_seconds and failure_code is None:
+        failure_code = "REMOTE_TRAINING_SMOKE_TIMEOUT"
+    return {
+        "schema": "atlaslens-phase3f-remote-training-smoke-v1",
+        "outcome": "passed" if failure_code is None else "failed",
+        "event": (
+            "PHASE3F_REMOTE_TRAINING_SMOKE_PASSED"
+            if failure_code is None
+            else None
+        ),
+        "failure_code": failure_code,
+        "checks": checks,
+        "check_count": len(checks),
+        "elapsed_seconds": elapsed,
+        "timeout_seconds": timeout_seconds,
+        "peak_cuda_bytes": peak_cuda_bytes,
+        "dataset_open_count": 0,
+        "holdout_open_count": 0,
+        "checkpoint_write_count": 0,
+        "secrets_included": False,
+    }
+
+
 def _runtime_descriptors(
     runtime: TrainableMegaLocRuntime,
     assets: Sequence[SplitAsset],
@@ -1216,6 +1402,9 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
     _require(not config.output_root.exists(), "TRAINING_OUTPUT_EXISTS")
     config.output_root.mkdir(mode=0o700, parents=True)
     config.work_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    environment_identity_sha256 = hashlib.sha256(
+        b"atlaslens-phase3f-local-unbound-environment-v1"
+    ).hexdigest()
     if config.environment_contract_sha256 is not None:
         _require(
             config.environment_receipt_path is not None,
@@ -1229,12 +1418,23 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
             and environment_receipt.get("contract_sha256")
             == config.environment_contract_sha256
             and environment_receipt.get("all_imports_passed") is True
+            and environment_receipt.get("compatibility_smoke_passed") is True
+            and isinstance(environment_receipt.get("runtime_environment_sha256"), str)
+            and bool(
+                re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    cast(str, environment_receipt["runtime_environment_sha256"]),
+                )
+            )
             and environment_receipt.get("secrets_included") is False,
             "TRAINING_ENVIRONMENT_RECEIPT_INVALID",
         )
         _atomic_json(
             config.output_root / "environment-receipt.json",
             environment_receipt,
+        )
+        environment_identity_sha256 = cast(
+            str, environment_receipt["runtime_environment_sha256"]
         )
     holdout_state_path = config.work_root / "training-checkpoint" / "holdout-state.json"
     if holdout_state_path.exists():
@@ -1272,6 +1472,7 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
                 "sealed_assets_sha256": sealed_assets_sha256,
                 "training_config_sha256": config_sha256,
                 "environment_contract_sha256": config.environment_contract_sha256,
+                "environment_identity_sha256": environment_identity_sha256,
                 "seed": config.seed,
                 "maximum_epochs": config.max_epochs,
                 "holdout_open_count": 0,
@@ -1370,6 +1571,7 @@ def run_training_job(config: TrainingJobConfig) -> dict[str, object]:
                     dataset_readiness_sha256=dataset_readiness_sha256,
                     sealed_assets_sha256=sealed_assets_sha256,
                     training_config_sha256_value=config_sha256,
+                    environment_identity_sha256=environment_identity_sha256,
                     progress_root=config.recovery_root,
                 )
                 break
